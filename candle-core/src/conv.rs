@@ -19,7 +19,15 @@ pub struct ParamsConv1D {
 
 impl ParamsConv1D {
     pub(crate) fn l_out(&self) -> usize {
-        (self.l_in + 2 * self.padding - self.dilation * (self.k_size - 1) - 1) / self.stride + 1
+        let effective_k = self.dilation * (self.k_size - 1) + 1;
+        let padded = self.l_in + 2 * self.padding;
+        // Saturate to 0 instead of panicking on underflow.
+        // Callers should validate input dimensions before reaching this point,
+        // but this prevents a panic if they don't.
+        padded
+            .checked_sub(effective_k)
+            .map(|v| v / self.stride + 1)
+            .unwrap_or(0)
     }
 
     pub(crate) fn out_dims(&self) -> Vec<usize> {
@@ -85,11 +93,21 @@ pub struct ParamsConv2D {
 
 impl ParamsConv2D {
     pub(crate) fn out_h(&self) -> usize {
-        (self.i_h + 2 * self.padding - self.dilation * (self.k_h - 1) - 1) / self.stride + 1
+        let effective_k = self.dilation * (self.k_h - 1) + 1;
+        let padded = self.i_h + 2 * self.padding;
+        padded
+            .checked_sub(effective_k)
+            .map(|v| v / self.stride + 1)
+            .unwrap_or(0)
     }
 
     pub(crate) fn out_w(&self) -> usize {
-        (self.i_w + 2 * self.padding - self.dilation * (self.k_w - 1) - 1) / self.stride + 1
+        let effective_k = self.dilation * (self.k_w - 1) + 1;
+        let padded = self.i_w + 2 * self.padding;
+        padded
+            .checked_sub(effective_k)
+            .map(|v| v / self.stride + 1)
+            .unwrap_or(0)
     }
 
     pub(crate) fn out_dims(&self) -> Vec<usize> {

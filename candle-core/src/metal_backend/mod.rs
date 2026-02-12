@@ -946,7 +946,20 @@ impl BackendStorage for MetalStorage {
         let dilation = params.dilation;
         let padding = params.padding;
         let k_size = params.k_size;
-        let l_out = (dims[2] + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+        let effective_k = dilation * (k_size - 1) + 1;
+        let padded_input = dims[2] + 2 * padding;
+        if padded_input < effective_k {
+            crate::bail!(
+                "conv1d: input length ({}) with padding ({}) is too small for \
+                 kernel_size={}, dilation={} (effective kernel size={})",
+                dims[2],
+                padding,
+                k_size,
+                dilation,
+                effective_k
+            );
+        }
+        let l_out = (padded_input - effective_k) / stride + 1;
         let dst_el = dims[0] * l_out * dims[1] * k_size;
         let dst = self
             .device
@@ -1130,8 +1143,26 @@ impl BackendStorage for MetalStorage {
         let w_k = params.k_w;
         let h = dims[2];
         let w = dims[3];
-        let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
-        let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
+        let effective_h_k = dilation * (h_k - 1) + 1;
+        let effective_w_k = dilation * (w_k - 1) + 1;
+        let padded_h = h + 2 * padding;
+        let padded_w = w + 2 * padding;
+        if padded_h < effective_h_k || padded_w < effective_w_k {
+            crate::bail!(
+                "conv2d: input size ({},{}) with padding ({}) is too small for \
+                 kernel=({},{}), dilation={} (effective kernel=({},{}))",
+                h,
+                w,
+                padding,
+                h_k,
+                w_k,
+                dilation,
+                effective_h_k,
+                effective_w_k
+            );
+        }
+        let h_out = (padded_h - effective_h_k) / stride + 1;
+        let w_out = (padded_w - effective_w_k) / stride + 1;
         let dst_el = dims[0] * h_out * w_out * dims[1] * h_k * w_k;
 
         let dst = self

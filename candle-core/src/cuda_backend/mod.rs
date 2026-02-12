@@ -159,8 +159,19 @@ struct Im2Col1D {
 
 impl Im2Col1D {
     #[allow(unused)]
-    fn l_out(&self, l: usize) -> usize {
-        (l + 2 * self.padding - self.dilation * (self.l_k - 1) - 1) / self.stride + 1
+    fn l_out(&self, l: usize) -> Result<usize> {
+        let effective_k = self.dilation * (self.l_k - 1) + 1;
+        let padded = l + 2 * self.padding;
+        if padded < effective_k {
+            crate::bail!(
+                "conv1d: input length ({l}) with padding ({}) is too small for \
+                 kernel_size={}, dilation={} (effective kernel size={effective_k})",
+                self.padding,
+                self.l_k,
+                self.dilation,
+            );
+        }
+        Ok((padded - effective_k) / self.stride + 1)
     }
 }
 
@@ -173,7 +184,7 @@ impl Map1 for Im2Col1D {
     ) -> Result<CudaSlice<T>> {
         let shape = layout.shape();
         let dims = shape.dims();
-        let l_out = self.l_out(dims[2]);
+        let l_out = self.l_out(dims[2])?;
         let threads = dims[0] * l_out * dims[1];
         let cfg = LaunchConfig::for_num_elems(threads as u32);
         let ds = dev.memcpy_stod(&[dims, layout.stride()].concat())?;
