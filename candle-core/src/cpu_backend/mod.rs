@@ -1000,8 +1000,19 @@ struct Im2Col1D {
 }
 
 impl Im2Col1D {
-    fn l_out(&self, l: usize) -> usize {
-        (l + 2 * self.padding - self.dilation * (self.l_k - 1) - 1) / self.stride + 1
+    fn l_out(&self, l: usize) -> Result<usize> {
+        let effective_k = self.dilation * (self.l_k - 1) + 1;
+        let padded = l + 2 * self.padding;
+        if padded < effective_k {
+            crate::bail!(
+                "conv1d: input length ({l}) with padding ({}) is too small for \
+                 kernel_size={}, dilation={} (effective kernel size={effective_k})",
+                self.padding,
+                self.l_k,
+                self.dilation,
+            );
+        }
+        Ok((padded - effective_k) / self.stride + 1)
     }
 }
 
@@ -1014,7 +1025,7 @@ impl Map1 for Im2Col1D {
             padding,
         } = self;
         let (b, c, l) = layout.shape().dims3()?;
-        let l_out = self.l_out(l);
+        let l_out = self.l_out(l)?;
         let src = &vs[layout.start_offset()..];
         let mut dst = vec![T::zero(); b * l_out * c * l_k];
         let (src_s0, src_s1, src_s2) = {
