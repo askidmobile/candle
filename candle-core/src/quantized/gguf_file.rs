@@ -79,6 +79,49 @@ impl TensorInfo {
             device,
         )
     }
+
+    /// Read a tensor directly from a byte slice (e.g., mmap'd GGUF data).
+    ///
+    /// Unlike [`read`], this avoids allocating a temporary `Vec<u8>` for each tensor.
+    /// The slice is passed directly to `qtensor_from_ggml`, which for Metal/CUDA
+    /// copies data into device memory without an intermediate heap allocation.
+    /// For CPU, `data.to_vec()` still allocates, but the mmap source doesn't need
+    /// a separate `Vec<u8>` copy.
+    ///
+    /// This eliminates heap fragmentation from large temporary allocations
+    /// during model loading (e.g., ~206 MB for Qwen3-0.6B).
+    pub fn read_from_slice(
+        &self,
+        data: &[u8],
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+            )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let start = (tensor_data_offset + self.offset) as usize;
+        let end = start + size_in_bytes;
+        if end > data.len() {
+            crate::bail!(
+                "tensor data out of bounds: need {}..{} but data len is {}",
+                start,
+                end,
+                data.len()
+            )
+        }
+        let raw_data = &data[start..end];
+        super::ggml_file::qtensor_from_ggml(
+            self.ggml_dtype,
+            raw_data,
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -478,6 +521,18 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    /// Load a tensor directly from a byte slice (e.g., mmap'd file data).
+    ///
+    /// This is a zero-copy alternative to [`tensor`] that avoids temporary `Vec<u8>`
+    /// allocations per tensor. Use with mmap'd GGUF files to eliminate heap fragmentation.
+    pub fn tensor_from_slice(&self, data: &[u8], name: &str, device: &Device) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_from_slice(data, self.tensor_data_offset, device)
     }
 }
 
