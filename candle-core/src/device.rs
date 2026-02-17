@@ -499,4 +499,15 @@ impl Device {
             Self::Metal(d) => d.synchronize(),
         }
     }
+
+    /// Освободить неиспользуемые Metal буферы из buffer pool.
+    /// На CPU/CUDA — no-op.
+    /// Вызывать после synchronize() для освобождения памяти.
+    pub fn flush_buffers(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(_) => Ok(()),
+            Self::Metal(d) => d.flush_buffers(),
+        }
+    }
 }
