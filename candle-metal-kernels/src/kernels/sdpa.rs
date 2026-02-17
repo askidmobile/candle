@@ -78,11 +78,11 @@ pub fn call_sdpa_full(
 
     const BQ: usize = 32;
     let bd = q_shape[q_shape.len() - 1];
-    if ![32, 64, 72, 80, 96, 128, 256].contains(&bd) {
+    if ![32, 48, 64, 72, 80, 96, 128, 256].contains(&bd) {
         return Err(MetalKernelError::SdpaHeadSizeMismatch {
             variation: "full",
             got: bd,
-            expected: vec![32, 64, 72, 80, 96, 128, 256],
+            expected: vec![32, 48, 64, 72, 80, 96, 128, 256],
         });
     };
     let bk = if bd < 128 { 32 } else { 16 };
