@@ -1,7 +1,7 @@
 use super::Config;
 use crate::quantized_nn::{layer_norm, linear, linear_no_bias, Embedding, Linear};
 pub use crate::quantized_var_builder::VarBuilder;
-use candle::{Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv1d, Conv1dConfig, LayerNorm, Module};
 
 fn conv1d(
@@ -74,11 +74,16 @@ impl MultiHeadAttention {
                     self.kv_cache = None;
                 }
                 if let Some((k, v)) = &self.kv_cache {
-                    (k.clone(), v.clone())
+                    // f16 KV-cache: приводим обратно к рабочему dtype при чтении.
+                    let working_dtype = q.dtype();
+                    (k.to_dtype(working_dtype)?, v.to_dtype(working_dtype)?)
                 } else {
                     let k = self.key.forward(x)?;
                     let v = self.value.forward(x)?;
-                    self.kv_cache = Some((k.clone(), v.clone()));
+                    // Хранение в f16 для экономии ~240 МБ (Whisper large-v3).
+                    let k_cached = k.to_dtype(DType::F16)?;
+                    let v_cached = v.to_dtype(DType::F16)?;
+                    self.kv_cache = Some((k_cached, v_cached));
                     (k, v)
                 }
             }
@@ -102,29 +107,51 @@ impl MultiHeadAttention {
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (_, n_ctx, n_state) = q.dims3()?;
-        let scale = ((n_state / self.n_head) as f64).powf(-0.25);
-        let q = (self.reshape_head(q)? * scale)?;
-        let k = (self.reshape_head(k)?.transpose(2, 3)? * scale)?;
-        let v = self.reshape_head(v)?.contiguous()?;
-        let mut qk = {
-            let _enter = self.matmul_span.enter();
-            q.matmul(&k)?
-        };
-        if let Some(mask) = mask {
-            let mask = mask.i((0..n_ctx, 0..n_ctx))?;
-            qk = qk.broadcast_add(&mask)?
+        let head_dim = n_state / self.n_head;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q = self.reshape_head(q)?;
+        let k = self.reshape_head(k)?;
+        let v = self.reshape_head(v)?;
+
+        // Fused SDPA на Metal GPU, matmul fallback для CPU
+        let use_sdpa = q.device().is_metal();
+
+        if use_sdpa {
+            let sdpa_mask = match mask {
+                Some(mask) => {
+                    let mask = mask.i((0..n_ctx, 0..n_ctx))?;
+                    Some(mask.unsqueeze(0)?.unsqueeze(0)?)
+                }
+                None => None,
+            };
+
+            let wv = candle_nn::ops::sdpa(&q, &k, &v, sdpa_mask.as_ref(), false, scale, 1.0)?;
+            wv.transpose(1, 2)?.flatten_from(2)
+        } else {
+            let scale_f64 = scale as f64;
+            let k_t = k.transpose(2, 3)?;
+            let mut qk = {
+                let _enter = self.matmul_span.enter();
+                (q.matmul(&k_t)? * scale_f64)?
+            };
+            if let Some(mask) = mask {
+                let mask = mask.i((0..n_ctx, 0..n_ctx))?;
+                qk = qk.broadcast_add(&mask)?
+            }
+            let w = {
+                let _enter = self.softmax_span.enter();
+                candle_nn::ops::softmax_last_dim(&qk)?
+            };
+            let v = v.contiguous()?;
+            let wv = {
+                let _enter = self.matmul_span.enter();
+                w.matmul(&v)?
+            }
+            .transpose(1, 2)?
+            .flatten_from(2)?;
+            Ok(wv)
         }
-        let w = {
-            let _enter = self.softmax_span.enter();
-            candle_nn::ops::softmax_last_dim(&qk)?
-        };
-        let wv = {
-            let _enter = self.matmul_span.enter();
-            w.matmul(&v)?
-        }
-        .transpose(1, 2)?
-        .flatten_from(2)?;
-        Ok(wv)
     }
 
     fn reset_kv_cache(&mut self) {
