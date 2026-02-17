@@ -136,6 +136,41 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Flush all unused buffers from the Metal buffer pool.
+    ///
+    /// Removes buffers with `strong_count == 1` (only the pool holds a reference)
+    /// and removes empty size buckets. Call after model loading to reclaim memory
+    /// used by intermediate buffers (dequantization temporaries, etc.).
+    pub fn flush_buffers(&self) -> Result<()> {
+        self.drop_unused_buffers()?;
+        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+        buffers.retain(|_, v| !v.is_empty());
+        Ok(())
+    }
+
+    /// Returns buffer pool statistics: `(total_buffers, total_bytes, unused_buffers, unused_bytes)`.
+    ///
+    /// Unused buffers have `strong_count == 1` and can be reclaimed by [`flush_buffers`].
+    pub fn buffer_pool_stats(&self) -> Result<(usize, usize, usize, usize)> {
+        let buffers = self.buffers.read().map_err(MetalError::from)?;
+        let mut total_count = 0usize;
+        let mut total_bytes = 0usize;
+        let mut unused_count = 0usize;
+        let mut unused_bytes = 0usize;
+        for subbuffers in buffers.values() {
+            for buf in subbuffers {
+                let len = buf.length();
+                total_count += 1;
+                total_bytes += len;
+                if Arc::strong_count(buf) == 1 {
+                    unused_count += 1;
+                    unused_bytes += len;
+                }
+            }
+        }
+        Ok((total_count, total_bytes, unused_count, unused_bytes))
+    }
+
     pub fn command_encoder(&self) -> Result<ComputeCommandEncoder> {
         let commands = self.commands.write().map_err(MetalError::from)?;
         let (flush, command_encoder) = commands.command_encoder().map_err(MetalError::from)?;
