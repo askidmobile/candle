@@ -5,6 +5,13 @@ use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 #[derive(Debug, Clone)]
 pub struct MetalDevice;
 
+impl MetalDevice {
+    /// No-op stub for non-macOS platforms (Metal не поддерживается).
+    pub fn flush_buffers(&self) -> Result<()> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+}
+
 #[derive(Debug)]
 pub struct MetalStorage;
 
