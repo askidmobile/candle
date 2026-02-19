@@ -250,6 +250,27 @@ impl MetalDevice {
         Ok(new_buffer)
     }
 
+    /// Создаёт Metal-буфер без копирования данных (zero-copy) из mmap'd памяти.
+    ///
+    /// Буфер НЕ добавляется в пул буферов MetalDevice — он привязан к mmap
+    /// и не должен переиспользоваться другими операциями.
+    ///
+    /// Требования:
+    /// - `ptr` ДОЛЖЕН быть page-aligned (mmap гарантирует это)
+    /// - `len` ДОЛЖЕН быть кратен page size (иначе Metal вернёт ошибку)
+    /// - Вызывающий код ОБЯЗАН гарантировать, что mmap живёт дольше буфера
+    pub fn new_buffer_no_copy(
+        &self,
+        ptr: *mut std::ffi::c_void,
+        len: usize,
+    ) -> Result<Arc<Buffer>> {
+        let new_buffer = self
+            .device
+            .new_buffer_no_copy(ptr, len, RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        Ok(Arc::new(new_buffer))
+    }
+
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
         let buffer = self.allocate_buffer(size_in_bytes)?;
         let blit = self.blit_command_encoder()?;

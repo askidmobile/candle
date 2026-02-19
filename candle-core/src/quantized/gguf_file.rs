@@ -122,6 +122,22 @@ impl TensorInfo {
             device,
         )
     }
+
+    /// Вычисляет смещение и размер тензора в файле (для zero-copy Metal buffer).
+    ///
+    /// Возвращает (offset_in_bytes, size_in_bytes) от начала файла (не от tensor_data_offset).
+    pub fn byte_range(&self, tensor_data_offset: u64) -> Result<(usize, usize)> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+            )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let start = (tensor_data_offset + self.offset) as usize;
+        Ok((start, size_in_bytes))
+    }
 }
 
 #[derive(Debug)]
@@ -533,6 +549,35 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read_from_slice(data, self.tensor_data_offset, device)
+    }
+
+    /// Вычисляет byte range тензора по имени.
+    ///
+    /// Для zero-copy Metal buffer: возвращает (offset, size) тензора в файле.
+    pub fn tensor_byte_range(&self, name: &str) -> Result<(usize, usize)> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.byte_range(self.tensor_data_offset)
+    }
+
+    /// Возвращает ggml_dtype тензора по имени.
+    pub fn tensor_dtype(&self, name: &str) -> Result<GgmlDType> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        Ok(tensor_info.ggml_dtype)
+    }
+
+    /// Возвращает shape тензора по имени.
+    pub fn tensor_shape(&self, name: &str) -> Result<Vec<usize>> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        Ok(tensor_info.shape.dims().to_vec())
     }
 }
 

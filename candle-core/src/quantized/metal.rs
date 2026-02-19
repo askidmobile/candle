@@ -8,6 +8,12 @@ pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
     buffer: Arc<Buffer>,
+    /// Смещение в байтах от начала буфера до данных этого тензора.
+    /// Для обычных буферов (per-tensor) = 0.
+    /// Для shared NoCopy буфера (mmap zero-copy) = смещение тензора в файле.
+    offset: usize,
+    /// Размер данных тензора в байтах. None = весь буфер (обратная совместимость).
+    tensor_size: Option<usize>,
 }
 
 impl QMetalStorage {
@@ -18,6 +24,8 @@ impl QMetalStorage {
             buffer,
             device: device.clone(),
             dtype,
+            offset: 0,
+            tensor_size: None,
         })
     }
 
@@ -33,13 +41,19 @@ impl QMetalStorage {
         &self.buffer
     }
 
+    /// Смещение в байтах от начала буфера до данных этого тензора.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
     pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 
-        let buffer = self.device.allocate_buffer(self.buffer.length())?;
+        let copy_size = self.storage_size_in_bytes();
+        let buffer = self.device.allocate_buffer(copy_size)?;
         let blit = self.device.blit_command_encoder()?;
         blit.set_label("blit_to_cpu");
-        blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+        blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, copy_size);
         blit.end_encoding();
         self.device.wait_until_completed()?;
         let mut out = vec![0.0; elem_count];
@@ -125,6 +139,7 @@ impl QMetalStorage {
         qcpu_storage.quantize(&src)?;
         let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
         self.buffer = buffer;
+        self.offset = 0;
         Ok(())
     }
 
@@ -142,6 +157,7 @@ impl QMetalStorage {
         qcpu_storage.quantize_imatrix(&src, imatrix_weights, n_per_row)?;
         let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
         self.buffer = buffer;
+        self.offset = 0;
         Ok(())
     }
 
@@ -163,6 +179,7 @@ impl QMetalStorage {
 
         let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
         self.buffer = buffer;
+        self.offset = 0;
         Ok(())
     }
 
@@ -179,11 +196,12 @@ impl QMetalStorage {
 
         let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
         self.buffer = buffer;
+        self.offset = 0;
         Ok(())
     }
 
     pub fn storage_size_in_bytes(&self) -> usize {
-        self.buffer.length()
+        self.tensor_size.unwrap_or(self.buffer.length())
     }
 
     fn fwd_mv(
@@ -234,6 +252,7 @@ impl QMetalStorage {
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
                 &self.buffer,
+                self.offset,
                 batch_id * n * DType::F32.size_in_bytes(),
                 &dst,
             )
@@ -317,6 +336,7 @@ impl QMetalStorage {
             src0_l.dims(),
             &src0_stride,
             &self.buffer,
+            self.offset,
             src1_l.dims(),
             &src1_l
                 .stride()
@@ -336,15 +356,16 @@ impl QMetalStorage {
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
-        let buffer = self.device.allocate_buffer(self.buffer.length())?;
+        let size = self.storage_size_in_bytes();
+        let buffer = self.device.allocate_buffer(size)?;
         {
             let blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+            blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, size);
             blit.end_encoding();
         }
         self.device.wait_until_completed()?;
-        Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
+        Ok(read_to_vec::<u8>(&buffer, size))
     }
 }
 
@@ -358,6 +379,29 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         dtype: T::DTYPE,
         device,
         buffer,
+        offset: 0,
+        tensor_size: None,
+    }))
+}
+
+/// Создаёт QStorage из shared NoCopy Metal-буфера (zero-copy mmap).
+///
+/// Вместо копирования данных в отдельный Metal buffer, ссылается на часть
+/// общего буфера через offset. Размер буфера = весь файл, offset указывает
+/// на начало данных конкретного тензора.
+pub fn load_quantized_from_shared_buffer(
+    device: &MetalDevice,
+    shared_buffer: Arc<Buffer>,
+    dtype: super::GgmlDType,
+    offset: usize,
+    tensor_size: usize,
+) -> Result<QStorage> {
+    Ok(QStorage::Metal(QMetalStorage {
+        dtype,
+        device: device.clone(),
+        buffer: shared_buffer,
+        offset,
+        tensor_size: Some(tensor_size),
     }))
 }
 

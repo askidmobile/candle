@@ -188,6 +188,47 @@ pub fn qtensor_from_ggml(
     }
 }
 
+/// Создаёт QTensor из shared Metal NoCopy buffer (zero-copy mmap).
+///
+/// Вместо копирования данных в отдельный Metal buffer, этот метод ссылается
+/// на часть общего NoCopy buffer через offset. Данные остаются в mmap'd памяти,
+/// Metal GPU обращается к ним напрямую через unified memory.
+///
+/// Для CPU и CUDA fallback'ит на обычный `qtensor_from_ggml`.
+#[cfg(feature = "metal")]
+pub fn qtensor_from_shared_metal_buffer(
+    ggml_dtype: GgmlDType,
+    shared_buffer: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+    offset: usize,
+    tensor_size: usize,
+    dims: Vec<usize>,
+    device: &Device,
+) -> Result<super::QTensor> {
+    let tensor_elems = dims.iter().product::<usize>();
+    let block_size = ggml_dtype.block_size();
+    if tensor_elems % block_size != 0 {
+        crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+    }
+
+    match device {
+        Device::Metal(metal) => {
+            let data = super::metal::load_quantized_from_shared_buffer(
+                metal,
+                shared_buffer,
+                ggml_dtype,
+                offset,
+                tensor_size,
+            )?;
+            super::QTensor::new(data, dims)
+        }
+        _ => {
+            crate::bail!("qtensor_from_shared_metal_buffer requires Metal device")
+        }
+    }
+}
+
 fn read_one_tensor<R: std::io::Seek + std::io::Read>(
     reader: &mut R,
     magic: VersionedMagic,

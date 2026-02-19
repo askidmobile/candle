@@ -88,6 +88,34 @@ impl Device {
         }
     }
 
+    /// Создаёт Metal-буфер без копирования данных (zero-copy).
+    ///
+    /// Использует `newBufferWithBytesNoCopy` — Metal ссылается на существующую память
+    /// вместо копирования. Требования:
+    /// - `pointer` ДОЛЖЕН быть выровнен по page boundary (`getpagesize()`, обычно 16384)
+    /// - Вызывающий код ОБЯЗАН гарантировать, что память живёт дольше буфера
+    /// - `deallocator = None` — мы управляем временем жизни через mmap/Arc
+    ///
+    /// Идеально для mmap'd файлов моделей: mmap всегда page-aligned.
+    pub fn new_buffer_no_copy(
+        &self,
+        pointer: *mut c_void,
+        length: usize,
+        options: MTLResourceOptions,
+    ) -> Result<Buffer, MetalKernelError> {
+        let pointer = ptr::NonNull::new(pointer).ok_or_else(|| {
+            MetalKernelError::FailedToCreateResource("NoCopy buffer: null pointer".to_string())
+        })?;
+        unsafe {
+            self.as_ref()
+                .newBufferWithBytesNoCopy_length_options_deallocator(pointer, length, options, None)
+                .map(Buffer::new)
+                .ok_or(MetalKernelError::FailedToCreateResource(
+                    "NoCopy Buffer (pointer may not be page-aligned)".to_string(),
+                ))
+        }
+    }
+
     pub fn new_library_with_source(
         &self,
         source: &str,
