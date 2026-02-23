@@ -126,12 +126,17 @@ impl MultiHeadAttention {
             )?;
             wv.transpose(1, 2)?.flatten_from(2)
         } else {
-            // Decoder self-attention с causal mask / CPU fallback
-            let scale_f64 = scale as f64;
-            let k_t = k.transpose(2, 3)?;
+            // Decoder self-attention с causal mask / CPU fallback.
+            // Применяем scale к q и k раздельно (x^{-0.25} + x^{-0.25} = x^{-0.5}),
+            // что одновременно создаёт contiguous копии после reshape+transpose —
+            // необходимо для Metal matmul, который не поддерживает non-contiguous strides.
+            let scale_quarter = (head_dim as f64).powf(-0.25);
+            let q = (q * scale_quarter)?;
+            let k = (k.transpose(2, 3)? * scale_quarter)?;
+            let v = v.contiguous()?;
             let mut qk = {
                 let _enter = self.matmul_span.enter();
-                (q.matmul(&k_t)? * scale_f64)?
+                q.matmul(&k)?
             };
             if let Some(mask) = mask {
                 let mask = mask.i((0..n_ctx, 0..n_ctx))?;
@@ -141,7 +146,6 @@ impl MultiHeadAttention {
                 let _enter = self.softmax_span.enter();
                 candle_nn::ops::softmax_last_dim(&qk)?
             };
-            let v = v.contiguous()?;
             let wv = {
                 let _enter = self.matmul_span.enter();
                 w.matmul(&v)?
