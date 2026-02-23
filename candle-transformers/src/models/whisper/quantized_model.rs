@@ -63,6 +63,10 @@ impl MultiHeadAttention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let q = self.query.forward(x)?;
+        // Encoder self-attention: xa=None, mask=None → безопасно для SDPA.
+        // Decoder self-attention: xa=None, mask=Some → matmul (SDPA не поддерживает causal mask).
+        // Decoder cross-attention: xa=Some, mask=None → matmul (SDPA даёт мусор на GGUF).
+        let is_encoder_self_attn = xa.is_none() && mask.is_none();
         let (k, v) = match xa {
             None => {
                 let k = self.key.forward(x)?;
@@ -83,7 +87,7 @@ impl MultiHeadAttention {
                 }
             }
         };
-        let wv = self.qkv_attention(&q, &k, &v, mask)?;
+        let wv = self.qkv_attention(&q, &k, &v, mask, is_encoder_self_attn)?;
         let out = self.out.forward(&wv)?;
         Ok(out)
     }
@@ -100,31 +104,49 @@ impl MultiHeadAttention {
         k: &Tensor,
         v: &Tensor,
         mask: Option<&Tensor>,
+        use_sdpa: bool,
     ) -> Result<Tensor> {
         let (_, n_ctx, n_state) = q.dims3()?;
-        let scale = ((n_state / self.n_head) as f64).powf(-0.25);
-        let q = (self.reshape_head(q)? * scale)?;
-        let k = (self.reshape_head(k)?.transpose(2, 3)? * scale)?;
-        let v = self.reshape_head(v)?.contiguous()?;
-        let mut qk = {
-            let _enter = self.matmul_span.enter();
-            q.matmul(&k)?
-        };
-        if let Some(mask) = mask {
-            let mask = mask.i((0..n_ctx, 0..n_ctx))?;
-            qk = qk.broadcast_add(&mask)?
+        let head_dim = n_state / self.n_head;
+
+        let q = self.reshape_head(q)?; // (B, H, S, D)
+        let k = self.reshape_head(k)?; // (B, H, KV_S, D)
+        let v = self.reshape_head(v)?; // (B, H, KV_S, D)
+
+        // Fused SDPA только для encoder self-attention на Metal GPU.
+        // Encoder: длинные последовательности (750+ токенов), mask=None → SDPA даёт ~20% ускорение.
+        // Decoder: SDPA не используется — cross-attention даёт мусор на GGUF моделях,
+        // self-attention требует causal mask (не поддерживается SDPA vector path).
+        if use_sdpa && q.device().is_metal() {
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let wv = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
+            wv.transpose(1, 2)?.flatten_from(2)
+        } else {
+            // Matmul path: pre-matmul scaling создаёт contiguous копии (необходимо для Metal).
+            let scale = (head_dim as f64).powf(-0.25);
+            let q = (q * scale)?;
+            let k = (k.transpose(2, 3)? * scale)?;
+            let v = v.contiguous()?;
+            let mut qk = {
+                let _enter = self.matmul_span.enter();
+                q.matmul(&k)?
+            };
+            if let Some(mask) = mask {
+                let mask = mask.i((0..n_ctx, 0..n_ctx))?;
+                qk = qk.broadcast_add(&mask)?
+            }
+            let w = {
+                let _enter = self.softmax_span.enter();
+                candle_nn::ops::softmax_last_dim(&qk)?
+            };
+            let wv = {
+                let _enter = self.matmul_span.enter();
+                w.matmul(&v)?
+            }
+            .transpose(1, 2)?
+            .flatten_from(2)?;
+            Ok(wv)
         }
-        let w = {
-            let _enter = self.softmax_span.enter();
-            candle_nn::ops::softmax_last_dim(&qk)?
-        };
-        let wv = {
-            let _enter = self.matmul_span.enter();
-            w.matmul(&v)?
-        }
-        .transpose(1, 2)?
-        .flatten_from(2)?;
-        Ok(wv)
     }
 
     fn reset_kv_cache(&mut self) {
