@@ -116,41 +116,34 @@ impl MultiHeadAttention {
         let k = self.reshape_head(k)?; // (B, H, KV_S, D)
         let v = self.reshape_head(v)?; // (B, H, KV_S, D)
 
-        // Fused SDPA только для encoder self-attention на Metal GPU.
-        // Decoder cross-attention (xa=Some, mask=None): SDPA вызывает hallucinations (мусорные токены).
-        // Decoder self-attention (mask=Some): SDPA vector path не поддерживает causal mask.
-        let use_sdpa = use_sdpa && q.device().is_metal();
-
-        if use_sdpa {
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            let wv = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
-            wv.transpose(1, 2)?.flatten_from(2)
-        } else {
-            // Matmul path: pre-matmul scaling создаёт contiguous копии (необходимо для Metal).
-            let scale = (head_dim as f64).powf(-0.25);
-            let q = (q * scale)?;
-            let k = (k.transpose(2, 3)? * scale)?;
-            let v = v.contiguous()?;
-            let mut qk = {
-                let _enter = self.matmul_span.enter();
-                q.matmul(&k)?
-            };
-            if let Some(mask) = mask {
-                let mask = mask.i((0..n_ctx, 0..n_ctx))?;
-                qk = qk.broadcast_add(&mask)?
-            }
-            let w = {
-                let _enter = self.softmax_span.enter();
-                candle_nn::ops::softmax_last_dim(&qk)?
-            };
-            let wv = {
-                let _enter = self.matmul_span.enter();
-                w.matmul(&v)?
-            }
-            .transpose(1, 2)?
-            .flatten_from(2)?;
-            Ok(wv)
+        // Matmul path для всех attention (encoder, decoder self, decoder cross).
+        // SDPA Metal kernel вызывает hallucinations в Whisper decoder (cross-attention),
+        // и числовые артефакты в encoder при параллельной GPU нагрузке.
+        // Pre-matmul scaling создаёт contiguous копии (необходимо для Metal).
+        let _ = use_sdpa; // reserved для будущего включения SDPA после исправления kernel
+        let scale = (head_dim as f64).powf(-0.25);
+        let q = (q * scale)?;
+        let k = (k.transpose(2, 3)? * scale)?;
+        let v = v.contiguous()?;
+        let mut qk = {
+            let _enter = self.matmul_span.enter();
+            q.matmul(&k)?
+        };
+        if let Some(mask) = mask {
+            let mask = mask.i((0..n_ctx, 0..n_ctx))?;
+            qk = qk.broadcast_add(&mask)?
         }
+        let w = {
+            let _enter = self.softmax_span.enter();
+            candle_nn::ops::softmax_last_dim(&qk)?
+        };
+        let wv = {
+            let _enter = self.matmul_span.enter();
+            w.matmul(&v)?
+        }
+        .transpose(1, 2)?
+        .flatten_from(2)?;
+        Ok(wv)
     }
 
     fn reset_kv_cache(&mut self) {
