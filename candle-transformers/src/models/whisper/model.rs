@@ -66,6 +66,10 @@ impl MultiHeadAttention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let q = self.query.forward(x)?;
+        // Encoder self-attention: xa=None, mask=None → безопасно для SDPA.
+        // Decoder self-attention: xa=None, mask=Some → matmul (causal mask).
+        // Decoder cross-attention: xa=Some, mask=None → matmul (SDPA вызывает hallucinations).
+        let is_encoder_self_attn = xa.is_none() && mask.is_none();
         let (k, v) = match xa {
             None => {
                 let k = self.key.forward(x)?;
@@ -86,7 +90,7 @@ impl MultiHeadAttention {
                 }
             }
         };
-        let wv = self.qkv_attention(&q, &k, &v, mask)?;
+        let wv = self.qkv_attention(&q, &k, &v, mask, is_encoder_self_attn)?;
         let out = self.out.forward(&wv)?;
         Ok(out)
     }
@@ -103,6 +107,7 @@ impl MultiHeadAttention {
         k: &Tensor,
         v: &Tensor,
         mask: Option<&Tensor>,
+        use_sdpa: bool,
     ) -> Result<Tensor> {
         let (_, n_ctx, n_state) = q.dims3()?;
         let head_dim = n_state / self.n_head;
@@ -111,10 +116,10 @@ impl MultiHeadAttention {
         let k = self.reshape_head(k)?; // (B, H, KV_S, D)
         let v = self.reshape_head(v)?; // (B, H, KV_S, D)
 
-        // Fused SDPA на Metal GPU для encoder self-attention и decoder cross-attention (mask=None).
-        // Decoder self-attention (mask=Some) использует matmul: SDPA vector path (q_seq<=8)
-        // не поддерживает causal mask.
-        let use_sdpa = q.device().is_metal() && mask.is_none();
+        // Fused SDPA только для encoder self-attention на Metal GPU.
+        // Decoder cross-attention (xa=Some, mask=None): SDPA вызывает hallucinations (мусорные токены).
+        // Decoder self-attention (mask=Some): SDPA vector path не поддерживает causal mask.
+        let use_sdpa = use_sdpa && q.device().is_metal();
 
         if use_sdpa {
             let scale = 1.0 / (head_dim as f32).sqrt();
