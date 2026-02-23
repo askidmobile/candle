@@ -110,25 +110,23 @@ impl MultiHeadAttention {
         let head_dim = n_state / self.n_head;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let q = self.reshape_head(q)?;
-        let k = self.reshape_head(k)?;
-        let v = self.reshape_head(v)?;
+        let q = self.reshape_head(q)?; // (B, H, S, D)
+        let k = self.reshape_head(k)?; // (B, H, KV_S, D)
+        let v = self.reshape_head(v)?; // (B, H, KV_S, D)
 
-        // Fused SDPA на Metal GPU, matmul fallback для CPU
-        let use_sdpa = q.device().is_metal();
+        // Fused SDPA на Metal GPU для encoder self-attention и cross-attention (mask=None).
+        // Decoder self-attention (mask=Some) использует matmul: SDPA vector path (q_seq<=8)
+        // не поддерживает causal mask, а full path требует shape (B,H,S,kS) вместо (1,1,S,S).
+        let use_sdpa = q.device().is_metal() && mask.is_none();
 
         if use_sdpa {
-            let sdpa_mask = match mask {
-                Some(mask) => {
-                    let mask = mask.i((0..n_ctx, 0..n_ctx))?;
-                    Some(mask.unsqueeze(0)?.unsqueeze(0)?)
-                }
-                None => None,
-            };
-
-            let wv = candle_nn::ops::sdpa(&q, &k, &v, sdpa_mask.as_ref(), false, scale, 1.0)?;
+            let wv = candle_nn::ops::sdpa(
+                &q, &k, &v, None, false, // encoder/cross-attention: без causal mask
+                scale, 1.0, // без softcapping
+            )?;
             wv.transpose(1, 2)?.flatten_from(2)
         } else {
+            // Decoder self-attention с causal mask / CPU fallback
             let scale_f64 = scale as f64;
             let k_t = k.transpose(2, 3)?;
             let mut qk = {

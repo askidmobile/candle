@@ -119,32 +119,19 @@ impl MultiHeadAttention {
         let k = self.reshape_head(k)?; // (B, H, KV_S, D)
         let v = self.reshape_head(v)?; // (B, H, KV_S, D)
 
-        // Fused SDPA на Metal GPU: steel_attention kernel с O(N) memory.
-        // Fallback на matmul для CPU (SDPA не имеет CPU реализации).
-        let use_sdpa = q.device().is_metal();
+        // Fused SDPA на Metal GPU для encoder self-attention и cross-attention (mask=None).
+        // Decoder self-attention (mask=Some) использует matmul: SDPA vector path (q_seq<=8)
+        // не поддерживает causal mask, а full path требует shape (B,H,S,kS) вместо (1,1,S,S).
+        let use_sdpa = q.device().is_metal() && mask.is_none();
 
         if use_sdpa {
-            // Подготовка additive mask для SDPA: (n_ctx, n_ctx) → (1, 1, n_ctx, n_ctx)
-            let sdpa_mask = match mask {
-                Some(mask) => {
-                    let mask = mask.i((0..n_ctx, 0..n_ctx))?;
-                    Some(mask.unsqueeze(0)?.unsqueeze(0)?)
-                }
-                None => None,
-            };
-
             let wv = candle_nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                sdpa_mask.as_ref(),
-                false, // маска уже явная, не causal
-                scale,
-                1.0, // без softcapping
+                &q, &k, &v, None, false, // encoder/cross-attention: без causal mask
+                scale, 1.0, // без softcapping
             )?;
             wv.transpose(1, 2)?.flatten_from(2)
         } else {
-            // CPU fallback: стандартный matmul attention
+            // Decoder self-attention с causal mask / CPU fallback
             let scale_f64 = scale as f64;
             let k_t = k.transpose(2, 3)?;
             let mut qk = {
