@@ -122,8 +122,8 @@ impl MultiHeadAttention {
         // Pre-matmul scaling создаёт contiguous копии (необходимо для Metal).
         let _ = use_sdpa; // reserved для будущего включения SDPA после исправления kernel
         let scale = (head_dim as f64).powf(-0.25);
-        let q = (q * scale)?;
-        let k = (k.transpose(2, 3)? * scale)?;
+        let q = (q * scale)?.contiguous()?;
+        let k = (k.transpose(2, 3)? * scale)?.contiguous()?;
         let v = v.contiguous()?;
         let mut qk = {
             let _enter = self.matmul_span.enter();
