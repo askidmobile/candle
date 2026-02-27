@@ -219,6 +219,38 @@ impl Commands {
         Ok(())
     }
 
+    /// Статистика command buffer pool (best-effort, не atomic snapshot):
+    /// `(entries, in_flight_total, encoding_entries, total_compute_count)`.
+    ///
+    /// Значения могут быть несогласованы между собой, т.к. lock на каждый entry
+    /// захватывается и отпускается независимо. Используйте только для диагностики.
+    pub fn pool_stats(&self) -> Result<(usize, usize, usize, usize), MetalKernelError> {
+        let mut in_flight_total = 0usize;
+        let mut encoding_entries = 0usize;
+        let mut total_compute_count = 0usize;
+
+        for entry in &self.pool {
+            let state = entry.state.lock()?;
+            in_flight_total += state.in_flight.len();
+            drop(state);
+
+            if let Ok(status) = entry.semaphore.status.try_lock() {
+                if matches!(*status, CommandStatus::Encoding) {
+                    encoding_entries += 1;
+                }
+            }
+
+            total_compute_count += entry.compute_count.load(Ordering::Acquire);
+        }
+
+        Ok((
+            self.pool.len(),
+            in_flight_total,
+            encoding_entries,
+            total_compute_count,
+        ))
+    }
+
     /// Commit the current command buffer, swap in a fresh one, push the old into `in_flight`,
     /// and reset `compute_count` to `reset_to`.
     fn commit_swap_locked(

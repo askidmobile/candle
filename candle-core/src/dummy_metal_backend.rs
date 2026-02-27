@@ -10,6 +10,11 @@ impl MetalDevice {
     pub fn flush_buffers(&self) -> Result<()> {
         Err(Error::NotCompiledWithMetalSupport)
     }
+
+    /// No-op stub for non-macOS platforms.
+    pub fn purge_buffer_pool(&self) -> Result<()> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
 }
 
 #[derive(Debug)]

@@ -510,4 +510,21 @@ impl Device {
             Self::Metal(d) => d.flush_buffers(),
         }
     }
+
+    /// Агрессивно очистить Metal buffer pool и kernel caches.
+    ///
+    /// Включает ожидание завершения in-flight операций и полную очистку
+    /// внутреннего allocator pool для возврата памяти системе.
+    /// На CPU/CUDA — no-op.
+    ///
+    /// **Внимание**: после вызова Metal shaders будут перекомпилированы при
+    /// следующем использовании (cold-start spike). Вызывайте только при teardown.
+    /// См. [`MetalDevice::purge_buffer_pool`] для подробностей.
+    pub fn purge_buffers(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(_) => Ok(()),
+            Self::Metal(d) => d.purge_buffer_pool(),
+        }
+    }
 }

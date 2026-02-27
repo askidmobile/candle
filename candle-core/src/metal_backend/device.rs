@@ -148,6 +148,30 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Агрессивная очистка buffer pool.
+    ///
+    /// В отличие от `flush_buffers()` полностью очищает все size buckets
+    /// после ожидания завершения in-flight GPU команд. Также очищает
+    /// кэши скомпилированных Metal libraries и pipeline state objects.
+    ///
+    /// # Важные замечания
+    ///
+    /// - **Cold-start spike**: после вызова все Metal shaders будут перекомпилированы
+    ///   при следующем использовании (~50-200мс на каждый source). Вызывайте только
+    ///   при teardown движка, а не между инференсами.
+    ///
+    /// - **Живые Arc-ссылки**: буферы, на которые существуют `Arc`-ссылки из
+    ///   живых тензоров (`MetalStorage`), не будут физически освобождены — только
+    ///   удалены из pool. Новые аллокации создадут новые буферы вместо
+    ///   переиспользования. Вызывайте после drop всех тензоров модели.
+    pub fn purge_buffer_pool(&self) -> Result<()> {
+        self.wait_until_completed()?;
+        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+        buffers.clear();
+        let _ = self.kernels.clear_caches();
+        Ok(())
+    }
+
     /// Returns buffer pool statistics: `(total_buffers, total_bytes, unused_buffers, unused_bytes)`.
     ///
     /// Unused buffers have `strong_count == 1` and can be reclaimed by [`flush_buffers`].
@@ -169,6 +193,27 @@ impl MetalDevice {
             }
         }
         Ok((total_count, total_bytes, unused_count, unused_bytes))
+    }
+
+    /// Статистика command pool:
+    /// `(entries, in_flight_total, encoding_entries, total_compute_count)`.
+    pub fn command_pool_stats(&self) -> Result<(usize, usize, usize, usize)> {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands.pool_stats().map_err(MetalError::from)?)
+    }
+
+    /// Размеры kernel caches: `(libraries, pipelines)`.
+    pub fn kernel_cache_stats(&self) -> Result<(usize, usize)> {
+        Ok(self.kernels.cache_stats().map_err(MetalError::from)?)
+    }
+
+    /// Сводная статистика runtime памяти Metal:
+    /// `(current_allocated_bytes, recommended_max_working_set_bytes)`.
+    pub fn metal_memory_stats(&self) -> (usize, usize) {
+        (
+            self.device.current_allocated_size(),
+            self.device.recommended_max_working_set_size(),
+        )
     }
 
     pub fn command_encoder(&self) -> Result<ComputeCommandEncoder> {
