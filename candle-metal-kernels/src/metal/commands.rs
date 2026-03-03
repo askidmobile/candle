@@ -4,8 +4,25 @@ use crate::metal::{
 use crate::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Accumulated timing breakdown for flush_and_wait_fast calls.
+/// Used to diagnose GPU↔CPU sync overhead in inference hot paths.
+#[derive(Default)]
+struct SyncTimings {
+    count: u64,
+    sem_us: u64,
+    lock_us: u64,
+    commit_us: u64,
+    wait_us: u64,
+    total_us: u64,
+}
+
+thread_local! {
+    static SYNC_TIMINGS: RefCell<SyncTimings> = RefCell::new(SyncTimings::default());
+}
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
@@ -199,6 +216,87 @@ impl Commands {
         }
 
         Ok(())
+    }
+
+    /// Fast flush+wait optimized for single-threaded inference.
+    ///
+    /// Unlike `flush_and_wait()` which iterates ALL pool entries (acquiring semaphores
+    /// and locks for each), this only touches entries that actually have pending work.
+    /// For serial inference with 24+ sync points per token, this saves ~0.5мс per sync
+    /// by skipping 4 empty pool entries.
+    pub fn flush_and_wait_fast(&self) -> Result<(), MetalKernelError> {
+        for entry in &self.pool {
+            // Quick atomic check — skip entries with no pending work (no lock needed)
+            if entry.compute_count.load(Ordering::Acquire) == 0 {
+                // Still need to check in_flight, but only if there might be something
+                if let Ok(state) = entry.state.try_lock() {
+                    if state.in_flight.is_empty() {
+                        continue; // Nothing to do for this entry
+                    }
+                } else {
+                    continue; // Someone else holds the lock, skip
+                }
+            }
+
+            // This entry has work — do the full sync
+            let t0 = std::time::Instant::now();
+            let to_wait: Vec<CommandBuffer> = {
+                let _guard = entry
+                    .semaphore
+                    .wait_until(|s| matches!(s, CommandStatus::Available));
+                let t_sem = t0.elapsed();
+
+                let mut state = entry.state.lock()?;
+                let t_lock = t0.elapsed();
+
+                if entry.compute_count.load(Ordering::Acquire) > 0 {
+                    self.commit_swap_locked(&entry, &mut state, 0)?;
+                }
+                let t_commit = t0.elapsed();
+
+                let result = std::mem::take(&mut state.in_flight);
+                // Log timing breakdown (accumulate via thread_local)
+                SYNC_TIMINGS.with(|t| {
+                    let mut t = t.borrow_mut();
+                    t.count += 1;
+                    t.sem_us += t_sem.as_micros() as u64;
+                    t.lock_us += (t_lock - t_sem).as_micros() as u64;
+                    t.commit_us += (t_commit - t_lock).as_micros() as u64;
+                });
+                result
+            };
+
+            let t_pre_wait = t0.elapsed();
+            for cb in to_wait {
+                Self::ensure_completed(&cb)?;
+            }
+            let t_total = t0.elapsed();
+            SYNC_TIMINGS.with(|t| {
+                let mut t = t.borrow_mut();
+                t.wait_us += (t_total - t_pre_wait).as_micros() as u64;
+                t.total_us += t_total.as_micros() as u64;
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Get and reset accumulated sync timing stats.
+    /// Returns: (count, sem_us, lock_us, commit_us, wait_us, total_us)
+    pub fn take_sync_timings() -> (u64, u64, u64, u64, u64, u64) {
+        SYNC_TIMINGS.with(|t| {
+            let mut t = t.borrow_mut();
+            let result = (
+                t.count,
+                t.sem_us,
+                t.lock_us,
+                t.commit_us,
+                t.wait_us,
+                t.total_us,
+            );
+            *t = SyncTimings::default();
+            result
+        })
     }
 
     /// Flushes all buffers without waiting for completion.

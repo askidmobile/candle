@@ -1951,6 +1951,63 @@ impl Tensor {
         }
     }
 
+    /// Fast version of `to_vec1` optimized for Metal inference.
+    /// Uses `to_cpu_storage_fast()` which skips empty command buffer pool entries.
+    /// Falls back to regular `to_vec1` for non-Metal storage.
+    #[cfg(feature = "metal")]
+    pub fn to_vec1_fast<S: crate::WithDType>(&self) -> Result<Vec<S>> {
+        if self.rank() != 1 {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: 1,
+                got: self.rank(),
+                shape: self.shape().clone(),
+            }
+            .bt())?
+        }
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+            let data = S::cpu_storage_as_slice(cpu_storage)?;
+            let data = match self.layout.contiguous_offsets() {
+                Some((o1, o2)) => data[o1..o2].to_vec(),
+                None => self.strided_index().map(|i| data[i]).collect(),
+            };
+            Ok::<Vec<_>, Error>(data)
+        };
+        match &*self.storage() {
+            Storage::Cpu(storage) => from_cpu_storage(storage),
+            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage_fast()?),
+            _ => self.to_vec1(),
+        }
+    }
+
+    /// Zero-copy version of `to_vec1` for Metal inference on Apple Silicon.
+    /// Reads directly from GPU buffer (StorageModeShared = unified memory).
+    /// No blit copy, no buffer allocation — only flush+wait.
+    /// Falls back to regular `to_vec1` for non-Metal storage.
+    #[cfg(feature = "metal")]
+    pub fn to_vec1_zero_copy<S: crate::WithDType>(&self) -> Result<Vec<S>> {
+        if self.rank() != 1 {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: 1,
+                got: self.rank(),
+                shape: self.shape().clone(),
+            }
+            .bt())?
+        }
+        let from_cpu_storage = |cpu_storage: &crate::CpuStorage| {
+            let data = S::cpu_storage_as_slice(cpu_storage)?;
+            let data = match self.layout.contiguous_offsets() {
+                Some((o1, o2)) => data[o1..o2].to_vec(),
+                None => self.strided_index().map(|i| data[i]).collect(),
+            };
+            Ok::<Vec<_>, Error>(data)
+        };
+        match &*self.storage() {
+            Storage::Cpu(storage) => from_cpu_storage(storage),
+            Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage_zero_copy()?),
+            _ => self.to_vec1(),
+        }
+    }
+
     /// Returns the data contained in a 2D tensor as a vector of vector of scalar values.
     pub fn to_vec2<S: crate::WithDType>(&self) -> Result<Vec<Vec<S>>> {
         let (dim1, dim2) = self.dims2()?;

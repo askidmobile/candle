@@ -240,6 +240,25 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Fast sync optimized for single-threaded inference workloads.
+    /// Only processes pool entries that have pending work, skipping empty ones.
+    pub fn wait_until_completed_fast(&self) -> Result<()> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.flush_and_wait_fast().map_err(MetalError::from)?;
+        Ok(())
+    }
+
+    /// Get and reset accumulated sync timing stats from flush_and_wait_fast.
+    /// Returns: (count, sem_us, lock_us, commit_us, wait_us, total_us)
+    pub fn take_sync_timings(&self) -> (u64, u64, u64, u64, u64, u64) {
+        Commands::take_sync_timings()
+    }
+
+    /// Static version — no device instance needed (timings are thread-local).
+    pub fn take_sync_timings_static() -> (u64, u64, u64, u64, u64, u64) {
+        Commands::take_sync_timings()
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }
