@@ -85,3 +85,11 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
 ) -> Result<super::QStorage> {
     Err(Error::NotCompiledWithMetalSupport)
 }
+
+pub fn load_quantized_bytes(
+    _device: &MetalDevice,
+    _data: &[u8],
+    _dtype: super::GgmlDType,
+) -> Result<super::QStorage> {
+    Err(Error::NotCompiledWithMetalSupport)
+}

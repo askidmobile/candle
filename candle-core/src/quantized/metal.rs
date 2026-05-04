@@ -119,6 +119,20 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ1S
+            | GgmlDType::IQ4NL
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ1M => {
+                crate::bail!(
+                    "Metal dequantization is not implemented for {:?}",
+                    self.dtype
+                )
+            }
         }
 
         let buffer = self.device.new_buffer_with_data(&out)?;
@@ -290,6 +304,27 @@ impl QMetalStorage {
             )
         }
 
+        if matches!(
+            self.dtype,
+            GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+                | GgmlDType::Q8K
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ1S
+                | GgmlDType::IQ4NL
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ4XS
+                | GgmlDType::IQ1M
+        ) {
+            return self.fwd_mv(self_shape, storage, layout);
+        }
+
         if src_shape.dim(D::Minus2)? == 1 {
             return self.fwd_mv(self_shape, storage, layout);
         }
@@ -384,6 +419,21 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     }))
 }
 
+pub fn load_quantized_bytes(
+    device: &MetalDevice,
+    data: &[u8],
+    dtype: super::GgmlDType,
+) -> Result<QStorage> {
+    let buffer = device.new_buffer_with_data(data)?;
+    Ok(QStorage::Metal(QMetalStorage {
+        dtype,
+        device: device.clone(),
+        buffer,
+        offset: 0,
+        tensor_size: None,
+    }))
+}
+
 /// Создаёт QStorage из shared NoCopy Metal-буфера (zero-copy mmap).
 ///
 /// Вместо копирования данных в отдельный Metal buffer, ссылается на часть
@@ -427,6 +477,15 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::Q5K => candle_metal_kernels::GgmlDType::Q5K,
             GgmlDType::Q6K => candle_metal_kernels::GgmlDType::Q6K,
             GgmlDType::Q8K => candle_metal_kernels::GgmlDType::Q8K,
+            GgmlDType::IQ2XXS => candle_metal_kernels::GgmlDType::IQ2XXS,
+            GgmlDType::IQ2XS => candle_metal_kernels::GgmlDType::IQ2XS,
+            GgmlDType::IQ3XXS => candle_metal_kernels::GgmlDType::IQ3XXS,
+            GgmlDType::IQ1S => candle_metal_kernels::GgmlDType::IQ1S,
+            GgmlDType::IQ4NL => candle_metal_kernels::GgmlDType::IQ4NL,
+            GgmlDType::IQ3S => candle_metal_kernels::GgmlDType::IQ3S,
+            GgmlDType::IQ2S => candle_metal_kernels::GgmlDType::IQ2S,
+            GgmlDType::IQ4XS => candle_metal_kernels::GgmlDType::IQ4XS,
+            GgmlDType::IQ1M => candle_metal_kernels::GgmlDType::IQ1M,
             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::F16,

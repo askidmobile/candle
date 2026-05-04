@@ -16,6 +16,15 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    IQ2XXS,
+    IQ2XS,
+    IQ3XXS,
+    IQ1S,
+    IQ4NL,
+    IQ3S,
+    IQ2S,
+    IQ4XS,
+    IQ1M,
     F16,
     F32,
     BF16,
@@ -104,6 +113,20 @@ pub fn call_quantized_matmul_mv_t(
             let align = 8;
             (nth0, nth1, align)
         }
+        GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ1S
+        | GgmlDType::IQ4NL
+        | GgmlDType::IQ3S
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ4XS
+        | GgmlDType::IQ1M => {
+            let nth0 = 8;
+            let nth1 = 8;
+            let align = 8;
+            (nth0, nth1, align)
+        }
         GgmlDType::F32 => {
             let nth0 = 32;
             let nth1 = 1;
@@ -134,6 +157,15 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q5K => "kernel_mul_mv_q5_K_f32",
         GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
         GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
+        GgmlDType::IQ2XXS => "kernel_mul_mv_iq2_xxs_f32",
+        GgmlDType::IQ2XS => "kernel_mul_mv_iq2_xs_f32",
+        GgmlDType::IQ3XXS => "kernel_mul_mv_iq3_xxs_f32",
+        GgmlDType::IQ1S => "kernel_mul_mv_iq1_s_f32",
+        GgmlDType::IQ4NL => "kernel_mul_mv_iq4_nl_f32",
+        GgmlDType::IQ3S => "kernel_mul_mv_iq3_s_f32",
+        GgmlDType::IQ2S => "kernel_mul_mv_iq2_s_f32",
+        GgmlDType::IQ4XS => "kernel_mul_mv_iq4_xs_f32",
+        GgmlDType::IQ1M => "kernel_mul_mv_iq1_m_f32",
         GgmlDType::F16 => "kernel_mul_mv_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mv_f32_f32",
@@ -171,6 +203,21 @@ pub fn call_quantized_matmul_mv_t(
     encoder.use_resource(lhs, MTLResourceUsage::Read);
     encoder.use_resource(rhs, MTLResourceUsage::Read);
     encoder.use_resource(dst, MTLResourceUsage::Write);
+
+    if matches!(
+        dtype,
+        GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ1S
+            | GgmlDType::IQ4NL
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ1M
+    ) {
+        encoder.set_threadgroup_memory_length(0, 8192);
+    }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -241,6 +288,15 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
         GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
         GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
+        GgmlDType::IQ2XXS => "kernel_mul_mm_iq2_xxs_f32",
+        GgmlDType::IQ2XS => "kernel_mul_mm_iq2_xs_f32",
+        GgmlDType::IQ3XXS => "kernel_mul_mm_iq3_xxs_f32",
+        GgmlDType::IQ1S => "kernel_mul_mm_iq1_s_f32",
+        GgmlDType::IQ4NL => "kernel_mul_mm_iq4_nl_f32",
+        GgmlDType::IQ3S => "kernel_mul_mm_iq3_s_f32",
+        GgmlDType::IQ2S => "kernel_mul_mm_iq2_s_f32",
+        GgmlDType::IQ4XS => "kernel_mul_mm_iq4_xs_f32",
+        GgmlDType::IQ1M => "kernel_mul_mm_iq1_m_f32",
         GgmlDType::F16 => "kernel_mul_mm_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
