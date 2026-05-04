@@ -2034,7 +2034,7 @@ impl BackendDevice for MetalDevice {
             device
                 .new_buffer_with_data(
                     [299792458u64].as_ptr() as *const c_void,
-                    std::mem::size_of::<u64>(),
+                    4,
                     RESOURCE_OPTIONS,
                 )
                 .map_err(MetalError::from)?,
