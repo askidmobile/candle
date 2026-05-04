@@ -77,8 +77,7 @@ impl Device {
         length: usize,
         options: MTLResourceOptions,
     ) -> Result<Buffer, MetalKernelError> {
-        let pointer = ptr::NonNull::new(pointer as *mut c_void)
-            .ok_or_else(|| MetalKernelError::InvalidInput("Null pointer".to_string()))?;
+        let pointer = ptr::NonNull::new(pointer as *mut c_void).unwrap();
         unsafe {
             self.as_ref()
                 .newBufferWithBytes_length_options(pointer, length, options)
@@ -125,7 +124,7 @@ impl Device {
         let raw = self
             .as_ref()
             .newLibraryWithSource_options_error(&NSString::from_str(source), options)
-            .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?;
+            .unwrap();
 
         Ok(Library::new(raw))
     }
@@ -137,14 +136,13 @@ impl Device {
         let raw = self
             .as_ref()
             .newComputePipelineStateWithFunction_error(function.as_ref())
-            .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
+            .unwrap();
         Ok(ComputePipeline::new(raw))
     }
 
     pub fn new_command_queue(&self) -> Result<CommandQueue, MetalKernelError> {
-        self.as_ref()
-            .newCommandQueue()
-            .ok_or_else(|| MetalKernelError::FailedToCreateResource("CommandQueue".to_string()))
+        let raw = self.as_ref().newCommandQueue().unwrap();
+        Ok(raw)
     }
 
     pub fn recommended_max_working_set_size(&self) -> usize {
