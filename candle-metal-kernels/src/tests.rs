@@ -2487,3 +2487,30 @@ fn commands_concurrent_acquisition() {
 
     commands.wait_until_completed().unwrap();
 }
+
+#[test]
+fn kernel_mul_mm_f16_instantiations_compile() {
+    let device = device();
+    let kernels = Kernels::new();
+    let f32_names = [
+        "kernel_mul_mm_q4_0_f32",
+        "kernel_mul_mm_q6_K_f32",
+    ];
+    let f16_names = [
+        "kernel_mul_mm_q4_0_f16",
+        "kernel_mul_mm_q4_1_f16",
+        "kernel_mul_mm_q5_0_f16",
+        "kernel_mul_mm_q5_1_f16",
+        "kernel_mul_mm_q8_0_f16",
+        "kernel_mul_mm_q2_K_f16",
+        "kernel_mul_mm_q3_K_f16",
+        "kernel_mul_mm_q4_K_f16",
+        "kernel_mul_mm_q5_K_f16",
+        "kernel_mul_mm_q6_K_f16",
+    ];
+    for name in f32_names.iter().chain(f16_names.iter()) {
+        kernels
+            .load_pipeline(&device, Source::Quantized, name.to_string())
+            .unwrap_or_else(|e| panic!("load_pipeline({name}) failed: {e}"));
+    }
+}
