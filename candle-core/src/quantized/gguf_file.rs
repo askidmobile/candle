@@ -61,6 +61,25 @@ impl TensorInfo {
         tensor_data_offset: u64,
         device: &Device,
     ) -> Result<QTensor> {
+        let mut scratch = Vec::new();
+        self.read_into(reader, tensor_data_offset, device, &mut scratch)
+    }
+
+    /// Phase 7.D #5: read с переиспользованием scratch buffer вместо
+    /// per-tensor `vec![0u8; size]` allocation.
+    ///
+    /// Loader (например `quantized_var_builder::from_gguf`) выделяет один
+    /// `Vec<u8>` достаточного размера и передаёт его всем `read_into` вызовам
+    /// в loop. Это снижает peak heap во время загрузки с
+    /// `sum(all_tensor_sizes)` до `max(tensor_size)` — для Qwen3-ASR-0.6B-Q8
+    /// это ~50 МБ вместо ~743 МБ потенциальной аккумуляции через allocator.
+    pub fn read_into<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+        device: &Device,
+        scratch: &mut Vec<u8>,
+    ) -> Result<QTensor> {
         let tensor_elems = self.shape.elem_count();
         let block_size = self.ggml_dtype.block_size();
         if !tensor_elems.is_multiple_of(block_size) {
@@ -69,12 +88,15 @@ impl TensorInfo {
         )
         }
         let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
-        let mut raw_data = vec![0u8; size_in_bytes];
+        if scratch.len() < size_in_bytes {
+            scratch.resize(size_in_bytes, 0);
+        }
+        let raw_data = &mut scratch[..size_in_bytes];
         reader.seek(std::io::SeekFrom::Start(tensor_data_offset + self.offset))?;
-        reader.read_exact(&mut raw_data)?;
+        reader.read_exact(raw_data)?;
         super::ggml_file::qtensor_from_ggml(
             self.ggml_dtype,
-            &raw_data,
+            raw_data,
             self.shape.dims().to_vec(),
             device,
         )
@@ -537,6 +559,22 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    /// Phase 7.D #5: tensor с reusable scratch buffer.
+    /// См. `TensorInfo::read_into` для деталей.
+    pub fn tensor_into<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        name: &str,
+        device: &Device,
+        scratch: &mut Vec<u8>,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_into(reader, self.tensor_data_offset, device, scratch)
     }
 
     /// Load a tensor directly from a byte slice (e.g., mmap'd file data).

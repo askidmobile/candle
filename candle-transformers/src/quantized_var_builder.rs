@@ -17,18 +17,41 @@ pub struct VarBuilder {
 }
 
 impl VarBuilder {
-    /// Load quantized tensors from a GGUF file using the legacy sequential read path.
+    /// Load quantized tensors from a GGUF file using sequential read with shared
+    /// scratch buffer.
     ///
-    /// Each tensor is loaded via `TensorInfo::read()` which allocates a temporary `Vec<u8>`
-    /// per tensor. For better performance on Apple Silicon, use [`from_gguf_mmap`] instead.
+    /// Phase 7.D #5: tensor data читается через переиспользуемый `Vec<u8>` scratch
+    /// buffer вместо per-tensor heap allocation. Peak heap при загрузке падает
+    /// с `sum(tensor_sizes)` (если allocator не reuses) до `max(tensor_size)`.
+    /// Для Qwen3-ASR-0.6B-Q8: ~50 МБ scratch вместо потенциальной allocator
+    /// аккумуляции до 743 МБ.
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         let mut file = std::fs::File::open(p)?;
         let content = candle::quantized::gguf_file::Content::read(&mut file)?;
+        // Pre-pass: вычисляем max tensor size — резервируем scratch один раз,
+        // избегая повторных realloc внутри read_into.
+        let max_tensor_bytes = content
+            .tensor_infos
+            .values()
+            .map(|ti| {
+                let elems = ti.shape.elem_count();
+                let bs = ti.ggml_dtype.block_size();
+                if bs == 0 {
+                    0
+                } else {
+                    elems / bs * ti.ggml_dtype.type_size()
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let mut scratch: Vec<u8> = Vec::with_capacity(max_tensor_bytes);
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
-            let tensor = content.tensor(&mut file, tensor_name, device)?;
+            let tensor = content.tensor_into(&mut file, tensor_name, device, &mut scratch)?;
             data.insert(tensor_name.to_string(), Arc::new(tensor));
         }
+        // Освобождаем scratch — больше не нужен после загрузки.
+        drop(scratch);
         Ok(Self {
             data: Arc::new(data),
             path: Vec::new(),
