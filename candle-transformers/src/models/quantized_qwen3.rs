@@ -312,9 +312,22 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
-        let md_get = |s: &str| match gg.metadata().get(s) {
-            None => candle::bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
+        // Поддерживаем оба prefix'а: `qwen3.*` (стандартный Qwen3 LLM) и
+        // `qwen3vl.*` (Qwen3-VL/Qwen3-ASR — text-only часть имеет ту же
+        // архитектуру и tensor naming, отличается только prefix metadata).
+        let md_get = |s: &str| {
+            let v = gg.metadata().get(s);
+            if let Some(v) = v {
+                return Ok(v);
+            }
+            // Fallback: попробовать `qwen3vl.*` если запрашивали `qwen3.*`.
+            if let Some(rest) = s.strip_prefix("qwen3.") {
+                let alt = format!("qwen3vl.{}", rest);
+                if let Some(v) = gg.metadata().get(&alt) {
+                    return Ok(v);
+                }
+            }
+            candle::bail!("cannot find {s} in metadata")
         };
 
         let num_attention_heads = md_get("qwen3.attention.head_count")?.to_u32()? as usize;
@@ -423,6 +436,47 @@ impl ModelWeights {
         let _enter = self.span_output.enter();
         let last_hidden = h.narrow(1, l - 1, 1)?;
         self.lm_head.forward(&last_hidden)?.squeeze(1)
+    }
+
+    /// Forward pass с pre-computed embeddings (вместо token IDs).
+    ///
+    /// Используется в multimodal pipeline'ах (ASR, VL) где входная
+    /// последовательность — combined audio_embeds + text_embeds.
+    /// Skip embedding lookup — input уже [batch, seq, hidden_size].
+    ///
+    /// Возвращает logits **только последнего токена**: [batch, vocab].
+    pub fn forward_embeds(&mut self, embeds: &Tensor, offset: usize) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (b, l, _h) = embeds.dims3()?;
+        let mut h = embeds.clone();
+        let causal_mask = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset, None)?)
+        };
+        for layer in &mut self.layers {
+            h = layer.forward(&h, causal_mask.as_ref(), offset)?;
+        }
+        let h = self.norm.forward(&h)?;
+        let _enter = self.span_output.enter();
+        let last_hidden = h.narrow(1, l - 1, 1)?;
+        self.lm_head.forward(&last_hidden)?.squeeze(1)
+    }
+
+    /// Доступ к embed_tokens — для построения text embeddings в multimodal
+    /// контекстах (где вход — concatenation audio + text embeddings).
+    pub fn embed_tokens(&self) -> &Embedding {
+        &self.embed_tokens
+    }
+
+    /// Hidden size модели (для размерности audio projector outputs).
+    pub fn hidden_size(&self) -> usize {
+        self.embed_tokens.embeddings().dim(1).unwrap_or(0)
+    }
+
+    /// Тип данных модели (F16 / F32 / BF16) — для cast audio embeds.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     pub fn clear_kv_cache(&mut self) {
