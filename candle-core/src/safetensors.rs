@@ -513,6 +513,46 @@ impl MmapedSafetensors {
         };
         Ok(self.safetensors[index].get().0.tensor(name)?)
     }
+
+    /// Подсказывает kernel что mmap pages не нужны (madvise MADV_DONTNEED).
+    ///
+    /// Phase 7.D #4: на macOS file-backed mmap pages засчитываются в RSS
+    /// процесса. После полной загрузки tensors в device (Metal/CUDA) эти
+    /// pages становятся бесполезны — данные уже скопированы в GPU buffers.
+    /// `advise_dontneed` сообщает kernel освободить page cache, что снижает
+    /// peak RSS на 500-800 МБ для крупных моделей.
+    ///
+    /// **Важно:** после вызова **повторное чтение** из этого `MmapedSafetensors`
+    /// потребует re-faulting pages (медленнее). Используйте только когда вы
+    /// уверены, что больше не будете загружать тензоры через этот экземпляр.
+    ///
+    /// На non-Unix platforms — no-op (memmap2::UncheckedAdvice доступен только Unix).
+    ///
+    /// # Safety
+    ///
+    /// `MADV_DONTNEED` помечен в memmap2 как unsafe потому что доступы к pages
+    /// после advise могут вернуть нули для anonymous mappings или
+    /// re-fault'нуться для file mappings — это может выглядеть как UB. Но мы
+    /// используем **read-only file mapping** (safetensors), и после advise
+    /// мы **не читаем** mmap pages (тензоры скопированы в device buffer).
+    /// Так что вызов безопасен в этом контексте.
+    pub fn advise_dontneed(&self) {
+        #[cfg(unix)]
+        for st in &self.safetensors {
+            // SAFETY: read-only file mapping, дальнейших чтений не будет
+            // (см. doc-comment выше).
+            unsafe {
+                let cart = st.backing_cart();
+                // На macOS MADV_DONTNEED для file-backed mappings часто игнорируется
+                // (kernel оптимизирует под page cache reuse). MADV_FREE_REUSABLE
+                // гарантированно вычитает pages из RSS — Darwin-only.
+                #[cfg(target_vendor = "apple")]
+                let _ = cart.unchecked_advise(memmap2::UncheckedAdvice::FreeReusable);
+                #[cfg(not(target_vendor = "apple"))]
+                let _ = cart.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
+            }
+        }
+    }
 }
 
 pub struct SliceSafetensors<'a> {

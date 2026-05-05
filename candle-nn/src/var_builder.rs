@@ -64,6 +64,12 @@ pub trait Backend: Send + Sync {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     fn contains_tensor(&self, name: &str) -> bool;
+
+    /// Hint to OS that mmap'd backing pages are no longer needed (memory-mapped
+    /// backends only). Default: no-op for non-mmap backends. Useful после load
+    /// модели в device buffers — освобождает file page cache, который иначе
+    /// засчитывается в RSS на macOS.
+    fn advise_dontneed(&self) {}
 }
 
 pub trait SimpleBackend: Send + Sync {
@@ -81,6 +87,10 @@ pub trait SimpleBackend: Send + Sync {
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor>;
 
     fn contains_tensor(&self, name: &str) -> bool;
+
+    /// Hint to OS that mmap'd backing pages are no longer needed.
+    /// Default: no-op. Override для memory-mapped backends.
+    fn advise_dontneed(&self) {}
 }
 
 impl Backend for Box<dyn SimpleBackend + '_> {
@@ -102,6 +112,10 @@ impl Backend for Box<dyn SimpleBackend + '_> {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.as_ref().contains_tensor(name)
+    }
+
+    fn advise_dontneed(&self) {
+        self.as_ref().advise_dontneed()
     }
 }
 
@@ -161,6 +175,15 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
     /// Short alias for `push_prefix`.
     pub fn pp<S: ToString>(&self, s: S) -> Self {
         self.push_prefix(s)
+    }
+
+    /// Hint to OS that mmap'd backing pages are no longer needed. Should be
+    /// called после полной загрузки tensors из этого VarBuilder в device
+    /// buffers — освобождает file page cache, который засчитывается в RSS
+    /// process'a на macOS (~500-800 МБ для крупных моделей).
+    /// На non-mmap backends — no-op.
+    pub fn advise_mmap_dontneed(&self) {
+        self.data.backend.advise_dontneed();
     }
 
     /// The device used by default.
@@ -525,6 +548,14 @@ impl SimpleBackend for candle::safetensors::MmapedSafetensors {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.get(name).is_ok()
+    }
+
+    fn advise_dontneed(&self) {
+        // Phase 7.D #4: подсказывает kernel что mmap pages не нужны.
+        // На macOS file page cache от mmap засчитывается в RSS process'a;
+        // после загрузки тензоров в device buffers эти pages бесполезны.
+        // Вызывать после полного load модели.
+        self.advise_dontneed();
     }
 }
 
