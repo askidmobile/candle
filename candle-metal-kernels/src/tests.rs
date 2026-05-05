@@ -2514,3 +2514,46 @@ fn kernel_mul_mm_f16_instantiations_compile() {
             .unwrap_or_else(|e| panic!("load_pipeline({name}) failed: {e}"));
     }
 }
+
+#[test]
+fn kernel_mul_mv_f16_instantiations_compile() {
+    let device = device();
+    let kernels = Kernels::new();
+    // Все 10 F32 mv-kernels (back-compat) и 10 F16 mv-kernels (новые).
+    let f32_names = [
+        "kernel_mul_mv_q4_0_f32",
+        "kernel_mul_mv_q4_1_f32",
+        "kernel_mul_mv_q5_0_f32",
+        "kernel_mul_mv_q5_1_f32",
+        "kernel_mul_mv_q8_0_f32",
+        "kernel_mul_mv_q2_K_f32",
+        "kernel_mul_mv_q3_K_f32",
+        "kernel_mul_mv_q4_K_f32",
+        "kernel_mul_mv_q5_K_f32",
+        "kernel_mul_mv_q6_K_f32",
+        // mul_mv_id F32 — после rename impls
+        "kernel_mul_mv_id_q8_0_f32",
+        "kernel_mul_mv_id_q2_K_f32",
+        "kernel_mul_mv_id_q3_K_f32",
+        "kernel_mul_mv_id_q4_K_f32",
+        "kernel_mul_mv_id_q5_K_f32",
+        "kernel_mul_mv_id_q6_K_f32",
+    ];
+    let f16_names = [
+        "kernel_mul_mv_q4_0_f16",
+        "kernel_mul_mv_q4_1_f16",
+        "kernel_mul_mv_q5_0_f16",
+        "kernel_mul_mv_q5_1_f16",
+        "kernel_mul_mv_q8_0_f16",
+        "kernel_mul_mv_q2_K_f16",
+        "kernel_mul_mv_q3_K_f16",
+        "kernel_mul_mv_q4_K_f16",
+        "kernel_mul_mv_q5_K_f16",
+        "kernel_mul_mv_q6_K_f16",
+    ];
+    for name in f32_names.iter().chain(f16_names.iter()) {
+        kernels
+            .load_pipeline(&device, Source::Quantized, name.to_string())
+            .unwrap_or_else(|e| panic!("load_pipeline({name}) failed: {e}"));
+    }
+}
