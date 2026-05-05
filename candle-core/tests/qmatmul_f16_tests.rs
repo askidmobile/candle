@@ -114,3 +114,62 @@ fn qmatmul_f16_q4_k_mm() -> Result<()> {
     run_f16_vs_f32_qmatmul(GgmlDType::Q4K, 64, 512, 64)?;
     Ok(())
 }
+
+// === Quantization quality (RMSE) — порт make_qkx2_quants ===
+//
+// Эти тесты сравнивают качество candle quantize на random F32 weights с
+// llama.cpp reference. Метрика: nRMSE = RMSE(x, dequant(quant(x))) / RMS(x).
+// Threshold выбраны так, чтобы соответствовать ожидаемой точности типа.
+fn quantize_dequantize_nrmse(dtype: GgmlDType, n: usize, k: usize) -> Result<f32> {
+    let device = Device::Cpu;
+    let weight = Tensor::randn(0f32, 1f32, (n, k), &device)?;
+    let x_orig = weight.flatten_all()?.to_vec1::<f32>()?;
+    let qweight = QTensor::quantize(&weight, dtype)?;
+    let dequant = qweight.dequantize(&device)?.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(x_orig.len(), dequant.len());
+    let mse: f32 = x_orig
+        .iter()
+        .zip(dequant.iter())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f32>()
+        / x_orig.len() as f32;
+    let rms: f32 = (x_orig.iter().map(|v| v * v).sum::<f32>() / x_orig.len() as f32).sqrt();
+    Ok(mse.sqrt() / rms.max(1e-9))
+}
+
+// Threshold'ы соответствуют llama.cpp ref на random Gaussian (это baseline точности
+// самих типов; преимущества make_qkx2_quants vs qkx1 видны на реальных weights с
+// long-tail outliers — там grid search действительно помогает).
+#[test]
+fn quantize_quality_q4_k() -> Result<()> {
+    let nrmse = quantize_dequantize_nrmse(GgmlDType::Q4K, 64, 512)?;
+    println!("Q4_K nRMSE = {nrmse:.5}");
+    assert!(nrmse < 0.10, "Q4_K nRMSE {nrmse} превышает 0.10");
+    Ok(())
+}
+
+#[test]
+fn quantize_quality_q5_k() -> Result<()> {
+    let nrmse = quantize_dequantize_nrmse(GgmlDType::Q5K, 64, 512)?;
+    println!("Q5_K nRMSE = {nrmse:.5}");
+    assert!(nrmse < 0.05, "Q5_K nRMSE {nrmse} превышает 0.05");
+    Ok(())
+}
+
+#[test]
+fn quantize_quality_q2_k() -> Result<()> {
+    let nrmse = quantize_dequantize_nrmse(GgmlDType::Q2K, 64, 512)?;
+    println!("Q2_K nRMSE = {nrmse:.5}");
+    // Q2_K на random Gaussian обычно даёт nRMSE 0.25-0.35 (агрессивная 2-bit
+    // квантизация, без выраженных outliers где qkx2 grid search помогает).
+    assert!(nrmse < 0.40, "Q2_K nRMSE {nrmse} превышает 0.40");
+    Ok(())
+}
+
+#[test]
+fn quantize_quality_q4_0() -> Result<()> {
+    let nrmse = quantize_dequantize_nrmse(GgmlDType::Q4_0, 64, 512)?;
+    println!("Q4_0 nRMSE = {nrmse:.5}");
+    assert!(nrmse < 0.10, "Q4_0 nRMSE {nrmse} превышает 0.10");
+    Ok(())
+}

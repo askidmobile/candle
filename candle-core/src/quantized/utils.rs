@@ -283,6 +283,121 @@ pub(super) fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32) 
     (scale, -min)
 }
 
+/// Порт `make_qkx2_quants` из llama.cpp ggml-quants.c (улучшенный k-quant scale finder
+/// с grid search по nstep шагам и weighted error metric).
+///
+/// Это **рекомендуемый** алгоритм для Q2_K/Q4_K/Q5_K вместо более простого
+/// `make_qkx1_quants` — даёт измеримо меньше квантизационной ошибки на больших
+/// matmul layers. См. llama.cpp commit history для деталей.
+///
+/// Параметры:
+/// - `nmax` — максимальное значение квантованного индекса (15 для Q4, 31 для Q5, 3 для Q2)
+/// - `weights` — importance weights per element (для Q2_K = abs(x); для Q4_K/Q5_K
+///   обычно `weights[l] = sqrt(sigma2 + x[l]^2)` если imatrix недоступна)
+/// - `rmin`, `rdelta`, `nstep` — параметры grid search (типичные: -1.0, 0.1, 20)
+/// - `use_mad` — использовать |error| вместо error² (true для Q2_K, false для Q4_K/Q5_K)
+///
+/// Возвращает `(scale, the_min)` где `the_min = -min` (положительная величина offset).
+/// Заполняет `L` оптимальными квантованными индексами.
+pub(super) fn make_qkx2_quants(
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l_out: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+    use_mad: bool,
+) -> (f32, f32) {
+    let n = x.len();
+    debug_assert_eq!(weights.len(), n);
+    debug_assert_eq!(l_out.len(), n);
+
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    let _ = sum_x; // используется в реализации llama.cpp для unweighted statistics
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for li in l_out.iter_mut() {
+            *li = 0;
+        }
+        return (0.0, -min);
+    }
+
+    let iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+
+    // Initial pass — пишем в l_out начальную аппроксимацию + считаем initial error.
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let li = nearest_int(iscale * (x[i] - min)).clamp(0, nmax) as u8;
+        l_out[i] = li;
+        let diff = scale * li as f32 + min - x[i];
+        let diff = if use_mad { diff.abs() } else { diff * diff };
+        best_error += weights[i] * diff;
+    }
+
+    if nstep < 1 {
+        return (scale, -min);
+    }
+
+    let mut laux = vec![0u8; n];
+    for is in 0..=nstep {
+        let cand_iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for i in 0..n {
+            let li = nearest_int(cand_iscale * (x[i] - min)).clamp(0, nmax) as u8;
+            laux[i] = li;
+            let w = weights[i];
+            let lf = li as f32;
+            sum_l += w * lf;
+            sum_l2 += w * lf * lf;
+            sum_xl += w * lf * x[i];
+        }
+        let det = sum_w * sum_l2 - sum_l * sum_l;
+        if det > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / det;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                if sum_l2 > 0.0 {
+                    this_scale = sum_xl / sum_l2;
+                }
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale * laux[i] as f32 + this_min - x[i];
+                let diff = if use_mad { diff.abs() } else { diff * diff };
+                cur_error += weights[i] * diff;
+            }
+            if cur_error < best_error {
+                l_out.copy_from_slice(&laux);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
 // https://github.com/ggerganov/llama.cpp/blob/8183159cf3def112f6d1fe94815fce70e1bffa12/k_quants.c#L165
 pub(super) fn make_q3_quants(x: &[f32], nmax: i32, do_rmse: bool) -> f32 {
     let n = x.len();

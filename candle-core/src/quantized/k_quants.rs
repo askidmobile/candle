@@ -3,7 +3,7 @@ use super::utils::{
     make_qkx1_quants, make_qx_quants, nearest_int,
 };
 use super::GgmlDType;
-use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
+use crate::quantized::utils::{make_qkx2_quants, make_qkx3_quants, make_qp_quants};
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
@@ -825,8 +825,27 @@ impl GgmlType for BlockQ2K {
             let mut mins: [f32; QK_K / 16] = [0.0; QK_K / 16];
             let mut scales: [f32; QK_K / 16] = [0.0; QK_K / 16];
 
+            // Q2_K: используем make_qkx2_quants (порт из llama.cpp ref) с
+            // weights = |x| и use_mad=true — даёт меньше квантизационной ошибки
+            // чем legacy make_qkx1_quants.
+            let mut weights = [0f32; 16];
+            let mut l_aux = [0u8; 16];
             for (j, x_scale_slice) in x.chunks(16).enumerate() {
-                (scales[j], mins[j]) = make_qkx1_quants(3, 5, x_scale_slice);
+                for (w, &xv) in weights.iter_mut().zip(x_scale_slice.iter()) {
+                    *w = xv.abs();
+                }
+                let (s, m) = make_qkx2_quants(
+                    3,
+                    x_scale_slice,
+                    &weights,
+                    &mut l_aux,
+                    -0.5,
+                    0.1,
+                    15,
+                    true,
+                );
+                scales[j] = s;
+                mins[j] = m;
             }
             // get max scale and max min and ensure they are >= 0.0
             let max_scale = scales.iter().fold(0.0, |max, &val| val.max(max));
@@ -1456,8 +1475,29 @@ impl GgmlType for BlockQ4K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
+            // Q4_K: make_qkx2_quants (порт llama.cpp ref) с
+            // weights[l] = av_x + |x[l]|, av_x = sqrt(sum(x²)/32),
+            // и параметрами grid search rmin=-1.0, rdelta=0.1, nstep=20.
+            let mut weights = [0f32; 32];
+            let mut l_aux = [0u8; 32];
             for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
-                (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
+                let sum_x2: f32 = x_scale_slice.iter().map(|v| v * v).sum();
+                let av_x = (sum_x2 / 32.0).sqrt();
+                for (w, &xv) in weights.iter_mut().zip(x_scale_slice.iter()) {
+                    *w = av_x + xv.abs();
+                }
+                let (s, m) = make_qkx2_quants(
+                    15,
+                    x_scale_slice,
+                    &weights,
+                    &mut l_aux,
+                    -1.0,
+                    0.1,
+                    20,
+                    false,
+                );
+                scales[j] = s;
+                mins[j] = m;
             }
 
             // get max scale and max min and ensure they are >= 0.0
@@ -1718,8 +1758,29 @@ impl GgmlType for BlockQ5K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
+            // Q5_K: make_qkx2_quants (порт llama.cpp ref) с
+            // weights[l] = av_x + |x[l]|, av_x = sqrt(sum(x²)/32),
+            // и параметрами grid search rmin=-0.5, rdelta=0.1, nstep=15.
+            let mut weights = [0f32; 32];
+            let mut l_aux = [0u8; 32];
             for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
-                (scales[j], mins[j]) = make_qkx1_quants(31, 5, x_scale_slice);
+                let sum_x2: f32 = x_scale_slice.iter().map(|v| v * v).sum();
+                let av_x = (sum_x2 / 32.0).sqrt();
+                for (w, &xv) in weights.iter_mut().zip(x_scale_slice.iter()) {
+                    *w = av_x + xv.abs();
+                }
+                let (s, m) = make_qkx2_quants(
+                    31,
+                    x_scale_slice,
+                    &weights,
+                    &mut l_aux,
+                    -0.5,
+                    0.1,
+                    15,
+                    false,
+                );
+                scales[j] = s;
+                mins[j] = m;
             }
 
             // get max scale and max min and ensure they are >= 0.0
