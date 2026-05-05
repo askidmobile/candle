@@ -36,6 +36,7 @@ pub fn call_quantized_matmul_mv_t(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    input_is_f16: bool,
     (b, m, n, k): (usize, usize, usize, usize),
     lhs: &Buffer,
     lhs_offset: usize,
@@ -144,31 +145,55 @@ pub fn call_quantized_matmul_mv_t(
         height: nth1,
         depth: 1,
     };
-    let name = match dtype {
-        GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f32",
-        GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
-        GgmlDType::Q2K => "kernel_mul_mv_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mv_q3_K_f32",
-        GgmlDType::Q4K => "kernel_mul_mv_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mv_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
-        GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
-        GgmlDType::IQ2XXS => "kernel_mul_mv_iq2_xxs_f32",
-        GgmlDType::IQ2XS => "kernel_mul_mv_iq2_xs_f32",
-        GgmlDType::IQ3XXS => "kernel_mul_mv_iq3_xxs_f32",
-        GgmlDType::IQ1S => "kernel_mul_mv_iq1_s_f32",
-        GgmlDType::IQ4NL => "kernel_mul_mv_iq4_nl_f32",
-        GgmlDType::IQ3S => "kernel_mul_mv_iq3_s_f32",
-        GgmlDType::IQ2S => "kernel_mul_mv_iq2_s_f32",
-        GgmlDType::IQ4XS => "kernel_mul_mv_iq4_xs_f32",
-        GgmlDType::IQ1M => "kernel_mul_mv_iq1_m_f32",
-        GgmlDType::F16 => "kernel_mul_mv_f16_f32",
-        GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
-        GgmlDType::F32 => "kernel_mul_mv_f32_f32",
+    // F16 input variants пока поддержаны только для базовых Q-типов
+    // (Phase 1-2 плана). IQ кванты, Q8_1, Q8K, F32/F16/BF16 weights —
+    // F32 input only (Phase 7 опц.).
+    let name: &str = if input_is_f16 {
+        match dtype {
+            GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f16",
+            GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f16",
+            GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f16",
+            GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f16",
+            GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f16",
+            GgmlDType::Q2K => "kernel_mul_mv_q2_K_f16",
+            GgmlDType::Q3K => "kernel_mul_mv_q3_K_f16",
+            GgmlDType::Q4K => "kernel_mul_mv_q4_K_f16",
+            GgmlDType::Q5K => "kernel_mul_mv_q5_K_f16",
+            GgmlDType::Q6K => "kernel_mul_mv_q6_K_f16",
+            _ => {
+                return Err(MetalKernelError::UnsupportedDTypeForOp(
+                    "non-Q4_0..Q6_K dtype + F16 input",
+                    "qmatmul_mv",
+                ))
+            }
+        }
+    } else {
+        match dtype {
+            GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f32",
+            GgmlDType::Q4_1 => "kernel_mul_mv_q4_1_f32",
+            GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f32",
+            GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f32",
+            GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f32",
+            GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
+            GgmlDType::Q2K => "kernel_mul_mv_q2_K_f32",
+            GgmlDType::Q3K => "kernel_mul_mv_q3_K_f32",
+            GgmlDType::Q4K => "kernel_mul_mv_q4_K_f32",
+            GgmlDType::Q5K => "kernel_mul_mv_q5_K_f32",
+            GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
+            GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
+            GgmlDType::IQ2XXS => "kernel_mul_mv_iq2_xxs_f32",
+            GgmlDType::IQ2XS => "kernel_mul_mv_iq2_xs_f32",
+            GgmlDType::IQ3XXS => "kernel_mul_mv_iq3_xxs_f32",
+            GgmlDType::IQ1S => "kernel_mul_mv_iq1_s_f32",
+            GgmlDType::IQ4NL => "kernel_mul_mv_iq4_nl_f32",
+            GgmlDType::IQ3S => "kernel_mul_mv_iq3_s_f32",
+            GgmlDType::IQ2S => "kernel_mul_mv_iq2_s_f32",
+            GgmlDType::IQ4XS => "kernel_mul_mv_iq4_xs_f32",
+            GgmlDType::IQ1M => "kernel_mul_mv_iq1_m_f32",
+            GgmlDType::F16 => "kernel_mul_mv_f16_f32",
+            GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
+            GgmlDType::F32 => "kernel_mul_mv_f32_f32",
+        }
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -231,6 +256,7 @@ pub fn call_quantized_matmul_mm_t(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    input_is_f16: bool,
     src0_shape: &[usize],
     src0_stride: &[usize],
     src0: &Buffer,
@@ -277,31 +303,55 @@ pub fn call_quantized_matmul_mm_t(
         height: 1,
         depth: 1,
     };
-    let name = match dtype {
-        GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
-        GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
-        GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
-        GgmlDType::IQ2XXS => "kernel_mul_mm_iq2_xxs_f32",
-        GgmlDType::IQ2XS => "kernel_mul_mm_iq2_xs_f32",
-        GgmlDType::IQ3XXS => "kernel_mul_mm_iq3_xxs_f32",
-        GgmlDType::IQ1S => "kernel_mul_mm_iq1_s_f32",
-        GgmlDType::IQ4NL => "kernel_mul_mm_iq4_nl_f32",
-        GgmlDType::IQ3S => "kernel_mul_mm_iq3_s_f32",
-        GgmlDType::IQ2S => "kernel_mul_mm_iq2_s_f32",
-        GgmlDType::IQ4XS => "kernel_mul_mm_iq4_xs_f32",
-        GgmlDType::IQ1M => "kernel_mul_mm_iq1_m_f32",
-        GgmlDType::F16 => "kernel_mul_mm_f16_f32",
-        GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
-        GgmlDType::F32 => "kernel_mul_mm_f32_f32",
-        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
-        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+    // F16 input variants пока поддержаны только для базовых Q-типов
+    // (Phase 1 плана). IQ кванты, Q8_1, Q8K, F32/F16/BF16 weights —
+    // F32 input only (Phase 7 опц.).
+    let name: &str = if input_is_f16 {
+        match dtype {
+            GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f16",
+            GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f16",
+            GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f16",
+            GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f16",
+            GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f16",
+            GgmlDType::Q2K => "kernel_mul_mm_q2_K_f16",
+            GgmlDType::Q3K => "kernel_mul_mm_q3_K_f16",
+            GgmlDType::Q4K => "kernel_mul_mm_q4_K_f16",
+            GgmlDType::Q5K => "kernel_mul_mm_q5_K_f16",
+            GgmlDType::Q6K => "kernel_mul_mm_q6_K_f16",
+            _ => {
+                return Err(MetalKernelError::UnsupportedDTypeForOp(
+                    "non-Q4_0..Q6_K dtype + F16 input",
+                    "qmatmul_mm",
+                ))
+            }
+        }
+    } else {
+        match dtype {
+            GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
+            GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",
+            GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
+            GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
+            GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
+            GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
+            GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
+            GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
+            GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
+            GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
+            GgmlDType::IQ2XXS => "kernel_mul_mm_iq2_xxs_f32",
+            GgmlDType::IQ2XS => "kernel_mul_mm_iq2_xs_f32",
+            GgmlDType::IQ3XXS => "kernel_mul_mm_iq3_xxs_f32",
+            GgmlDType::IQ1S => "kernel_mul_mm_iq1_s_f32",
+            GgmlDType::IQ4NL => "kernel_mul_mm_iq4_nl_f32",
+            GgmlDType::IQ3S => "kernel_mul_mm_iq3_s_f32",
+            GgmlDType::IQ2S => "kernel_mul_mm_iq2_s_f32",
+            GgmlDType::IQ4XS => "kernel_mul_mm_iq4_xs_f32",
+            GgmlDType::IQ1M => "kernel_mul_mm_iq1_m_f32",
+            GgmlDType::F16 => "kernel_mul_mm_f16_f32",
+            GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
+            GgmlDType::F32 => "kernel_mul_mm_f32_f32",
+            GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
+            GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+        }
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

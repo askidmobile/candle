@@ -296,12 +296,14 @@ impl QMetalStorage {
         let encoder = device.command_encoder()?;
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
+        let input_is_f16 = matches!(storage.dtype(), DType::F16);
         for batch_id in 0..m {
             candle_metal_kernels::call_quantized_matmul_mv_t(
                 device.device(),
                 &encoder,
                 device.kernels(),
                 self.dtype.into(),
+                input_is_f16,
                 (1, 1, n, k),
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
@@ -379,7 +381,13 @@ impl QMetalStorage {
         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
         let encoder = device.command_encoder()?;
 
-        assert_eq!(storage.dtype(), DType::F32);
+        if !matches!(storage.dtype(), DType::F32 | DType::F16) {
+            crate::bail!(
+                "qmatmul Metal mm path supports only F32/F16 input, got {:?}",
+                storage.dtype()
+            )
+        }
+        let input_is_f16 = matches!(storage.dtype(), DType::F16);
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
@@ -403,11 +411,14 @@ impl QMetalStorage {
             [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
         );
 
+        let src1_elem_bytes = storage.dtype().size_in_bytes();
+
         candle_metal_kernels::call_quantized_matmul_mm_t(
             device.device(),
             &encoder,
             device.kernels(),
             self.dtype.into(),
+            input_is_f16,
             src0_l.dims(),
             &src0_stride,
             &self.buffer,
@@ -416,10 +427,10 @@ impl QMetalStorage {
             &src1_l
                 .stride()
                 .iter()
-                .map(|x| x * DType::F32.size_in_bytes())
+                .map(|x| x * src1_elem_bytes)
                 .collect::<Vec<_>>(),
             storage.buffer(),
-            src1_l.start_offset() * storage.dtype().size_in_bytes(),
+            src1_l.start_offset() * src1_elem_bytes,
             dst_shape.dims(),
             0,
             &dst,
