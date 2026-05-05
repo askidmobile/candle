@@ -14,6 +14,7 @@ accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
 candle = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
+candle-metal-kernels = { workspace = true, optional = true }
 candle-nn = { workspace = true }
 fancy-regex = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
@@ -33,4 +34,4 @@ cuda = ["candle/cuda", "candle-nn/cuda"]
 cudnn = ["candle/cudnn", "candle-nn/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl"]
-metal = ["candle/metal", "candle-nn/metal"]
+metal = ["candle/metal", "candle-nn/metal", "dep:candle-metal-kernels"]

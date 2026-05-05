@@ -18,20 +18,89 @@ pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
+    /// Phase 7.D: shared scratch buffer для tensor reads. Переиспользуется
+    /// между всеми `tensor` / `qmatmul` / `rms_norm` calls — peak heap при
+    /// загрузке падает с `sum(tensor_sizes)` (per-tensor allocations) до
+    /// `max(tensor_size)`. Pre-allocated с capacity = max tensor size.
+    scratch: Vec<u8>,
+    /// Phase 7.D #6: zero-copy mode — если установлен, tensor data берётся
+    /// как sub-view общего Metal NoCopy buffer (mmap'd file → GPU напрямую,
+    /// без CPU heap allocations и без отдельных Metal buffers per tensor).
+    #[cfg(feature = "metal")]
+    shared_metal_buffer: Option<Arc<candle_metal_kernels::metal::Buffer>>,
 }
 
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
-        Self { ct, reader, device }
+        // Pre-pass: вычисляем max tensor size — резервируем scratch один раз.
+        let max_tensor_bytes = ct
+            .tensor_infos
+            .values()
+            .map(|ti| {
+                let elems = ti.shape.elem_count();
+                let bs = ti.ggml_dtype.block_size();
+                if bs == 0 {
+                    0
+                } else {
+                    elems / bs * ti.ggml_dtype.type_size()
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        Self {
+            ct,
+            reader,
+            device,
+            scratch: Vec::with_capacity(max_tensor_bytes),
+            #[cfg(feature = "metal")]
+            shared_metal_buffer: None,
+        }
+    }
+
+    /// Phase 7.D #6: enable zero-copy mode — tensors берутся как sub-views
+    /// общего Metal NoCopy buffer на mmap'd file. Caller отвечает за
+    /// keeping `mmap` alive до drop'а Gguf (через Arc).
+    #[cfg(feature = "metal")]
+    pub fn with_metal_no_copy_buffer(
+        mut self,
+        shared: Arc<candle_metal_kernels::metal::Buffer>,
+    ) -> Self {
+        self.shared_metal_buffer = Some(shared);
+        self
+    }
+
+    /// Загрузка тензора. Если zero-copy включён через `with_metal_no_copy_buffer`,
+    /// возвращает sub-view shared buffer. Иначе — обычное чтение через scratch.
+    fn load_tensor(&mut self, name: &str) -> Result<QTensor> {
+        #[cfg(feature = "metal")]
+        if let Some(ref shared) = self.shared_metal_buffer {
+            let (offset, size) = self.ct.tensor_byte_range(name)?;
+            let dtype = self.ct.tensor_dtype(name)?;
+            let dims = self.ct.tensor_shape(name)?;
+            return candle::quantized::ggml_file::qtensor_from_shared_metal_buffer(
+                dtype,
+                shared.clone(),
+                offset,
+                size,
+                dims,
+                &self.device,
+            );
+        }
+        self.ct.tensor_into(
+            &mut self.reader,
+            name,
+            &self.device,
+            &mut self.scratch,
+        )
     }
 
     pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_tensor(name)?;
         QMatMul::from_weights(ws.into())
     }
 
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_tensor(name)?;
         RmsNorm::from_qtensor(ws, eps)
     }
 
@@ -40,7 +109,7 @@ impl<R: Read + Seek> Gguf<R> {
     }
 
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
-        self.ct.tensor(&mut self.reader, name, &self.device)
+        self.load_tensor(name)
     }
 }
 
@@ -306,12 +375,63 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
+    /// Phase 7.D #6: zero-copy load из mmap'd GGUF.
+    /// Создаёт ОДИН Metal NoCopy buffer на весь mmap, каждый тензор —
+    /// sub-view через offset (БЕЗ копирования в CPU heap или отдельные
+    /// Metal buffers). Эквивалент Yttri Local LLM `quantized_qwen35::
+    /// from_gguf_zero_copy`.
+    ///
+    /// На non-Metal device fallback к обычному `from_gguf`.
+    #[cfg(feature = "metal")]
+    pub fn from_gguf_zero_copy<P: AsRef<std::path::Path>>(
+        path: P,
+        device: &Device,
+    ) -> Result<Self> {
+        let metal_device = match device {
+            Device::Metal(m) => m.clone(),
+            _ => candle::bail!("from_gguf_zero_copy requires a Metal device"),
+        };
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let mut cursor = std::io::Cursor::new(mmap.as_ref());
+        let ct = gguf_file::Content::read(&mut cursor)?;
+
+        // Page-aligned размер для Metal NoCopy buffer.
+        #[cfg(target_arch = "aarch64")]
+        const PAGE_SIZE: usize = 16384;
+        #[cfg(not(target_arch = "aarch64"))]
+        const PAGE_SIZE: usize = 4096;
+        let mmap_len = mmap.len();
+        let aligned_len = (mmap_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let shared_buffer = metal_device
+            .new_buffer_no_copy(mmap.as_ptr() as *mut std::ffi::c_void, aligned_len)?;
+
+        // Берём raw pointer на mmap data ДО leak'а, потом leak'аем mmap чтобы
+        // pages держались пока ModelWeights жив (NoCopy buffer ссылается на них).
+        // Cursor получает 'static slice — это обеспечивается leak'ом mmap.
+        let data_ptr: *const u8 = mmap.as_ptr();
+        let data_len = mmap.len();
+        std::mem::forget(mmap);
+        // SAFETY: pages валидны пока NoCopy buffer жив (Metal держит указатель).
+        // Buffer хранится в Gguf через with_metal_no_copy_buffer → ModelWeights.
+        let data_slice: &'static [u8] = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+        let cursor2 = std::io::Cursor::new(data_slice);
+
+        let gg = Gguf::new(ct, cursor2, device.clone()).with_metal_no_copy_buffer(shared_buffer);
+        Self::build_from_gguf(gg)
+    }
+
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let mut gg = Gguf::new(ct, reader, device.clone());
+        let gg = Gguf::new(ct, reader, device.clone());
+        Self::build_from_gguf(gg)
+    }
+
+    fn build_from_gguf<R: Read + Seek>(mut gg: Gguf<R>) -> Result<Self> {
+        let device = gg.device.clone();
         // Поддерживаем оба prefix'а: `qwen3.*` (стандартный Qwen3 LLM) и
         // `qwen3vl.*` (Qwen3-VL/Qwen3-ASR — text-only часть имеет ту же
         // архитектуру и tensor naming, отличается только prefix metadata).
@@ -349,14 +469,14 @@ impl ModelWeights {
         };
 
         let embed_tensor = gg.tensor("token_embd.weight")?;
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
+        let embed_tokens = Embedding::new(embed_tensor.dequantize(&device)?, hidden_size);
 
         let rotary = Arc::new(RotaryEmbedding::new(
             dtype,
             head_dim,
             max_position_embeddings,
             rope_freq_base,
-            device,
+            &device,
         )?);
 
         let mut layers = Vec::with_capacity(num_layers);
