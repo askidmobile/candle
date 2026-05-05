@@ -24,6 +24,10 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    pub fn dequantize_f16(&self, _elem_count: usize) -> Result<MetalStorage> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn quantize(&mut self, _src: &MetalStorage) -> Result<()> {
         Err(Error::NotCompiledWithMetalSupport)
     }

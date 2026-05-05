@@ -6980,6 +6980,53 @@ kernel void kernel_get_rows_i32(
     }
 }
 
+// Полная дequantization квантованного буфера в half (F16) на GPU.
+// Каждый поток обрабатывает один блок из 16 элементов (один float4x4/half4x4).
+// Используется для CANDLE_DEQUANTIZE_ALL_F16 — материализация весов в F16
+// без промежуточного F32-копирования (экономия peak в 2 раза при load).
+// MSL: kernel position attributes должны быть consistent vector size.
+// Используем uint3 для tgpig и tptg (обращаемся к .x), uint для tiitg
+// (это допустимо — tiitg это linearized scalar index в threadgroup).
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_dequantize_q_h(
+        device const  void * src0,
+        device       half * dst,
+        constant  uint64_t & ne,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const uint64_t group_size = (uint64_t)tptg.x;
+    const uint64_t base = (uint64_t)tgpig.x * group_size;
+    const uint64_t ind = base + (uint64_t)tiitg;
+
+    if (ind * 16 >= ne) return;
+
+    half4x4 temp;
+    dequantize_func(((device const block_q *) src0) + ind / nl, ind % nl, temp);
+    *(((device half4x4 *) dst) + ind) = temp;
+}
+
+// Аналогичный kernel для F32 — на случай явного запроса F32 dequantize на GPU
+// (сейчас в QMetalStorage::dequantize вся материализация идёт через CPU readback).
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_dequantize_q_f(
+        device const  void * src0,
+        device      float * dst,
+        constant  uint64_t & ne,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const uint64_t group_size = (uint64_t)tptg.x;
+    const uint64_t base = (uint64_t)tgpig.x * group_size;
+    const uint64_t ind = base + (uint64_t)tiitg;
+
+    if (ind * 16 >= ne) return;
+
+    float4x4 temp;
+    dequantize_func(((device const block_q *) src0) + ind / nl, ind % nl, temp);
+    *(((device float4x4 *) dst) + ind) = temp;
+}
+
 
 #define BLOCK_SIZE_M 64 // 8 simdgroup matrices from matrix A
 #define BLOCK_SIZE_N 32 // 4 simdgroup matrices from matrix B
@@ -7372,6 +7419,32 @@ template [[host_name("kernel_get_rows_iq1_s")]]   kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_iq1_m")]]   kernel get_rows_q_t kernel_get_rows_q<block_iq1_m,   QK_NL, dequantize_iq1_m>;
 template [[host_name("kernel_get_rows_iq4_nl")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_nl,  2,     dequantize_iq4_nl>;
 template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
+
+//
+// dequantize-to-half (F16) — полная материализация квантованных весов в half на GPU
+//
+
+typedef decltype(kernel_dequantize_q_h<block_q4_0, 2, dequantize_q4_0>) dequantize_q_h_t;
+
+template [[host_name("kernel_dequantize_q4_0_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q4_0,    2,     dequantize_q4_0>;
+template [[host_name("kernel_dequantize_q4_1_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q4_1,    2,     dequantize_q4_1>;
+template [[host_name("kernel_dequantize_q5_0_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q5_0,    2,     dequantize_q5_0>;
+template [[host_name("kernel_dequantize_q5_1_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q5_1,    2,     dequantize_q5_1>;
+template [[host_name("kernel_dequantize_q8_0_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q8_0,    2,     dequantize_q8_0>;
+template [[host_name("kernel_dequantize_q2_K_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q2_K,    QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_dequantize_q3_K_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q3_K,    QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_dequantize_q4_K_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q4_K,    QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_dequantize_q5_K_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q5_K,    QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_dequantize_q6_K_f16")]]    kernel dequantize_q_h_t kernel_dequantize_q_h<block_q6_K,    QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_dequantize_iq2_xxs_f16")]] kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_dequantize_iq2_xs_f16")]]  kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq2_xs,  QK_NL, dequantize_iq2_xs>;
+template [[host_name("kernel_dequantize_iq3_xxs_f16")]] kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
+template [[host_name("kernel_dequantize_iq3_s_f16")]]   kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq3_s,   QK_NL, dequantize_iq3_s>;
+template [[host_name("kernel_dequantize_iq2_s_f16")]]   kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq2_s,   QK_NL, dequantize_iq2_s>;
+template [[host_name("kernel_dequantize_iq1_s_f16")]]   kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq1_s,   QK_NL, dequantize_iq1_s>;
+template [[host_name("kernel_dequantize_iq1_m_f16")]]   kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq1_m,   QK_NL, dequantize_iq1_m>;
+template [[host_name("kernel_dequantize_iq4_nl_f16")]]  kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq4_nl,  2,     dequantize_iq4_nl>;
+template [[host_name("kernel_dequantize_iq4_xs_f16")]]  kernel dequantize_q_h_t kernel_dequantize_q_h<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
 
 //
 // matrix-matrix multiplication

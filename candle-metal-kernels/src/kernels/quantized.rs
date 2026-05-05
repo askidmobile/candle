@@ -344,3 +344,89 @@ pub fn call_quantized_matmul_mm_t(
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
+
+/// Полная дequantization квантованного буфера в F16 (half) на GPU.
+///
+/// Используется при `CANDLE_DEQUANTIZE_ALL_F16=1` для материализации весов в F16
+/// без промежуточной F32-копии. Каждый поток обрабатывает один блок из 16 элементов
+/// (один half4x4). Размер `dst` буфера должен быть `elem_count * 2` байт.
+#[allow(clippy::too_many_arguments)]
+pub fn call_dequantize_q_to_half(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    src: &Buffer,
+    src_offset: usize,
+    dst: &Buffer,
+    elem_count: usize,
+) -> Result<(), MetalKernelError> {
+    let name = match dtype {
+        GgmlDType::Q4_0 => "kernel_dequantize_q4_0_f16",
+        GgmlDType::Q4_1 => "kernel_dequantize_q4_1_f16",
+        GgmlDType::Q5_0 => "kernel_dequantize_q5_0_f16",
+        GgmlDType::Q5_1 => "kernel_dequantize_q5_1_f16",
+        GgmlDType::Q8_0 => "kernel_dequantize_q8_0_f16",
+        GgmlDType::Q2K => "kernel_dequantize_q2_K_f16",
+        GgmlDType::Q3K => "kernel_dequantize_q3_K_f16",
+        GgmlDType::Q4K => "kernel_dequantize_q4_K_f16",
+        GgmlDType::Q5K => "kernel_dequantize_q5_K_f16",
+        GgmlDType::Q6K => "kernel_dequantize_q6_K_f16",
+        GgmlDType::IQ2XXS => "kernel_dequantize_iq2_xxs_f16",
+        GgmlDType::IQ2XS => "kernel_dequantize_iq2_xs_f16",
+        GgmlDType::IQ3XXS => "kernel_dequantize_iq3_xxs_f16",
+        GgmlDType::IQ1S => "kernel_dequantize_iq1_s_f16",
+        GgmlDType::IQ4NL => "kernel_dequantize_iq4_nl_f16",
+        GgmlDType::IQ3S => "kernel_dequantize_iq3_s_f16",
+        GgmlDType::IQ2S => "kernel_dequantize_iq2_s_f16",
+        GgmlDType::IQ4XS => "kernel_dequantize_iq4_xs_f16",
+        GgmlDType::IQ1M => "kernel_dequantize_iq1_m_f16",
+        GgmlDType::F16 | GgmlDType::F32 | GgmlDType::BF16 => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "F16/F32/BF16",
+                "dequantize_q_to_half",
+            ))
+        }
+        GgmlDType::Q8_1 => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "Q8_1",
+                "dequantize_q_to_half",
+            ))
+        }
+        GgmlDType::Q8K => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "Q8K",
+                "dequantize_q_to_half",
+            ))
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    // Каждый поток обрабатывает 16 элементов (одну half4x4 структуру).
+    let total_threads = elem_count.div_ceil(16);
+    let threads_per_tg = 64usize;
+    let tg_count = total_threads.div_ceil(threads_per_tg);
+
+    let ne = elem_count as u64;
+    set_params!(encoder, ((src, src_offset), (dst, 0usize), ne));
+
+    encoder.use_resource(src, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+
+    let thread_groups = MTLSize {
+        width: tg_count,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: threads_per_tg,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups, threads_per_threadgroup);
+    Ok(())
+}

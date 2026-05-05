@@ -46,6 +46,46 @@ impl QMetalStorage {
         self.offset
     }
 
+    /// Native F16 dequantization на GPU без промежуточного F32 буфера.
+    /// ×2 экономия памяти на embed_tokens, output projection и других больших
+    /// квантованных весах. Использует Metal kernel `kernel_dequantize_*_f16`
+    /// (см. candle-metal-kernels/src/metal_src/quantized.metal).
+    ///
+    /// Для F16/F32/BF16 (не квантованных) тензоров делает обычный F32 dequantize
+    /// → to_dtype(F16) fallback (kernel поддерживает только Q-типы).
+    pub fn dequantize_f16(&self, elem_count: usize) -> Result<MetalStorage> {
+        use crate::backend::BackendStorage;
+        use crate::MetalError;
+
+        // Fallback для не-квантованных типов (F16/F32/BF16): kernel не поддерживает,
+        // но семантика та же — просто dequantize + cast в F16.
+        if matches!(
+            self.dtype,
+            GgmlDType::F16 | GgmlDType::F32 | GgmlDType::BF16
+        ) {
+            let f32_storage = self.dequantize(elem_count)?;
+            return f32_storage.to_dtype(
+                &crate::Layout::contiguous(elem_count),
+                DType::F16,
+            );
+        }
+
+        let dst = self.device.new_buffer(elem_count, DType::F16, "dequantize_f16")?;
+        let encoder = self.device.command_encoder()?;
+        candle_metal_kernels::call_dequantize_q_to_half(
+            self.device.device(),
+            &encoder,
+            self.device.kernels(),
+            self.dtype.into(),
+            &self.buffer,
+            self.offset,
+            &dst,
+            elem_count,
+        )
+        .map_err(MetalError::from)?;
+        Ok(MetalStorage::new(dst, self.device.clone(), elem_count, DType::F16))
+    }
+
     pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 

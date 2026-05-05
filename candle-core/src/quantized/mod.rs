@@ -783,11 +783,19 @@ impl QTensor {
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
         // In the CUDA case, we have a specialized kernel as this can be useful for volta
         // architectures. https://github.com/huggingface/candle/issues/2136
+        // Для Metal — нативный GPU-kernel пишет half напрямую без F32-промежуточного,
+        // что вдвое снижает пик памяти при загрузке весов с CANDLE_DEQUANTIZE_ALL_F16.
         match &self.storage {
             QStorage::Cuda(s) => {
                 let s = s.dequantize_f16(self.shape.elem_count())?;
                 let none = crate::op::BackpropOp::none();
                 crate::tensor::from_storage(Storage::Cuda(s), self.shape.clone(), none, false)
+                    .to_device(device)
+            }
+            QStorage::Metal(s) => {
+                let s = s.dequantize_f16(self.shape.elem_count())?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Metal(s), self.shape.clone(), none, false)
                     .to_device(device)
             }
             _ => {
