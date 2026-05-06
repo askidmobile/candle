@@ -20,12 +20,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 /// Element-wise kernels безопасны к self-aliasing: каждый thread читает
 /// и пишет по одному элементу независимо (нет читать-всё-потом-писать фаз).
 ///
-/// По умолчанию OFF (env-флаг YTTRI_INPLACE_OPS=1 для активации).
+/// По умолчанию ON (T-269 Phase 5 promote). Emergency revert через YTTRI_INPLACE_OPS=0.
 /// Skip: RmsNorm, Softmax, Rope — нужен 2-pass или pair-wise rotation.
 ///
 /// Кешируется через OnceLock: env::var() читается один раз при первом
 /// вызове, потом дешёвый atomic load. Без кеша — 480 syscall'ов per
-/// pp4096 forward → регрессия -23% даже когда default off.
+/// pp4096 forward → регрессия -23%.
 #[inline(always)]
 fn inplace_ops_enabled() -> bool {
     use std::sync::OnceLock;
@@ -33,7 +33,7 @@ fn inplace_ops_enabled() -> bool {
     *CACHED.get_or_init(|| {
         std::env::var("YTTRI_INPLACE_OPS")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -719,7 +719,7 @@ impl BackendStorage for MetalStorage {
         // 1. arc strong_count == 1 (только этот tensor владеет буфером)
         // 2. layout contiguous (output элементы совпадают 1:1 с input)
         // 3. dtype не меняется (element-wise unary сохраняет тип)
-        // 4. env-флаг YTTRI_INPLACE_OPS=1 (default off)
+        // 4. env-флаг YTTRI_INPLACE_OPS (default ON, T-269 Phase 5; YTTRI_INPLACE_OPS=0 для revert)
         // Metal element-wise kernels: каждый GPU thread читает src[i] →
         // вычисляет → пишет dst[i]. Нет зависимостей между потоками,
         // нет read-all-then-write фазы. Self-aliasing (src == dst) безопасен.
@@ -2033,7 +2033,7 @@ impl MetalStorage {
         // 1. output dtype == lhs dtype (не comparison op — те дают U8)
         // 2. оба input contiguous (иначе strided path нужен отдельный буфер)
         // 3. strong_count(lhs.buffer) == 1
-        // 4. env-флаг YTTRI_INPLACE_OPS=1
+        // 4. env-флаг YTTRI_INPLACE_OPS (default ON, T-269 Phase 5)
         // Metal binary kernel: thread[i] читает lhs[i] и rhs[i] независимо →
         // пишет out[i]. lhs[i] прочитан до записи в out[i] (тот же адрес) —
         // нет race даже при lhs == out.
