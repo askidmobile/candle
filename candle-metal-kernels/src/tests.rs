@@ -61,6 +61,7 @@ fn run<T: Clone>(v: &[T], name: unary::contiguous::Kernel) -> Vec<T> {
         v.len(),
         input,
         &output,
+        0,
     )
     .unwrap();
     command_buffer.commit();
@@ -90,6 +91,7 @@ fn run_binary<T: Clone, S: ToString>(x: &[T], y: &[T], name: S) -> Vec<T> {
         BufferOffset::zero_offset(&left),
         BufferOffset::zero_offset(&right),
         &output,
+        0,
     )
     .unwrap();
     command_buffer.commit();
@@ -337,6 +339,7 @@ fn run_cast<T: Clone, U: Clone>(v: &[T], name: &'static str) -> Vec<U> {
         v.len(),
         BufferOffset::zero_offset(&input),
         &output,
+        0,
     )
     .unwrap();
     command_buffer.commit();
@@ -551,6 +554,7 @@ fn run_affine<T: Clone>(v: &[T], mul: f64, add: f64) -> Vec<T> {
         size,
         BufferOffset::zero_offset(&input),
         &output,
+        0,
         mul as f32,
         add as f32,
     )
@@ -586,6 +590,7 @@ fn run_affine_strided<T: Clone>(
         BufferOffset::zero_offset(&input),
         strides,
         &output,
+        0,
         mul as f32,
         add as f32,
     )
@@ -816,6 +821,7 @@ fn run_index_select<T: Clone, I: Clone + std::fmt::Debug>(
         BufferOffset::zero_offset(&embeddings_buffer),
         BufferOffset::zero_offset(&ids_buffer),
         &dst_buffer,
+        0,
     )
     .unwrap();
 
@@ -861,6 +867,7 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
         BufferOffset::zero_offset(&embeddings_buffer),
         BufferOffset::zero_offset(&ids_buffer),
         &dst_buffer,
+        0,
     )
     .unwrap();
 
@@ -909,6 +916,7 @@ fn run_reduce<T, U: Clone>(
         out_length,
         BufferOffset::zero_offset(&input),
         &output,
+        0,
     ) {
         Ok(_) => {}
         Err(e) => {
@@ -940,6 +948,7 @@ fn run_softmax<T: Clone + std::fmt::Debug>(v: &[T], last_dim: usize, name: &'sta
         &input,
         0,
         &output,
+        0,
     )
     .unwrap();
     command_buffer.commit();
@@ -1270,6 +1279,7 @@ fn run_where_cond<I: Clone, T: Clone>(
         &cond_stride,
         true,
         &output,
+        0,
     )
     .unwrap();
     command_buffer.commit();
@@ -1370,6 +1380,7 @@ fn run_mlx_gemm<T: Clone>(
         rhs_offset,
         &rhs,
         &output,
+        0, // output_offset
     )
     .unwrap();
     command_buffer.commit();
@@ -1741,6 +1752,7 @@ fn run_index_add<T: Clone, I: Clone + std::fmt::Debug>(
         BufferOffset::zero_offset(&input_buffer),
         BufferOffset::zero_offset(&indices_buffer),
         &output,
+        0,
     )
     .unwrap();
     command_buffer.commit();
@@ -2407,7 +2419,7 @@ fn const_fill() {
         let buffer = dev
             .new_buffer(len * std::mem::size_of::<T>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_const_fill(&dev, &command_buffer, &kernels, name, len, &buffer, value).unwrap();
+        call_const_fill(&dev, &command_buffer, &kernels, name, len, &buffer, 0, value).unwrap();
         command_buffer.commit();
         command_buffer.wait_until_completed();
         read_to_vec::<T>(&buffer, len)

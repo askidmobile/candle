@@ -82,6 +82,7 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
             0,
             &rhs,
             &output,
+            0, // output_offset
         )?;
         command_buffer.commit();
         command_buffer.wait_until_completed();

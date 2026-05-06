@@ -218,6 +218,7 @@ impl candle::CustomOp3 for RotaryEmbI {
             sin.buffer(),
             l_sin.start_offset() * sin.dtype().size_in_bytes(),
             &output,
+            0,
         )
         .map_err(candle::Error::wrap)?;
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
@@ -502,6 +503,7 @@ impl candle::CustomOp3 for RotaryEmb {
             sin.buffer(),
             l_sin.start_offset() * sin.dtype().size_in_bytes(),
             &output,
+            0,
         )
         .map_err(candle::Error::wrap)?;
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
@@ -773,6 +775,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
             sin.buffer(),
             l_sin.start_offset() * sin.dtype().size_in_bytes(),
             &output,
+            0,
         )
         .map_err(candle::Error::wrap)?;
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());

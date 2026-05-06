@@ -24,6 +24,7 @@ pub fn call_where_cond(
     right_stride: &[usize],
     right_is_contiguous: bool,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let constants = Some(ConstantValues::new(vec![
         (0, Value::Bool(cond_is_contiguous)),
@@ -52,7 +53,7 @@ pub fn call_where_cond(
             &cond,
             &left,
             &right,
-            output
+            (output, output_offset)
         )
     );
 

@@ -22,6 +22,7 @@ pub fn call_unary_contiguous(
     length: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Unary, kernel_name.0)?;
     let encoder = ep.encoder();
@@ -29,7 +30,7 @@ pub fn call_unary_contiguous(
 
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (length, &input, output));
+    set_params!(encoder, (length, &input, (output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = length.div_ceil(tile_size);

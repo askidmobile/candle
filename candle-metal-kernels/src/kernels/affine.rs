@@ -13,6 +13,7 @@ pub fn call_affine(
     size: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
     mul: f32,
     add: f32,
 ) -> Result<(), MetalKernelError> {
@@ -22,7 +23,7 @@ pub fn call_affine(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (size, mul, add, &input, output));
+    set_params!(encoder, (size, mul, add, &input, (output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = size.div_ceil(tile_size);
@@ -43,6 +44,7 @@ pub fn call_affine_strided(
     input: BufferOffset,
     input_stride: &[usize],
     output: &Buffer,
+    output_offset: usize,
     mul: f32,
     add: f32,
 ) -> Result<(), MetalKernelError> {
@@ -63,7 +65,7 @@ pub fn call_affine_strided(
             mul,
             add,
             &input,
-            output
+            (output, output_offset)
         )
     );
 
@@ -84,6 +86,7 @@ pub fn call_powf(
     size: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
     mul: f32,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Affine, name)?;
@@ -92,7 +95,7 @@ pub fn call_powf(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (size, mul, &input, output));
+    set_params!(encoder, (size, mul, &input, (output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = size.div_ceil(tile_size);
@@ -113,6 +116,7 @@ pub fn call_powf_strided(
     input: BufferOffset,
     input_stride: &[usize],
     output: &Buffer,
+    output_offset: usize,
     mul: f32,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Affine, name)?;
@@ -124,7 +128,7 @@ pub fn call_powf_strided(
 
     set_params!(
         encoder,
-        (size, shape.len(), shape, input_stride, mul, &input, output)
+        (size, shape.len(), shape, input_stride, mul, &input, (output, output_offset))
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
@@ -144,6 +148,7 @@ pub fn call_elu(
     size: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
     mul: f32,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Affine, name)?;
@@ -152,7 +157,7 @@ pub fn call_elu(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (size, mul, &input, output));
+    set_params!(encoder, (size, mul, &input, (output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = size.div_ceil(tile_size);
@@ -173,6 +178,7 @@ pub fn call_elu_strided(
     input: BufferOffset,
     input_stride: &[usize],
     output: &Buffer,
+    output_offset: usize,
     mul: f32,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Affine, name)?;
@@ -184,7 +190,7 @@ pub fn call_elu_strided(
 
     set_params!(
         encoder,
-        (size, shape.len(), shape, input_stride, mul, &input, output)
+        (size, shape.len(), shape, input_stride, mul, &input, (output, output_offset))
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);

@@ -13,6 +13,7 @@ pub fn call_cast_contiguous(
     length: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Cast, kernel_name)?;
 
@@ -20,7 +21,7 @@ pub fn call_cast_contiguous(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (length, &input, output));
+    set_params!(encoder, (length, &input, (output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = length.div_ceil(tile_size);
@@ -41,6 +42,7 @@ pub fn call_cast_strided(
     input: BufferOffset,
     input_strides: &[usize],
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Cast, kernel_name)?;
 
@@ -52,7 +54,7 @@ pub fn call_cast_strided(
 
     set_params!(
         encoder,
-        (length, shape.len(), shape, input_strides, &input, output)
+        (length, shape.len(), shape, input_strides, &input, (output, output_offset))
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);

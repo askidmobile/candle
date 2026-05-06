@@ -18,6 +18,7 @@ pub fn call_index_select(
     input: BufferOffset,
     ids: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let left_size: usize = shape[..dim].iter().product();
     let right_size: usize = shape[dim + 1..].iter().product();
@@ -44,7 +45,7 @@ pub fn call_index_select(
             src_strides,
             &input,
             &ids,
-            output
+            (output, output_offset)
         )
     );
 
@@ -69,6 +70,7 @@ pub fn call_gather(
     input: BufferOffset,
     ids: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let left_size: usize = shape[..dim].iter().product();
     let right_size: usize = shape[dim + 1..].iter().product();
@@ -92,7 +94,7 @@ pub fn call_gather(
             ids_size,
             &input,
             &ids,
-            output
+            (output, output_offset)
         )
     );
 
@@ -167,6 +169,7 @@ pub fn call_index_add(
     input: BufferOffset,
     ids: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let left_size: usize = src_shape[..dim].iter().product();
     let right_size: usize = src_shape[dim + 1..].iter().product();
@@ -192,7 +195,7 @@ pub fn call_index_add(
             ids_dim_size,
             &input,
             &ids,
-            output
+            (output, output_offset)
         )
     );
 

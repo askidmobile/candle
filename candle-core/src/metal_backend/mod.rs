@@ -181,6 +181,7 @@ impl BackendStorage for MetalStorage {
                 el,
                 src,
                 &buffer,
+                0,
                 mul as f32,
                 add as f32,
             )
@@ -204,6 +205,7 @@ impl BackendStorage for MetalStorage {
                 src,
                 layout.stride(),
                 &buffer,
+                0,
                 mul as f32,
                 add as f32,
             )
@@ -239,6 +241,7 @@ impl BackendStorage for MetalStorage {
                 el,
                 src,
                 &buffer,
+                0,
                 pow as f32,
             )
             .map_err(MetalError::from)?;
@@ -258,6 +261,7 @@ impl BackendStorage for MetalStorage {
                 src,
                 layout.stride(),
                 &buffer,
+                0,
                 pow as f32,
             )
             .map_err(MetalError::from)?;
@@ -292,6 +296,7 @@ impl BackendStorage for MetalStorage {
                 el,
                 src,
                 &buffer,
+                0,
                 alpha as f32,
             )
             .map_err(MetalError::from)?;
@@ -311,6 +316,7 @@ impl BackendStorage for MetalStorage {
                 src,
                 layout.stride(),
                 &buffer,
+                0,
                 alpha as f32,
             )
             .map_err(MetalError::from)?;
@@ -395,6 +401,7 @@ impl BackendStorage for MetalStorage {
                 dst_el,
                 src,
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
 
@@ -452,6 +459,7 @@ impl BackendStorage for MetalStorage {
             dst_el,
             src,
             &buffer,
+            0,
         )
         .map_err(MetalError::from)?;
 
@@ -621,6 +629,7 @@ impl BackendStorage for MetalStorage {
                 el_count,
                 src,
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
         } else {
@@ -674,6 +683,7 @@ impl BackendStorage for MetalStorage {
                 src,
                 layout.stride(),
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
         }
@@ -782,6 +792,7 @@ impl BackendStorage for MetalStorage {
                 el_count,
                 src,
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
         } else {
@@ -924,6 +935,7 @@ impl BackendStorage for MetalStorage {
             f_l.stride(),
             f_l.is_contiguous(),
             &buffer,
+            0,
         )
         .map_err(MetalError::from)?;
         Ok(Self::new(buffer, device, el, dtype))
@@ -1529,6 +1541,7 @@ impl BackendStorage for MetalStorage {
             src,
             ids,
             &buffer,
+            0,
         )
         .map_err(MetalError::from)?;
         Ok(Self::new(buffer, device.clone(), dst_el, dtype))
@@ -1688,6 +1701,7 @@ impl BackendStorage for MetalStorage {
             src,
             ids,
             &buffer,
+            0,
         )
         .map_err(MetalError::from)?;
         Ok(Self::new(buffer, device.clone(), dst_el, dtype))
@@ -1751,6 +1765,7 @@ impl BackendStorage for MetalStorage {
             src,
             ids,
             &acc.buffer,
+            0,
         )
         .map_err(MetalError::from)?;
         Ok(acc)
@@ -1789,6 +1804,7 @@ impl BackendStorage for MetalStorage {
             rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
             &rhs.buffer,
             &buffer,
+            0, // output_offset: начало буфера (T-269 Phase 3c)
         )
         .map_err(MetalError::from)?;
 
@@ -1974,6 +1990,7 @@ impl MetalStorage {
                 lhs,
                 rhs,
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
             buffer
@@ -1999,6 +2016,7 @@ impl MetalStorage {
                 rhs,
                 rhs_l.stride(),
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
             buffer

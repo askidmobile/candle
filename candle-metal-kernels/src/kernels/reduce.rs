@@ -13,6 +13,7 @@ pub fn call_reduce_contiguous(
     out_length: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let length: usize = shape.iter().product();
     let num_dims = shape.len();
@@ -33,7 +34,7 @@ pub fn call_reduce_contiguous(
             shape.as_slice(),
             work_per_threadgroup as u32,
             &input,
-            output
+            (output, output_offset)
         )
     );
 
@@ -69,6 +70,7 @@ pub fn call_reduce_strided(
     out_length: usize,
     input: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let length: usize = shape.iter().product();
     let num_dims = shape.len();
@@ -91,7 +93,7 @@ pub fn call_reduce_strided(
             strides.as_slice(),
             work_per_threadgroup as u32,
             &input,
-            output
+            (output, output_offset)
         )
     );
 
@@ -127,6 +129,7 @@ pub fn call_last_softmax(
     input: &Buffer,
     input_offset: usize,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let work_per_threadgroup = elements;
 
@@ -137,7 +140,7 @@ pub fn call_last_softmax(
 
     set_params!(
         encoder,
-        (length, work_per_threadgroup, (input, input_offset), output)
+        (length, work_per_threadgroup, (input, input_offset), (output, output_offset))
     );
 
     let out_length = length / work_per_threadgroup;
@@ -178,6 +181,7 @@ pub fn call_rms_norm(
     alpha: &Buffer,
     alpha_offset: usize,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
@@ -190,7 +194,7 @@ pub fn call_rms_norm(
             length,
             elements_to_sum,
             (input, input_offset),
-            output,
+            (output, output_offset),
             (alpha, alpha_offset),
             eps
         )
@@ -238,6 +242,7 @@ pub fn call_layer_norm(
     beta: &Buffer,
     beta_offset: usize,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
@@ -250,7 +255,7 @@ pub fn call_layer_norm(
             length,
             elements_to_sum,
             (input, input_offset),
-            output,
+            (output, output_offset),
             (alpha, alpha_offset),
             (beta, beta_offset),
             eps
@@ -301,6 +306,7 @@ pub fn call_rope_i(
     sin: &Buffer,
     sin_offset: usize,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
@@ -316,7 +322,7 @@ pub fn call_rope_i(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            (output, output_offset)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);
@@ -346,6 +352,7 @@ pub fn call_rope_thd(
     sin: &Buffer,
     sin_offset: usize,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
@@ -363,7 +370,7 @@ pub fn call_rope_thd(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            (output, output_offset)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (b * t * h * d) / 2);
@@ -392,6 +399,7 @@ pub fn call_rope(
     sin: &Buffer,
     sin_offset: usize,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
     let encoder = ep.encoder();
@@ -408,7 +416,7 @@ pub fn call_rope(
             (src, src_offset),
             (cos, cos_offset),
             (sin, sin_offset),
-            output
+            (output, output_offset)
         )
     );
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, (bh * td) / 2);

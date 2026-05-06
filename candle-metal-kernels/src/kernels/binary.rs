@@ -17,6 +17,7 @@ pub fn call_binary_contiguous<S: ToString>(
     left: BufferOffset,
     right: BufferOffset,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Binary, kernel_name.to_string())?;
 
@@ -24,7 +25,7 @@ pub fn call_binary_contiguous<S: ToString>(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (length, &left, &right, output));
+    set_params!(encoder, (length, &left, &right, (output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = length.div_ceil(tile_size);
@@ -50,6 +51,7 @@ pub fn call_binary_strided<S: ToString>(
     right_input: BufferOffset,
     right_strides: &[usize],
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Binary, kernel_name.to_string())?;
 
@@ -72,7 +74,7 @@ pub fn call_binary_strided<S: ToString>(
             right_strides,
             &left_input,
             &right_input,
-            output
+            (output, output_offset)
         )
     );
     encoder.use_resource(left_input.buffer, MTLResourceUsage::Read);

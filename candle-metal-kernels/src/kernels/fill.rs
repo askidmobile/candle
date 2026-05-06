@@ -12,13 +12,14 @@ pub fn call_const_fill(
     name: &'static str,
     length: usize,
     output: &Buffer,
+    output_offset: usize,
     v: impl EncoderParam,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Fill, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    set_params!(encoder, (output, v, length));
+    set_params!(encoder, ((output, output_offset), v, length));
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
     encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);

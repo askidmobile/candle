@@ -266,6 +266,7 @@ pub fn call_mlx_gemm(
     rhs_offset: usize,
     rhs_buffer: &Buffer,
     output: &Buffer,
+    output_offset: usize,
 ) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
     #[repr(C)]
@@ -429,7 +430,7 @@ pub fn call_mlx_gemm(
             (lhs_buffer, lhs_offset),
             (rhs_buffer, rhs_offset),
             (),
-            output,
+            (output, output_offset),
             gemm_params,
             (),
             b as i32,

@@ -173,6 +173,7 @@ impl candle::CustomOp1 for Sigmoid {
                 el_count,
                 src,
                 &buffer,
+                0,
             )
             .map_err(MetalError::from)?;
         } else {
@@ -418,6 +419,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             storage.buffer(),
             layout.start_offset() * storage.dtype().size_in_bytes(),
             &output,
+            0,
         )
         .map_err(candle::Error::wrap)?;
         let newstorage =
@@ -612,6 +614,7 @@ impl candle::CustomOp2 for RmsNorm {
             s2.buffer(),
             l2.start_offset() * s2.dtype().size_in_bytes(),
             &output,
+            0,
         )
         .map_err(candle::Error::wrap)?;
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
@@ -859,6 +862,7 @@ impl candle::CustomOp3 for LayerNorm {
             s3.buffer(),
             l3.start_offset() * s3.dtype().size_in_bytes(),
             &output,
+            0,
         )
         .map_err(candle::Error::wrap)?;
         let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
