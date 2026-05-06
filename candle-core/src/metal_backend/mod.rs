@@ -37,6 +37,20 @@ fn inplace_ops_enabled() -> bool {
     })
 }
 
+/// T-269 Phase 3c step 5: opt-in для unified scratch arena в matmul.
+/// Включить через YTTRI_UNIFIED_ARENA=1. Default: off (безопасный baseline).
+/// Требует активации arena в Yttri forward() через activate_unified_arena().
+#[inline(always)]
+fn unified_arena_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("YTTRI_UNIFIED_ARENA")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
+}
+
 mod device;
 pub use device::{
     allocation_trace_active, begin_allocation_trace, end_allocation_trace, skip_arena_next_alloc,
@@ -510,7 +524,8 @@ impl BackendStorage for MetalStorage {
             let el_count = shape.elem_count();
             let encoder = device.command_encoder()?;
             encoder.set_label("const-set");
-            let dst = buffer_o(&self_.buffer, l, self_.dtype);
+            // T-269 Phase 3c step 5: учитываем buffer_offset
+            let dst = self_.buffer_slice(l, self_.dtype);
 
             if l.is_contiguous() {
                 use candle_metal_kernels::unary::contiguous;
@@ -935,8 +950,9 @@ impl BackendStorage for MetalStorage {
             (left, right) => crate::bail!("Metal where_cond {left:?} {right:?} not implemented"),
         };
         let src = self.buffer_slice(layout, self.dtype);
-        let t = buffer_o(&t.buffer, t_l, t.dtype);
-        let f = buffer_o(&f.buffer, f_l, f.dtype);
+        // T-269 Phase 3c step 5: t/f могут быть из unified arena — buffer_offset учитывается
+        let t = t.buffer_slice(t_l, t.dtype);
+        let f = f.buffer_slice(f_l, f.dtype);
         candle_metal_kernels::call_where_cond(
             &device.device,
             &encoder,
@@ -1155,9 +1171,10 @@ impl BackendStorage for MetalStorage {
                 k_layout.dims(),
                 k_layout.stride(),
                 &self.buffer,
-                layout.start_offset() * self.dtype.size_in_bytes(),
+                // T-269 Phase 3c step 5: buffer_offset для unified arena тензоров
+                self.buffer_offset + layout.start_offset() * self.dtype.size_in_bytes(),
                 &k.buffer,
-                k_layout.start_offset() * k.dtype.size_in_bytes(),
+                k.buffer_offset + k_layout.start_offset() * k.dtype.size_in_bytes(),
                 &buffer,
             )
             .map_err(MetalError::from)?;
@@ -1323,8 +1340,10 @@ impl BackendStorage for MetalStorage {
                 input_stride: l.stride(),
                 kernel_dims: kernel_l.dims(),
                 kernel_stride: kernel_l.stride(),
-                input_offset: l.start_offset() * self.dtype.size_in_bytes(),
-                kernel_offset: kernel_l.start_offset() * kernel.dtype.size_in_bytes(),
+                // T-269 Phase 3c step 5: buffer_offset для unified arena тензоров
+                input_offset: self.buffer_offset + l.start_offset() * self.dtype.size_in_bytes(),
+                kernel_offset: kernel.buffer_offset
+                    + kernel_l.start_offset() * kernel.dtype.size_in_bytes(),
             },
             &self.buffer,
             &kernel.buffer,
@@ -1357,6 +1376,10 @@ impl BackendStorage for MetalStorage {
         let buffer = self.device.new_buffer(dst_el, self.dtype, "avg_pool2d")?;
         let encoder = self.device.command_encoder()?;
         encoder.set_label("avg_pool2d");
+        // T-269 Phase 3c step 5: call_pool2d принимает &Buffer напрямую — не BufferOffset.
+        // Если avg_pool2d когда-либо получит тензор из unified arena (buffer_offset > 0),
+        // потребуется патч сигнатуры call_pool2d в candle-metal-kernels. Пока не используется
+        // в Qwen3.5 inference. Оставить &self.buffer (потенциально неверно при offset > 0).
         candle_metal_kernels::call_pool2d(
             &self.device.device,
             &encoder,
@@ -1550,7 +1573,8 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         encoder.set_label("gather");
         let src = self.buffer_slice(src_l, dtype);
-        let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
+        // T-269 Phase 3c step 5: ids может быть из unified arena
+        let ids = ids.buffer_slice(ids_l, ids.dtype);
         candle_metal_kernels::call_gather(
             &device.device,
             &encoder,
@@ -1600,8 +1624,9 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         encoder.set_label("scatter");
         let dst = self.buffer_slice(l, self.dtype);
-        let src = buffer_o(&src.buffer, src_l, src.dtype);
-        let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
+        // T-269 Phase 3c step 5: src/ids могут быть из unified arena
+        let src = src.buffer_slice(src_l, src.dtype);
+        let ids = ids.buffer_slice(ids_l, ids.dtype);
         candle_metal_kernels::call_scatter(
             &self.device.device,
             &encoder,
@@ -1650,8 +1675,9 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         encoder.set_label("scatter_add");
         let dst = self.buffer_slice(l, self.dtype);
-        let src = buffer_o(&src.buffer, src_l, src.dtype);
-        let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
+        // T-269 Phase 3c step 5: src/ids могут быть из unified arena
+        let src = src.buffer_slice(src_l, src.dtype);
+        let ids = ids.buffer_slice(ids_l, ids.dtype);
         candle_metal_kernels::call_scatter(
             &self.device.device,
             &encoder,
@@ -1707,7 +1733,8 @@ impl BackendStorage for MetalStorage {
         };
         let encoder = self.device.command_encoder()?;
         let src = self.buffer_slice(src_l, dtype);
-        let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
+        // T-269 Phase 3c step 5: ids может быть из unified arena
+        let ids = ids.buffer_slice(ids_l, ids.dtype);
         candle_metal_kernels::call_index_select(
             &device.device,
             &encoder,
@@ -1772,8 +1799,9 @@ impl BackendStorage for MetalStorage {
         };
         let encoder = self.device.command_encoder()?;
         encoder.set_label("index_add");
-        let src = buffer_o(&src.buffer, src_l, src.dtype);
-        let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
+        // T-269 Phase 3c step 5: src/ids могут быть из unified arena
+        let src = src.buffer_slice(src_l, src.dtype);
+        let ids = ids.buffer_slice(ids_l, ids.dtype);
         candle_metal_kernels::call_index_add(
             &self.device.device,
             &encoder,
@@ -1799,13 +1827,18 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // T-269 Phase 3c: unified arena для output buffer.
-        // NOTE: KV cache issue не решён — при использовании unified arena
-        // KV cache может попасть в arena и быть corrupted после reset.
-        // Пока используем обычный pool (offset=0) для всех ops кроме тех
-        // где KV cache явно исключён через skip флаг.
-        // TODO Phase 3c сессия 2: добавить skip_unified_next_alloc() в KV cache creation.
-        let buffer = self.device.new_buffer(b * m * n, self.dtype, "matmul")?;
+        // T-269 Phase 3c step 5: unified arena для output buffer при YTTRI_UNIFIED_ARENA=1.
+        // После полного патча всех buffer_o → buffer_slice (шаг 5) corruption устранена.
+        // Output из unified arena (offset > 0) корректно обрабатывается downstream ops.
+        let (buffer, output_offset) = if unified_arena_enabled() {
+            self.device
+                .new_buffer_unified(b * m * n, self.dtype, "matmul")?
+        } else {
+            (
+                self.device.new_buffer(b * m * n, self.dtype, "matmul")?,
+                0usize,
+            )
+        };
         let encoder = self.device.command_encoder()?;
         encoder.set_label("matmul");
         let dtype = match self.dtype {
@@ -1828,19 +1861,30 @@ impl BackendStorage for MetalStorage {
             self.buffer_slice(lhs_l, self.dtype).offset_in_bytes,
             &self.buffer,
             rhs_l.stride(),
-            rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
+            // T-269 Phase 3c step 5: rhs тоже может быть из unified arena — корректный offset
+            rhs.buffer_slice(rhs_l, rhs.dtype).offset_in_bytes,
             &rhs.buffer,
             &buffer,
-            0, // output_offset=0 (пул буфер), T-269 Phase 3c сессия 2 активирует unified
+            output_offset,
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(
-            buffer,
-            self.device.clone(),
-            b * m * n,
-            self.dtype(),
-        ))
+        if output_offset > 0 {
+            Ok(Self::new_with_offset(
+                buffer,
+                output_offset,
+                self.device.clone(),
+                b * m * n,
+                self.dtype(),
+            ))
+        } else {
+            Ok(Self::new(
+                buffer,
+                self.device.clone(),
+                b * m * n,
+                self.dtype(),
+            ))
+        }
     }
 
     fn copy2d(
@@ -1863,7 +1907,8 @@ impl BackendStorage for MetalStorage {
         if src_s == d2 && dst_s == d2 {
             let blit = self.device.blit_command_encoder()?;
             blit.set_label("copy2d_contiguous");
-            let src_offset = src_o * self.dtype.size_in_bytes();
+            // T-269 Phase 3c step 5: учитываем buffer_offset для unified arena тензоров
+            let src_offset = self.buffer_offset + src_o * self.dtype.size_in_bytes();
             let length = d1 * d2 * self.dtype.size_in_bytes();
             let dst_offset = dst_o * dst.dtype().size_in_bytes();
             blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
@@ -1884,6 +1929,7 @@ impl BackendStorage for MetalStorage {
             };
             let encoder = self.device.command_encoder()?;
             encoder.set_label("copy2d");
+            // T-269 Phase 3c step 5: добавляем buffer_offset для unified arena тензоров
             candle_metal_kernels::call_copy2d(
                 &self.device.device,
                 &encoder,
@@ -1895,7 +1941,7 @@ impl BackendStorage for MetalStorage {
                 d2,
                 src_s,
                 dst_s,
-                src_o * self.dtype.size_in_bytes(),
+                self.buffer_offset + src_o * self.dtype.size_in_bytes(),
                 dst_o * self.dtype.size_in_bytes(),
             )
             .map_err(MetalError::from)?;
@@ -1907,7 +1953,9 @@ impl BackendStorage for MetalStorage {
         if src_l.is_contiguous() && self.dtype == dst.dtype() {
             let blit = self.device.blit_command_encoder()?;
             blit.set_label("copy_contiguous");
-            let src_offset = src_l.start_offset() * self.dtype.size_in_bytes();
+            // T-269 Phase 3c step 5: учитываем buffer_offset для unified arena тензоров
+            let src_offset =
+                self.buffer_offset + src_l.start_offset() * self.dtype.size_in_bytes();
             let length = src_l.shape().elem_count() * self.dtype.size_in_bytes();
             let dst_offset = dst_offset * dst.dtype().size_in_bytes();
             blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
@@ -2019,7 +2067,8 @@ impl MetalStorage {
         let el_count = shape.elem_count();
         let encoder = device.command_encoder()?;
         let lhs = self.buffer_slice(lhs_l, self.dtype);
-        let rhs = buffer_o(&rhs.buffer, rhs_l, rhs.dtype);
+        // T-269 Phase 3c step 5: rhs может быть из unified arena — buffer_offset учитывается
+        let rhs = rhs.buffer_slice(rhs_l, rhs.dtype);
 
         let dtype = match op {
             "eq" | "ne" | "le" | "lt" | "ge" | "gt" => DType::U8,
@@ -2098,7 +2147,8 @@ impl MetalStorage {
         {
             let blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
+            // T-269 Phase 3c step 5: учитываем buffer_offset для unified arena тензоров
+            blit.copy_from_buffer(&self.buffer, self.buffer_offset, &buffer, 0, size);
             blit.end_encoding();
         }
         self.device.wait_until_completed()?;
@@ -2114,7 +2164,8 @@ impl MetalStorage {
         {
             let blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu_fast");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
+            // T-269 Phase 3c step 5: учитываем buffer_offset для unified arena тензоров
+            blit.copy_from_buffer(&self.buffer, self.buffer_offset, &buffer, 0, size);
             blit.end_encoding();
         }
         self.device.wait_until_completed_fast()?;
@@ -2133,7 +2184,8 @@ impl MetalStorage {
     /// - extra memory allocation
     pub fn to_cpu_zero_copy<T: Clone>(&self) -> Result<Vec<T>> {
         self.device.wait_until_completed_fast()?;
-        Ok(read_to_vec(&self.buffer, self.count))
+        // T-269 Phase 3c step 5: учитываем buffer_offset для unified arena тензоров
+        Ok(read_to_vec_at(&self.buffer, self.buffer_offset, self.count))
     }
 
     /// Zero-copy version of `to_cpu_storage` using `to_cpu_zero_copy`.
@@ -2389,6 +2441,17 @@ impl BackendDevice for MetalDevice {
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     let ptr = buffer.contents() as *const T;
     assert!(!ptr.is_null());
+    let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
+    slice.to_vec()
+}
+
+/// Читает n элементов типа T начиная с byte_offset в буфере.
+/// T-269 Phase 3c step 5: нужен для zero-copy read из unified arena тензоров
+/// где buffer_offset > 0.
+fn read_to_vec_at<T: Clone>(buffer: &Buffer, byte_offset: usize, n: usize) -> Vec<T> {
+    let base = buffer.contents() as *const u8;
+    assert!(!base.is_null());
+    let ptr = unsafe { base.add(byte_offset) } as *const T;
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
 }
