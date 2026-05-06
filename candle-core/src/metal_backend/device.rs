@@ -5,7 +5,7 @@ use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
         BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device,
-        MTLResourceOptions, ScratchArena,
+        MTLResourceOptions, ScratchArena, UnifiedScratchArena,
     },
     Kernels,
 };
@@ -88,6 +88,9 @@ fn record_trace(size: usize, rounded: usize, from_pool: bool) {
 
 thread_local! {
     static ACTIVE_ARENA: RefCell<Option<Arc<ScratchArena>>> = const { RefCell::new(None) };
+    /// Активная UnifiedScratchArena для Phase 3c offset dispatch.
+    /// None = отключена (default). Активируется через activate_unified_arena().
+    static ACTIVE_UNIFIED_ARENA: RefCell<Option<Arc<UnifiedScratchArena>>> = const { RefCell::new(None) };
     /// Если true — следующий allocate_buffer пропускает arena fast path.
     /// Используется для исключения long-lived allocations (KV cache) из arena.
     /// Автоматически сбрасывается при каждом чтении (одноразовый флаг).
@@ -530,6 +533,74 @@ impl MetalDevice {
         Ok(Arc::new(
             ScratchArena::new(&self.device, slot_sizes).map_err(MetalError::from)?,
         ))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // UnifiedScratchArena API (T-269 Phase 3c)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Создать UnifiedScratchArena (один большой MTLBuffer + bump allocator).
+    ///
+    /// `capacity` — суммарный размер в байтах (рекомендуется ~764 МБ для Qwen3.5-2B).
+    /// Выделяет один MTLBuffer при создании.
+    pub fn create_unified_arena(
+        &self,
+        capacity: usize,
+    ) -> Result<Arc<UnifiedScratchArena>> {
+        Ok(Arc::new(
+            UnifiedScratchArena::new(&self.device, capacity).map_err(MetalError::from)?,
+        ))
+    }
+
+    /// Активировать unified arena для текущего потока.
+    ///
+    /// После активации `try_acquire_unified` можно использовать для offset dispatch.
+    /// Default off — нет влияния на `allocate_buffer` пока.
+    pub fn activate_unified_arena(&self, arena: Arc<UnifiedScratchArena>) {
+        ACTIVE_UNIFIED_ARENA.with(|a| *a.borrow_mut() = Some(arena));
+    }
+
+    /// Деактивировать unified arena для текущего потока.
+    pub fn deactivate_unified_arena(&self) {
+        ACTIVE_UNIFIED_ARENA.with(|a| *a.borrow_mut() = None);
+    }
+
+    /// Сбросить bump offset unified arena (после GPU fence).
+    ///
+    /// ОБЯЗАТЕЛЕН вызов `wait_until_completed_fast()` ДО reset.
+    pub fn reset_unified_arena(&self) {
+        ACTIVE_UNIFIED_ARENA.with(|a| {
+            if let Some(arena) = a.borrow().as_ref() {
+                arena.reset();
+            }
+        });
+    }
+
+    /// Попробовать выделить из unified arena.
+    ///
+    /// Возвращает `(Arc<Buffer>, offset_in_bytes)` при успехе.
+    /// Возвращает `None` если arena не активна или исчерпана.
+    ///
+    /// # Использование
+    ///
+    /// ```ignore
+    /// if let Some(alloc) = device.try_acquire_unified(size) {
+    ///     call_kernel(..., &alloc.buffer, alloc.offset_in_bytes);
+    ///     // buffer и offset передаются напрямую в encoder без создания отдельного MTLBuffer
+    /// } else {
+    ///     let buffer = device.allocate_buffer(size)?;
+    ///     call_kernel(..., &buffer, 0);
+    /// }
+    /// ```
+    pub fn try_acquire_unified(
+        &self,
+        size: usize,
+    ) -> Option<candle_metal_kernels::metal::UnifiedAlloc> {
+        ACTIVE_UNIFIED_ARENA.with(|a| {
+            a.borrow()
+                .as_ref()
+                .and_then(|arena| arena.try_acquire(size))
+        })
     }
 
     /// Активировать scratch arena для текущего потока.
