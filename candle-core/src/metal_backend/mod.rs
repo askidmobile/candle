@@ -22,11 +22,19 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 ///
 /// По умолчанию OFF (env-флаг YTTRI_INPLACE_OPS=1 для активации).
 /// Skip: RmsNorm, Softmax, Rope — нужен 2-pass или pair-wise rotation.
+///
+/// Кешируется через OnceLock: env::var() читается один раз при первом
+/// вызове, потом дешёвый atomic load. Без кеша — 480 syscall'ов per
+/// pp4096 forward → регрессия -23% даже когда default off.
 #[inline(always)]
 fn inplace_ops_enabled() -> bool {
-    std::env::var("YTTRI_INPLACE_OPS")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false)
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("YTTRI_INPLACE_OPS")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
 }
 
 mod device;
