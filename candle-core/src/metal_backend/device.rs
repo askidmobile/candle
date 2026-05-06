@@ -5,7 +5,7 @@ use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
         BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device,
-        MTLResourceOptions,
+        MTLResourceOptions, ScratchArena,
     },
     Kernels,
 };
@@ -74,6 +74,34 @@ fn record_trace(size: usize, rounded: usize, from_pool: bool) {
             from_pool,
         });
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scratch arena thread_local activation (T-269 Phase 2)
+//
+// ACTIVE_ARENA содержит текущую scratch arena для данного потока (если активна).
+// Активируется через MetalDevice::activate_scratch_arena() перед prefill loop,
+// деактивируется через deactivate_scratch_arena() после final fence.
+//
+// Default: None — arena не активна, allocate_buffer использует обычный pool.
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static ACTIVE_ARENA: RefCell<Option<Arc<ScratchArena>>> = const { RefCell::new(None) };
+    /// Если true — следующий allocate_buffer пропускает arena fast path.
+    /// Используется для исключения long-lived allocations (KV cache) из arena.
+    /// Автоматически сбрасывается при каждом чтении (одноразовый флаг).
+    static SKIP_ARENA_NEXT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Пометить следующую аллокацию как "не для arena" (long-lived buffer).
+///
+/// Вызывать перед созданием KV cache буферов (`Tensor::zeros`) или других
+/// долгоживущих буферов которые не должны занимать arena slots.
+///
+/// Флаг автоматически сбрасывается после одного `allocate_buffer` вызова.
+pub fn skip_arena_next_alloc() {
+    SKIP_ARENA_NEXT.with(|s| s.set(true));
 }
 
 /// Unique identifier for metal devices.
@@ -486,8 +514,76 @@ impl MetalDevice {
         Ok(buffer)
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Scratch arena API (T-269 Phase 2)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Создать scratch arena с заданными slot sizes.
+    ///
+    /// `slot_sizes` — байтовые размеры каждого slot (обычно power-of-2,
+    /// из Phase 1 trace результатов).
+    ///
+    /// Арена выделяет все MTLBuffer'ы сразу при создании.
+    /// Возвращает `Arc<ScratchArena>` — готова к активации через
+    /// `activate_scratch_arena`.
+    pub fn create_scratch_arena(&self, slot_sizes: &[usize]) -> Result<Arc<ScratchArena>> {
+        Ok(Arc::new(
+            ScratchArena::new(&self.device, slot_sizes).map_err(MetalError::from)?,
+        ))
+    }
+
+    /// Активировать scratch arena для текущего потока.
+    ///
+    /// После вызова `allocate_buffer` будет сначала пробовать взять slot
+    /// из arena (lock-free через Arc::strong_count). Если arena не имеет
+    /// подходящего свободного slot — fallback к обычному pool.
+    ///
+    /// Вызывать перед prefill loop. Парная деактивация —
+    /// `deactivate_scratch_arena()` — ОБЯЗАТЕЛЬНА после final GPU fence.
+    pub fn activate_scratch_arena(&self, arena: Arc<ScratchArena>) {
+        ACTIVE_ARENA.with(|a| *a.borrow_mut() = Some(arena));
+    }
+
+    /// Деактивировать scratch arena для текущего потока.
+    ///
+    /// После вызова `allocate_buffer` использует только обычный pool.
+    /// Вызывать ВСЕГДА после prefill loop (даже при панике — используй RAII guard).
+    pub fn deactivate_scratch_arena(&self) {
+        ACTIVE_ARENA.with(|a| *a.borrow_mut() = None);
+    }
+
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
+        // ─── SCRATCH ARENA FAST PATH (T-269 Phase 2) ───────────────────
+        // Проверяем arena ДО pool lock. Lock-free: только атомарный
+        // strong_count check внутри try_acquire.
+        // Default off: ACTIVE_ARENA содержит None → бесплатный borrow().
+        //
+        // SKIP_ARENA_NEXT: если установлен — пропускаем arena для этой аллокации.
+        // Используется для исключения long-lived buffers (KV cache) из arena.
+        let skip_arena = SKIP_ARENA_NEXT.with(|s| {
+            let v = s.get();
+            if v {
+                s.set(false); // одноразовый флаг
+            }
+            v
+        });
+        if !skip_arena {
+            if let Some(buf) = ACTIVE_ARENA.with(|a| {
+                a.borrow()
+                    .as_ref()
+                    .and_then(|arena| arena.try_acquire(size))
+            }) {
+                // Arena hit: записываем в trace как from_pool=false
+                // чтобы Phase 1/2 trace мог различать arena vs pool vs new.
+                if allocation_trace_active() {
+                    record_trace(size, buf.length(), false);
+                }
+                return Ok(buf);
+            }
+        }
+        // ─── EXISTING POOL PATH (unchanged) ─────────────────────────────
+
         // Проверяем trace один раз — нет branch misprediction в hot path когда off.
         let trace_on = allocation_trace_active();
 
