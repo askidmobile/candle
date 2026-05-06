@@ -4,7 +4,7 @@ use crate::metal::{
 use crate::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,31 @@ struct SyncTimings {
 
 thread_local! {
     static SYNC_TIMINGS: RefCell<SyncTimings> = RefCell::new(SyncTimings::default());
+
+    /// Per-thread override for `compute_per_buffer` used inside graph-compute
+    /// scopes (`MetalDevice::with_shared_encoder`). When non-zero, replaces
+    /// the global limit set via `CANDLE_METAL_COMPUTE_PER_BUFFER`. Lets a
+    /// caller batch a long sequence of ops (e.g. an entire model forward
+    /// pass) into one command buffer without auto-flushing on every 50 ops.
+    /// Buffer pool reuse stays safe because all ops live in the same CB and
+    /// Metal's shared-storage hazards are enforced by hardware between
+    /// encoders within a CB.
+    static GRAPH_SCOPE_LIMIT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Set the per-thread `compute_per_buffer` override for the current graph
+/// scope. Pass `0` to clear (default behaviour).
+///
+/// Designed for `MetalDevice::with_shared_encoder` callers — outside of
+/// that scope users should not touch this directly.
+pub fn set_graph_scope_limit(limit: usize) {
+    GRAPH_SCOPE_LIMIT.with(|c| c.set(limit));
+}
+
+/// Read the current per-thread `compute_per_buffer` override.
+/// Returns `0` when no scope is active.
+pub fn graph_scope_limit() -> usize {
+    GRAPH_SCOPE_LIMIT.with(|c| c.get())
 }
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
@@ -165,6 +190,11 @@ impl Commands {
 
     /// Creates an encoder from the selected entry, recycling the buffer if needed.
     /// When recycling, the old committed buffer is moved to `in_flight` so we can later wait on it.
+    ///
+    /// Inside a graph-compute scope (`MetalDevice::with_shared_encoder`), the
+    /// per-thread `GRAPH_SCOPE_LIMIT` overrides `self.compute_per_buffer` so
+    /// the CB is not auto-flushed mid-scope. Pool reuse stays safe because
+    /// all ops live in the same CB.
     fn finalize_entry<F, E>(
         &self,
         entry: Arc<CommandBufferEntry>,
@@ -176,7 +206,13 @@ impl Commands {
         let mut state = entry.state.lock()?;
 
         let count = entry.compute_count.fetch_add(1, Ordering::Relaxed);
-        let flush = count >= self.compute_per_buffer;
+        let scope_limit = graph_scope_limit();
+        let limit = if scope_limit > 0 {
+            scope_limit
+        } else {
+            self.compute_per_buffer
+        };
+        let flush = count >= limit;
 
         if flush {
             self.commit_swap_locked(&entry, &mut state, 1)?;

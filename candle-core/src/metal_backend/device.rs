@@ -248,6 +248,84 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Commit any pending command buffers to the GPU **without** waiting for
+    /// completion. Enables CPU↔GPU pipelining when used inside hot loops
+    /// (e.g. Yttri Qwen3.5 prefill periodic flush at every N layers): CPU
+    /// continues encoding the next batch of ops while GPU executes the
+    /// committed work in parallel.
+    ///
+    /// **Hazard warning.** `flush_no_wait` does NOT clean up the buffer pool
+    /// or wait for in-flight work. The buffer pool may hand out a buffer
+    /// (matched by size and `Arc::strong_count == 1`) that GPU is still
+    /// writing to in a previous CB — leading to data races. Use ONLY inside
+    /// a `with_shared_encoder` scope or when the caller can guarantee no
+    /// pool reuse touches buffers from in-flight CBs.
+    ///
+    /// The caller must still call `wait_until_completed()` (or
+    /// `wait_until_completed_fast()`) before reading GPU outputs from CPU.
+    pub fn flush_no_wait(&self) -> Result<()> {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        commands.flush().map_err(MetalError::from)?;
+        Ok(())
+    }
+
+    /// Run a closure inside a graph-compute scope where all Metal compute
+    /// ops accumulate into a single command buffer (one `commit` at scope
+    /// exit) instead of the default behaviour of auto-flushing every
+    /// `compute_per_buffer` ops.
+    ///
+    /// Modeled on llama.cpp's `ggml_backend_metal_graph_compute`: a long
+    /// sequence of ops (e.g. a model forward pass) is encoded into one
+    /// CB. CPU encoding still runs serially, but the CPU↔GPU sync overhead
+    /// from per-batch commits is removed. Buffer pool reuse stays safe
+    /// because all ops live in the same CB and Metal's shared-storage
+    /// hazards are enforced by hardware between encoders within a CB.
+    ///
+    /// Memory profile improves too: intermediate buffers go back to the
+    /// pool as soon as their last `Tensor` is dropped (which happens
+    /// continuously during encoding), so peak in-flight memory tracks
+    /// the natural data-dependency depth of the graph rather than the
+    /// raw layer count.
+    ///
+    /// Caveats:
+    /// - The closure must complete its CPU side cleanly before any GPU
+    ///   output is read; this function calls `wait_until_completed_fast`
+    ///   on exit so the caller may read tensors right after.
+    /// - Large CBs slow down the GPU's first-byte latency, so for very
+    ///   small graphs (single-token decode) the default 50-op auto-flush
+    ///   path is usually faster — keep `with_shared_encoder` for prefill.
+    /// - Nesting is supported via thread_local stacking of the scope
+    ///   limit (closure-local restore at exit).
+    pub fn with_shared_encoder<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce() -> Result<R>,
+    {
+        // Effectively-infinite limit so finalize_entry never auto-flushes.
+        // Real-world forward'ы у нас 200-300 ops; миллион даёт огромный запас.
+        const SCOPE_LIMIT: usize = 1_000_000;
+
+        let prev_limit = candle_metal_kernels::metal::commands::graph_scope_limit();
+        candle_metal_kernels::metal::commands::set_graph_scope_limit(SCOPE_LIMIT);
+
+        struct ScopeGuard {
+            prev: usize,
+        }
+        impl Drop for ScopeGuard {
+            fn drop(&mut self) {
+                candle_metal_kernels::metal::commands::set_graph_scope_limit(self.prev);
+            }
+        }
+        let _guard = ScopeGuard { prev: prev_limit };
+
+        let result = f();
+
+        // Final sync: CB commit + wait. После этого pool reuse безопасен,
+        // GPU outputs готовы для CPU чтения.
+        self.wait_until_completed_fast()?;
+
+        result
+    }
+
     /// Get and reset accumulated sync timing stats from flush_and_wait_fast.
     /// Returns: (count, sem_us, lock_us, commit_us, wait_us, total_us)
     pub fn take_sync_timings(&self) -> (u64, u64, u64, u64, u64, u64) {
