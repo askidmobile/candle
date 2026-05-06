@@ -117,7 +117,10 @@ pub use dummy_cuda_backend as cuda;
 pub use cuda::{CudaDevice, CudaStorage};
 
 #[cfg(feature = "metal")]
-pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
+pub use metal_backend::{
+    allocation_trace_active, begin_allocation_trace, end_allocation_trace, MetalDevice, MetalError,
+    MetalStorage, TraceEntry,
+};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};

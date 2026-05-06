@@ -12,10 +12,69 @@ use candle_metal_kernels::{
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::MetalError;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allocation tracing API (T-269 Phase 1)
+//
+// Default off — нет overhead в hot path когда trace не активен.
+// Активируется через begin_allocation_trace() только во время calibration
+// forward. Результат забирается через end_allocation_trace().
+// ─────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static TRACE_ALLOC: Cell<bool> = const { Cell::new(false) };
+    static TRACE_LOG: RefCell<Vec<TraceEntry>> = RefCell::new(Vec::new());
+}
+
+/// Одна запись о Metal buffer аллокации во время calibration forward.
+#[derive(Clone, Debug)]
+pub struct TraceEntry {
+    /// Запрошенный размер (raw, до round-up).
+    pub size: usize,
+    /// Фактический размер буфера после buf_size() round-up.
+    pub rounded_size: usize,
+    /// Момент аллокации (монотонное время).
+    pub timestamp: std::time::Instant,
+    /// true = буфер взят из pool (reuse), false = новый MTLBuffer.
+    pub from_pool: bool,
+}
+
+/// Начать трассировку аллокаций. Очищает предыдущий лог.
+/// Вызвать перед calibration forward, после warmup.
+pub fn begin_allocation_trace() {
+    TRACE_LOG.with(|l| l.borrow_mut().clear());
+    TRACE_ALLOC.with(|c| c.set(true));
+}
+
+/// Остановить трассировку и вернуть собранный лог.
+/// Возвращает все TraceEntry с момента begin_allocation_trace().
+pub fn end_allocation_trace() -> Vec<TraceEntry> {
+    TRACE_ALLOC.with(|c| c.set(false));
+    TRACE_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+}
+
+/// Проверить активна ли трассировка на текущем потоке.
+#[inline(always)]
+pub fn allocation_trace_active() -> bool {
+    TRACE_ALLOC.with(|c| c.get())
+}
+
+#[inline(always)]
+fn record_trace(size: usize, rounded: usize, from_pool: bool) {
+    TRACE_LOG.with(|l| {
+        l.borrow_mut().push(TraceEntry {
+            size,
+            rounded_size: rounded,
+            timestamp: std::time::Instant::now(),
+            from_pool,
+        });
+    });
+}
 
 /// Unique identifier for metal devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -429,6 +488,9 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
+        // Проверяем trace один раз — нет branch misprediction в hot path когда off.
+        let trace_on = allocation_trace_active();
+
         let completed_command_buffer_id = if self.completion_aware_pool {
             let commands = self.commands.read().map_err(MetalError::from)?;
             Some(commands.completed_command_buffer_id())
@@ -438,17 +500,23 @@ impl MetalDevice {
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         if let Some(b) = find_available_buffer(size, &buffers, completed_command_buffer_id) {
             // Cloning also ensures we increment the strong count
+            if trace_on {
+                record_trace(size, b.length(), true);
+            }
             return Ok(b.clone());
         }
-        let size = buf_size(size);
-        let subbuffers = buffers.entry(size).or_insert(vec![]);
+        let rounded = buf_size(size);
+        let subbuffers = buffers.entry(rounded).or_insert(vec![]);
 
         let new_buffer = self
             .device
-            .new_buffer(size, RESOURCE_OPTIONS)
+            .new_buffer(rounded, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
         subbuffers.push(new_buffer.clone());
+        if trace_on {
+            record_trace(size, rounded, false);
+        }
         Ok(new_buffer)
     }
 
