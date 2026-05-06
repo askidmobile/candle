@@ -13,6 +13,22 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
+/// Включает inplace fast path для element-wise ops (Unary/Binary/Affine).
+///
+/// Когда Arc::strong_count(input.buffer) == 1 и shape/dtype совпадают —
+/// Metal kernel пишет output в тот же буфер что и input (zero allocation).
+/// Element-wise kernels безопасны к self-aliasing: каждый thread читает
+/// и пишет по одному элементу независимо (нет читать-всё-потом-писать фаз).
+///
+/// По умолчанию OFF (env-флаг YTTRI_INPLACE_OPS=1 для активации).
+/// Skip: RmsNorm, Softmax, Rope — нужен 2-pass или pair-wise rotation.
+#[inline(always)]
+fn inplace_ops_enabled() -> bool {
+    std::env::var("YTTRI_INPLACE_OPS")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
 mod device;
 pub use device::{
     allocation_trace_active, begin_allocation_trace, end_allocation_trace, skip_arena_next_alloc,
@@ -125,7 +141,16 @@ impl BackendStorage for MetalStorage {
         let el = shape.elem_count();
         let dtype = self.dtype;
 
-        let buffer = device.new_buffer(el, self.dtype, "affine")?;
+        // Inplace fast path для affine (scale + bias) — element-wise, dtype сохраняется.
+        let buffer = if inplace_ops_enabled()
+            && layout.is_contiguous()
+            && Arc::strong_count(&self.buffer) == 1
+        {
+            Arc::clone(&self.buffer)
+        } else {
+            device.new_buffer(el, self.dtype, "affine")?
+        };
+
         let encoder = self.device.command_encoder()?;
         encoder.set_label("affine");
         let src = buffer_o(&self.buffer, layout, dtype);
@@ -652,7 +677,24 @@ impl BackendStorage for MetalStorage {
         let dtype = self.dtype;
         let shape = layout.shape();
         let el_count = shape.elem_count();
-        let buffer = device.new_buffer(el_count, dtype, B::KERNEL)?;
+
+        // Inplace fast path: reuse input buffer как output когда:
+        // 1. arc strong_count == 1 (только этот tensor владеет буфером)
+        // 2. layout contiguous (output элементы совпадают 1:1 с input)
+        // 3. dtype не меняется (element-wise unary сохраняет тип)
+        // 4. env-флаг YTTRI_INPLACE_OPS=1 (default off)
+        // Metal element-wise kernels: каждый GPU thread читает src[i] →
+        // вычисляет → пишет dst[i]. Нет зависимостей между потоками,
+        // нет read-all-then-write фазы. Self-aliasing (src == dst) безопасен.
+        let buffer = if inplace_ops_enabled()
+            && layout.is_contiguous()
+            && Arc::strong_count(&self.buffer) == 1
+        {
+            Arc::clone(&self.buffer)
+        } else {
+            device.new_buffer(el_count, dtype, B::KERNEL)?
+        };
+
         let encoder = device.command_encoder()?;
         encoder.set_label(B::KERNEL);
         let src = buffer_o(&self.buffer, layout, self.dtype);
@@ -1895,9 +1937,25 @@ impl MetalStorage {
         let lhs_contiguous = lhs_l.is_contiguous();
         let rhs_contiguous = rhs_l.is_contiguous();
 
+        // Inplace fast path для binary contiguous arithmetic ops.
+        // Reuse lhs buffer когда:
+        // 1. output dtype == lhs dtype (не comparison op — те дают U8)
+        // 2. оба input contiguous (иначе strided path нужен отдельный буфер)
+        // 3. strong_count(lhs.buffer) == 1
+        // 4. env-флаг YTTRI_INPLACE_OPS=1
+        // Metal binary kernel: thread[i] читает lhs[i] и rhs[i] независимо →
+        // пишет out[i]. lhs[i] прочитан до записи в out[i] (тот же адрес) —
+        // нет race даже при lhs == out.
         let buffer = if lhs_contiguous && rhs_contiguous {
             let kernel = kernel_name(op, &self.dtype, "");
-            let buffer = device.new_buffer(el_count, dtype, op)?;
+            let buffer = if inplace_ops_enabled()
+                && dtype == self.dtype
+                && Arc::strong_count(&self.buffer) == 1
+            {
+                Arc::clone(&self.buffer)
+            } else {
+                device.new_buffer(el_count, dtype, op)?
+            };
             candle_metal_kernels::call_binary_contiguous(
                 &device.device,
                 &encoder,
