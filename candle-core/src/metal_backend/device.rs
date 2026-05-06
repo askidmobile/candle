@@ -603,6 +603,34 @@ impl MetalDevice {
         })
     }
 
+    /// Выделить из unified arena с возвратом `(Arc<Buffer>, offset)`.
+    ///
+    /// Если unified arena активна — bump allocate из неё.
+    /// Если arena не активна или исчерпана — fallback к `allocate_buffer(size)` с offset=0.
+    ///
+    /// Результат используется для создания `MetalStorage::new_with_offset`.
+    ///
+    /// # Safety
+    ///
+    /// Caller обязан гарантировать GPU fence (`wait_until_completed_fast`) перед
+    /// следующим `reset_unified_arena()`. Иначе GPU может записывать в offset
+    /// одновременно с новым kernel на том же offset.
+    pub fn new_buffer_unified(
+        &self,
+        element_count: usize,
+        dtype: crate::DType,
+        _name: &str,
+    ) -> Result<(Arc<Buffer>, usize)> {
+        let size = element_count * dtype.size_in_bytes();
+        // Пробуем unified arena first.
+        if let Some(alloc) = self.try_acquire_unified(size) {
+            return Ok((alloc.buffer, alloc.offset_in_bytes));
+        }
+        // Fallback: обычный pool, offset = 0.
+        let buf = self.allocate_buffer(size)?;
+        Ok((buf, 0))
+    }
+
     /// Активировать scratch arena для текущего потока.
     ///
     /// После вызова `allocate_buffer` будет сначала пробовать взять slot

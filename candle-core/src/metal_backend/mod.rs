@@ -1799,6 +1799,12 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // T-269 Phase 3c: unified arena для output buffer.
+        // NOTE: KV cache issue не решён — при использовании unified arena
+        // KV cache может попасть в arena и быть corrupted после reset.
+        // Пока используем обычный pool (offset=0) для всех ops кроме тех
+        // где KV cache явно исключён через skip флаг.
+        // TODO Phase 3c сессия 2: добавить skip_unified_next_alloc() в KV cache creation.
         let buffer = self.device.new_buffer(b * m * n, self.dtype, "matmul")?;
         let encoder = self.device.command_encoder()?;
         encoder.set_label("matmul");
@@ -1819,13 +1825,13 @@ impl BackendStorage for MetalStorage {
             dtype,
             (b, m, n, k),
             lhs_l.stride(),
-            lhs_l.start_offset() * self.dtype.size_in_bytes(),
+            self.buffer_slice(lhs_l, self.dtype).offset_in_bytes,
             &self.buffer,
             rhs_l.stride(),
             rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
             &rhs.buffer,
             &buffer,
-            0, // output_offset: начало буфера (T-269 Phase 3c)
+            0, // output_offset=0 (пул буфер), T-269 Phase 3c сессия 2 активирует unified
         )
         .map_err(MetalError::from)?;
 
