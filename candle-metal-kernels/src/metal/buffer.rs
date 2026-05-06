@@ -1,14 +1,22 @@
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSRange;
 use objc2_metal::{MTLBuffer, MTLResource};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 pub type MetalResource = ProtocolObject<dyn MTLResource>;
 pub type MTLResourceOptions = objc2_metal::MTLResourceOptions;
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Debug)]
 pub struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    last_used_command_buffer_id: Arc<AtomicU64>,
 }
 
 unsafe impl Send for Buffer {}
@@ -16,7 +24,10 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
-        Buffer { raw }
+        Buffer {
+            raw,
+            last_used_command_buffer_id: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn contents(&self) -> *mut u8 {
@@ -34,6 +45,38 @@ impl Buffer {
 
     pub fn did_modify_range(&self, range: NSRange) {
         self.as_ref().didModifyRange(range);
+    }
+
+    pub fn mark_used_in_command_buffer(&self, command_buffer_id: u64) {
+        self.last_used_command_buffer_id
+            .store(command_buffer_id, Ordering::Release);
+    }
+
+    pub fn last_used_command_buffer_id(&self) -> u64 {
+        self.last_used_command_buffer_id.load(Ordering::Acquire)
+    }
+}
+
+impl Clone for Buffer {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw.clone(),
+            last_used_command_buffer_id: Arc::clone(&self.last_used_command_buffer_id),
+        }
+    }
+}
+
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for Buffer {}
+
+impl Hash for Buffer {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
     }
 }
 

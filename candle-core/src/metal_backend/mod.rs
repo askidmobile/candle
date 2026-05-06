@@ -2048,6 +2048,7 @@ impl BackendDevice for MetalDevice {
             kernels,
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
+            completion_aware_pool: device::completion_aware_pool_enabled_from_env(),
         })
     }
 

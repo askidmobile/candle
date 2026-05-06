@@ -5,7 +5,7 @@ use crate::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Accumulated timing breakdown for flush_and_wait_fast calls.
@@ -61,9 +61,33 @@ pub fn create_command_buffer(
     command_queue: &CommandQueue,
     semaphore: Arc<CommandSemaphore>,
 ) -> Result<CommandBuffer, MetalKernelError> {
+    create_tracked_command_buffer(
+        command_queue,
+        semaphore,
+        0,
+        Arc::new(AtomicU64::new(0)),
+        false,
+    )
+}
+
+fn create_tracked_command_buffer(
+    command_queue: &CommandQueue,
+    semaphore: Arc<CommandSemaphore>,
+    id: u64,
+    completed_command_buffer_id: Arc<AtomicU64>,
+    track_buffer_usage: bool,
+) -> Result<CommandBuffer, MetalKernelError> {
     command_queue
         .commandBuffer()
-        .map(|raw| CommandBuffer::new(raw, semaphore))
+        .map(|raw| {
+            CommandBuffer::new(
+                raw,
+                semaphore,
+                id,
+                completed_command_buffer_id,
+                track_buffer_usage,
+            )
+        })
         .ok_or(MetalKernelError::FailedToCreateResource(
             "CommandBuffer".to_string(),
         ))
@@ -92,6 +116,9 @@ pub struct Commands {
     command_queue: CommandQueue,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc) per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
+    next_command_buffer_id: AtomicU64,
+    completed_command_buffer_id: Arc<AtomicU64>,
+    completion_aware_pool: bool,
 }
 
 unsafe impl Send for Commands {}
@@ -113,22 +140,46 @@ impl Commands {
             _ => DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE,
         };
 
+        let next_command_buffer_id = AtomicU64::new(1);
+        let completed_command_buffer_id = Arc::new(AtomicU64::new(0));
+        let completion_aware_pool = completion_aware_pool_enabled_from_env();
+
         let pool = (0..pool_size)
-            .map(|_| Self::create_pool_entry(&command_queue))
+            .map(|_| {
+                let id = next_command_buffer_id.fetch_add(1, Ordering::Relaxed);
+                Self::create_pool_entry(
+                    &command_queue,
+                    id,
+                    Arc::clone(&completed_command_buffer_id),
+                    completion_aware_pool,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             pool,
             command_queue,
             compute_per_buffer,
+            next_command_buffer_id,
+            completed_command_buffer_id,
+            completion_aware_pool,
         })
     }
 
     fn create_pool_entry(
         command_queue: &CommandQueue,
+        command_buffer_id: u64,
+        completed_command_buffer_id: Arc<AtomicU64>,
+        track_buffer_usage: bool,
     ) -> Result<Arc<CommandBufferEntry>, MetalKernelError> {
         let semaphore = Arc::new(CommandSemaphore::new());
-        let cb = create_command_buffer(command_queue, Arc::clone(&semaphore))?;
+        let cb = create_tracked_command_buffer(
+            command_queue,
+            Arc::clone(&semaphore),
+            command_buffer_id,
+            completed_command_buffer_id,
+            track_buffer_usage,
+        )?;
 
         Ok(Arc::new(CommandBufferEntry {
             state: Mutex::new(EntryState {
@@ -138,6 +189,10 @@ impl Commands {
             compute_count: AtomicUsize::new(0),
             semaphore,
         }))
+    }
+
+    pub fn completed_command_buffer_id(&self) -> u64 {
+        self.completed_command_buffer_id.load(Ordering::Acquire)
     }
 
     pub fn command_encoder(&self) -> Result<(bool, ComputeCommandEncoder), MetalKernelError> {
@@ -394,7 +449,13 @@ impl Commands {
         reset_to: usize,
     ) -> Result<(), MetalKernelError> {
         state.current.commit();
-        let new_cb = create_command_buffer(&self.command_queue, Arc::clone(&entry.semaphore))?;
+        let new_cb = create_tracked_command_buffer(
+            &self.command_queue,
+            Arc::clone(&entry.semaphore),
+            self.next_command_buffer_id.fetch_add(1, Ordering::Relaxed),
+            Arc::clone(&self.completed_command_buffer_id),
+            self.completion_aware_pool,
+        )?;
         let old_cb = std::mem::replace(&mut state.current, new_cb);
         state.in_flight.push(old_cb);
         entry.compute_count.store(reset_to, Ordering::Release);
@@ -422,8 +483,16 @@ impl Commands {
             _ => unreachable!(),
         }
 
+        cb.mark_completed();
+
         Ok(())
     }
+}
+
+fn completion_aware_pool_enabled_from_env() -> bool {
+    std::env::var("CANDLE_METAL_COMPLETION_AWARE_POOL")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
 }
 
 impl Drop for Commands {

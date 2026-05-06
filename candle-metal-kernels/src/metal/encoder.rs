@@ -9,6 +9,8 @@ use std::{ffi::c_void, ptr, sync::Arc};
 pub struct ComputeCommandEncoder {
     raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     semaphore: Arc<CommandSemaphore>,
+    command_buffer_id: u64,
+    track_buffer_usage: bool,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -20,8 +22,15 @@ impl ComputeCommandEncoder {
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         semaphore: Arc<CommandSemaphore>,
+        command_buffer_id: u64,
+        track_buffer_usage: bool,
     ) -> ComputeCommandEncoder {
-        ComputeCommandEncoder { raw, semaphore }
+        ComputeCommandEncoder {
+            raw,
+            semaphore,
+            command_buffer_id,
+            track_buffer_usage,
+        }
     }
 
     pub(crate) fn signal_encoding_ended(&self) {
@@ -49,6 +58,11 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        if self.track_buffer_usage {
+            if let Some(buffer) = buffer {
+                buffer.mark_used_in_command_buffer(self.command_buffer_id);
+            }
+        }
         unsafe {
             self.raw
                 .setBuffer_offset_atIndex(buffer.map(|b| b.as_ref()), offset, index)
@@ -103,6 +117,8 @@ impl Drop for ComputeCommandEncoder {
 pub struct BlitCommandEncoder {
     raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
     semaphore: Arc<CommandSemaphore>,
+    command_buffer_id: u64,
+    track_buffer_usage: bool,
 }
 
 impl AsRef<BlitCommandEncoder> for BlitCommandEncoder {
@@ -115,8 +131,15 @@ impl BlitCommandEncoder {
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
         semaphore: Arc<CommandSemaphore>,
+        command_buffer_id: u64,
+        track_buffer_usage: bool,
     ) -> BlitCommandEncoder {
-        BlitCommandEncoder { raw, semaphore }
+        BlitCommandEncoder {
+            raw,
+            semaphore,
+            command_buffer_id,
+            track_buffer_usage,
+        }
     }
 
     pub(crate) fn signal_encoding_ended(&self) {
@@ -142,6 +165,10 @@ impl BlitCommandEncoder {
         dst_offset: usize,
         size: usize,
     ) {
+        if self.track_buffer_usage {
+            src_buffer.mark_used_in_command_buffer(self.command_buffer_id);
+            dst_buffer.mark_used_in_command_buffer(self.command_buffer_id);
+        }
         unsafe {
             self.raw
                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -155,6 +182,9 @@ impl BlitCommandEncoder {
     }
 
     pub fn fill_buffer(&self, buffer: &Buffer, range: (usize, usize), value: u8) {
+        if self.track_buffer_usage {
+            buffer.mark_used_in_command_buffer(self.command_buffer_id);
+        }
         self.raw.fillBuffer_range_value(
             buffer.as_ref(),
             NSRange {

@@ -63,6 +63,7 @@ pub struct MetalDevice {
     pub(crate) seed: Arc<Mutex<Buffer>>,
     /// Last seed value set on this device.
     pub(crate) seed_value: Arc<RwLock<u64>>,
+    pub(crate) completion_aware_pool: bool,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -214,6 +215,10 @@ impl MetalDevice {
             self.device.current_allocated_size(),
             self.device.recommended_max_working_set_size(),
         )
+    }
+
+    pub fn completion_aware_pool_enabled(&self) -> bool {
+        self.completion_aware_pool
     }
 
     pub fn command_encoder(&self) -> Result<ComputeCommandEncoder> {
@@ -424,8 +429,14 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
+        let completed_command_buffer_id = if self.completion_aware_pool {
+            let commands = self.commands.read().map_err(MetalError::from)?;
+            Some(commands.completed_command_buffer_id())
+        } else {
+            None
+        };
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
-        if let Some(b) = find_available_buffer(size, &buffers) {
+        if let Some(b) = find_available_buffer(size, &buffers, completed_command_buffer_id) {
             // Cloning also ensures we increment the strong count
             return Ok(b.clone());
         }
@@ -468,13 +479,20 @@ fn buf_size(size: usize) -> usize {
     size.saturating_sub(1).next_power_of_two()
 }
 
-fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+fn find_available_buffer(
+    size: usize,
+    buffers: &BufferMap,
+    completed_command_buffer_id: Option<u64>,
+) -> Option<Arc<Buffer>> {
     let mut best_buffer: Option<&Arc<Buffer>> = None;
     let mut best_buffer_size = usize::MAX;
     for (buffer_size, subbuffers) in buffers.iter() {
         if buffer_size >= &size && buffer_size < &best_buffer_size {
             for sub in subbuffers {
-                if Arc::strong_count(sub) == 1 {
+                let gpu_completed = completed_command_buffer_id
+                    .map(|completed| sub.last_used_command_buffer_id() <= completed)
+                    .unwrap_or(true);
+                if Arc::strong_count(sub) == 1 && gpu_completed {
                     best_buffer = Some(sub);
                     best_buffer_size = *buffer_size;
                 }
@@ -482,4 +500,10 @@ fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>
         }
     }
     best_buffer.cloned()
+}
+
+pub(crate) fn completion_aware_pool_enabled_from_env() -> bool {
+    std::env::var("CANDLE_METAL_COMPLETION_AWARE_POOL")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
 }

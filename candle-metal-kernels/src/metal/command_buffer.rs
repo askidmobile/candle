@@ -1,9 +1,14 @@
 use crate::{BlitCommandEncoder, ComputeCommandEncoder};
+use block2::RcBlock;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
 use std::borrow::Cow;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::ptr::NonNull;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Condvar, Mutex, MutexGuard,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandStatus {
@@ -61,6 +66,10 @@ impl CommandSemaphore {
 pub struct CommandBuffer {
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     semaphore: Arc<CommandSemaphore>,
+    id: u64,
+    completed_command_buffer_id: Arc<AtomicU64>,
+    completion_handler_registered: Arc<AtomicBool>,
+    track_buffer_usage: bool,
 }
 
 unsafe impl Send for CommandBuffer {}
@@ -70,25 +79,52 @@ impl CommandBuffer {
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         semaphore: Arc<CommandSemaphore>,
+        id: u64,
+        completed_command_buffer_id: Arc<AtomicU64>,
+        track_buffer_usage: bool,
     ) -> Self {
-        Self { raw, semaphore }
+        Self {
+            raw,
+            semaphore,
+            id,
+            completed_command_buffer_id,
+            completion_handler_registered: Arc::new(AtomicBool::new(false)),
+            track_buffer_usage,
+        }
     }
 
     pub fn compute_command_encoder(&self) -> ComputeCommandEncoder {
         self.as_ref()
             .computeCommandEncoder()
-            .map(|raw| ComputeCommandEncoder::new(raw, Arc::clone(&self.semaphore)))
+            .map(|raw| {
+                ComputeCommandEncoder::new(
+                    raw,
+                    Arc::clone(&self.semaphore),
+                    self.id,
+                    self.track_buffer_usage,
+                )
+            })
             .unwrap()
     }
 
     pub fn blit_command_encoder(&self) -> BlitCommandEncoder {
         self.as_ref()
             .blitCommandEncoder()
-            .map(|raw| BlitCommandEncoder::new(raw, Arc::clone(&self.semaphore)))
+            .map(|raw| {
+                BlitCommandEncoder::new(
+                    raw,
+                    Arc::clone(&self.semaphore),
+                    self.id,
+                    self.track_buffer_usage,
+                )
+            })
             .unwrap()
     }
 
     pub fn commit(&self) {
+        if self.track_buffer_usage {
+            self.register_completion_handler();
+        }
         self.raw.commit()
     }
 
@@ -116,6 +152,31 @@ impl CommandBuffer {
 
     pub fn wait_until_completed(&self) {
         self.raw.waitUntilCompleted();
+        self.mark_completed();
+    }
+
+    pub fn mark_completed(&self) {
+        self.completed_command_buffer_id
+            .fetch_max(self.id, Ordering::Release);
+    }
+
+    fn register_completion_handler(&self) {
+        if self
+            .completion_handler_registered
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let id = self.id;
+        let completed = Arc::clone(&self.completed_command_buffer_id);
+        let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            completed.fetch_max(id, Ordering::Release);
+        });
+        unsafe {
+            self.raw.addCompletedHandler(RcBlock::as_ptr(&block).cast());
+        }
     }
 }
 
