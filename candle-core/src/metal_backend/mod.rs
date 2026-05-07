@@ -2092,6 +2092,55 @@ impl MetalStorage {
         Ok(Self::new(buffer, device.clone(), el_count, dtype))
     }
 
+    /// Fused SiLU(lhs) * rhs — прямой Metal dispatch без CustomOp2 overhead.
+    ///
+    /// Требует: оба тензора contiguous, same shape, same dtype (F32/F16/BF16).
+    /// Используется в Mlp::forward для SwiGLU gate path (T-275).
+    pub fn silu_mul_metal_direct(
+        &self,
+        rhs: &Self,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<Self> {
+        if !(lhs_l.is_contiguous() && rhs_l.is_contiguous()) {
+            crate::bail!("silu_mul_metal_direct requires contiguous inputs");
+        }
+        if self.dtype != rhs.dtype {
+            crate::bail!(
+                "silu_mul_metal_direct dtype mismatch: {:?} vs {:?}",
+                self.dtype,
+                rhs.dtype
+            );
+        }
+        let kernel_name = match self.dtype {
+            DType::F32 => "bsilu_mul_f32",
+            DType::F16 => "bsilu_mul_f16",
+            DType::BF16 => "bsilu_mul_bf16",
+            d => crate::bail!("silu_mul_metal_direct: unsupported dtype {:?}", d),
+        };
+        let device = self.device();
+        let el_count = lhs_l.shape().elem_count();
+        let buffer = device.new_buffer(el_count, self.dtype, "silu_mul")?;
+        let encoder = device.command_encoder()?;
+        let lhs = self.buffer_slice(lhs_l, self.dtype);
+        let rhs_buf = buffer_o(&rhs.buffer, rhs_l, rhs.dtype);
+        candle_metal_kernels::call_binary_contiguous(
+            &device.device,
+            &encoder,
+            &device.kernels,
+            kernel_name,
+            self.dtype.size_in_bytes(),
+            el_count,
+            lhs,
+            rhs_buf,
+            &buffer,
+            0,
+        )
+        .map_err(MetalError::from)?;
+        encoder.set_label("silu_mul");
+        Ok(Self::new(buffer, device.clone(), el_count, self.dtype))
+    }
+
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
         let buffer = self.device.allocate_buffer(size)?;

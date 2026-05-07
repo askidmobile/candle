@@ -643,6 +643,44 @@ impl Tensor {
     unary_op!(erf, Erf);
     unary_op!(relu, Relu);
     unary_op!(silu, Silu);
+
+    /// Fused SiLU(self) * rhs — прямой Metal dispatch (T-275).
+    ///
+    /// На Metal: один kernel `bsilu_mul_<dtype>` вместо двух (`silu` + `mul`).
+    /// На CPU / non-Metal: fallback через `self.silu()? * rhs`.
+    ///
+    /// Требования: same shape, same dtype (F32/F16/BF16), оба contiguous.
+    /// При нарушении требований — fallback, не ошибка.
+    pub fn silu_mul_direct(&self, rhs: &Self) -> Result<Self> {
+        let shape = self.same_shape_binary_op(rhs, "silu_mul_direct")?;
+        if shape.elem_count() == 0 {
+            return Ok(self.clone());
+        }
+        #[cfg(feature = "metal")]
+        {
+            let lhs_l = self.layout();
+            let rhs_l = rhs.layout();
+            if lhs_l.is_contiguous() && rhs_l.is_contiguous() && self.dtype() == rhs.dtype() {
+                let lhs_storage = self.storage();
+                let rhs_storage = rhs.storage();
+                if let (Storage::Metal(lhs_m), Storage::Metal(rhs_m)) =
+                    (&*lhs_storage, &*rhs_storage)
+                {
+                    let out = lhs_m.silu_mul_metal_direct(rhs_m, lhs_l, rhs_l)?;
+                    let none = crate::op::BackpropOp::none();
+                    return Ok(from_storage(
+                        Storage::Metal(out),
+                        shape.clone(),
+                        none,
+                        false,
+                    ));
+                }
+            }
+        }
+        // Fallback: CPU path или non-contiguous Metal
+        self.silu()? * rhs
+    }
+
     unary_op!(ceil, Ceil);
     unary_op!(floor, Floor);
     unary_op!(round, Round);
