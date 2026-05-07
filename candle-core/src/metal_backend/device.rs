@@ -16,6 +16,269 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
+#[allow(unused_imports)]
+use libc;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WeightResidencySet — MTLResidencySet lifecycle management (T-271 Phase 4 redux)
+//
+// Задача: сообщить macOS что weight buffers (GGUF mmaps) нужны GPU постоянно
+// и не должны выгружаться в compressed memory. Это закрывает 5.7× RSS gap
+// между Yttri (2.5 GB) и llama.cpp (434 MB) при работе с той же моделью.
+//
+// Паттерн из llama.cpp ggml-metal-device.m:
+// - Per-buffer residency set создаётся при init каждого Metal buffer
+// - requestResidency() сразу при создании set — память permanently wired
+// - Background thread с keep_alive interval (default 3 мин) поддерживает
+//   residency alive через периодические requestResidency() каждые 500ms
+//
+// Наша адаптация для Rust/candle (без per-buffer sets, один set на модель):
+// - WeightResidencySet создаётся при init модели
+// - new_buffer_no_copy добавляет каждый weight buffer через addAllocation()
+// - commit_and_request() вызывается после загрузки всех весов
+// - Background Rust thread каждые HEARTBEAT_INTERVAL_S секунд вызывает
+//   requestResidency() для предотвращения macOS eviction при idle
+// - Drop вызывает endResidency() + removeAllAllocations() + завершает thread
+//
+// macOS version: MTLResidencySet доступен с macOS 15.0. Проверяется в runtime
+// через sysctl kern.osproductversion. Если < 15 или env YTTRI_DISABLE_RESIDENCY_SET=1
+// — возвращает None, поведение не меняется.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLAllocation, MTLDevice as MTLDeviceProtocol, MTLResidencySet, MTLResidencySetDescriptor};
+use objc2_foundation::NSString;
+
+/// Интервал heartbeat-запросов residency (секунды).
+/// llama.cpp использует 500ms; мы берём 30с — достаточно для предотвращения
+/// eviction, меньше CPU overhead.
+const HEARTBEAT_INTERVAL_S: u64 = 30;
+
+/// Проверяет поддержку MTLResidencySet в runtime (macOS 15+).
+/// Результат кешируется в OnceLock — однократная проверка при первом вызове.
+fn supports_residency_set() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        // Быстрая проверка через env override
+        if std::env::var("YTTRI_DISABLE_RESIDENCY_SET")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        // macOS version check через sysctl kern.osproductversion
+        // MTLResidencySet доступен с 15.0; мы на 26.x — всегда true,
+        // но проверяем корректно для portability.
+        macos_version_ge_15()
+    })
+}
+
+/// Возвращает true если macOS >= 15.0 по kern.osproductversion.
+fn macos_version_ge_15() -> bool {
+    use std::ffi::CString;
+    let mut buf = [0u8; 64];
+    let mut size = buf.len();
+    let key = match CString::new("kern.osproductversion") {
+        Ok(k) => k,
+        Err(_) => return true, // fallback: assume supported
+    };
+    let ret = unsafe {
+        libc::sysctlbyname(
+            key.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return true; // sysctlbyname failed — assume supported
+    }
+    // Parse "X.Y.Z" → major version
+    let s = std::str::from_utf8(&buf[..size.saturating_sub(1)]).unwrap_or("26.0");
+    let major: u32 = s.split('.').next().and_then(|m| m.parse().ok()).unwrap_or(26);
+    major >= 15
+}
+
+/// Newtype wrapper делающий MTLResidencySet Send+Sync.
+///
+/// Safety: MTLResidencySet thread-safe по Apple документации —
+/// requestResidency/endResidency/addAllocation/commit можно вызывать
+/// с любого потока. Все ObjC retain/release операции в Retained<>
+/// атомарны.
+struct SendableRset(Retained<ProtocolObject<dyn MTLResidencySet>>);
+unsafe impl Send for SendableRset {}
+unsafe impl Sync for SendableRset {}
+
+impl std::ops::Deref for SendableRset {
+    type Target = ProtocolObject<dyn MTLResidencySet>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Внутреннее состояние residency set — содержит Objective-C объект.
+/// Завёрнут в Mutex чтобы addAllocation/commit/requestResidency могли
+/// вызываться из разных потоков (хотя типично это происходит последовательно).
+struct ResidencyInner {
+    rset: SendableRset,
+    /// true = requestResidency() уже был вызван, memory wired.
+    resident: bool,
+}
+
+// Safety: ResidencyInner содержит только SendableRset (Send+Sync) и bool.
+unsafe impl Send for ResidencyInner {}
+unsafe impl Sync for ResidencyInner {}
+
+/// Публичный handle на residency set модели.
+///
+/// Создаётся через `MetalDevice::new_weight_residency_set()`.
+/// Использование:
+/// 1. Загрузить веса через `new_buffer_no_copy` — каждый буфер автоматически
+///    добавляется в set если device содержит этот WeightResidencySet.
+/// 2. Вызвать `commit_and_request()` после загрузки всех весов.
+/// 3. Держать `Arc<WeightResidencySet>` живым пока модель в памяти.
+///    Drop() автоматически вызовет endResidency().
+pub struct WeightResidencySet {
+    inner: Mutex<ResidencyInner>,
+    /// Сигнал останова background heartbeat thread.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// JoinHandle для graceful shutdown при Drop.
+    thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+unsafe impl Send for WeightResidencySet {}
+unsafe impl Sync for WeightResidencySet {}
+
+impl WeightResidencySet {
+    /// Создать новый WeightResidencySet на данном MTLDevice.
+    /// Возвращает None если macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1.
+    pub fn new(device: &Device) -> Option<Arc<Self>> {
+        if !supports_residency_set() {
+            return None;
+        }
+        let desc = MTLResidencySetDescriptor::new();
+        unsafe { desc.setLabel(Some(&NSString::from_str("yttri-weights"))); }
+        let raw_device: &ProtocolObject<dyn MTLDeviceProtocol> =
+            ProtocolObject::from_ref(device.as_ref());
+        let rset = unsafe {
+            raw_device.newResidencySetWithDescriptor_error(&desc).ok()?
+        };
+        let rset = SendableRset(rset);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        // Для heartbeat thread создаём отдельный Arc<SendableRset>
+        // чтобы не клонировать всю структуру.
+        let rset_for_thread = Arc::new(SendableRset(rset.0.clone()));
+        // Background heartbeat thread — аналог llama.cpp background dispatch
+        // Периодически вызывает requestResidency() каждые HEARTBEAT_INTERVAL_S секунд.
+        // macOS может "забыть" о residency при memory pressure; heartbeat
+        // переодически напоминает ОС что буферы нужны GPU.
+        // Heartbeat thread — запрашивает requestResidency() каждые 30с
+        // только если YTTRI_WIRE_WEIGHTS=1. Иначе thread спит вечно.
+        let wire_weights = std::env::var("YTTRI_WIRE_WEIGHTS").map(|v| v == "1").unwrap_or(false);
+        let handle = std::thread::Builder::new()
+            .name("yttri-residency-heartbeat".to_string())
+            .spawn(move || {
+                if !wire_weights {
+                    // По умолчанию heartbeat не активен — requestResidency не вызывается.
+                    return;
+                }
+                while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_S));
+                    if !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        rset_for_thread.requestResidency();
+                    }
+                }
+            })
+            .ok();
+        Some(Arc::new(Self {
+            inner: Mutex::new(ResidencyInner { rset, resident: false }),
+            stop,
+            thread_handle: Mutex::new(handle),
+        }))
+    }
+
+    /// Добавить Metal buffer в residency set (uncommitted).
+    ///
+    /// Вызывается автоматически из `MetalDevice::new_buffer_no_copy`.
+    /// Threshold: только буферы >= 1 MiB (weight tensors, не маленькие промежуточные).
+    pub fn add_buffer(&self, buffer: &Buffer) {
+        if buffer.length() < 1024 * 1024 {
+            return;
+        }
+        if let Ok(inner) = self.inner.lock() {
+            let mtl_alloc: &ProtocolObject<dyn MTLAllocation> =
+                ProtocolObject::from_ref(buffer.as_ref());
+            inner.rset.addAllocation(mtl_alloc);
+        }
+    }
+
+    /// Зафиксировать все добавленные allocations (без requestResidency).
+    ///
+    /// Должен вызываться ОДИН РАЗ после загрузки всех весов модели.
+    /// commit() — регистрирует буферы в residency set без их принудительного wiring.
+    ///
+    /// Для принудительного wiring вызовите `request_residency()` отдельно.
+    /// Default: только commit(), без requestResidency() — иначе Physical footprint +500 MB.
+    pub fn commit_and_request(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.rset.commit();
+            // requestResidency() намеренно НЕ вызывается здесь.
+            // Оно wires память в GPU (non-evictable), увеличивая Physical footprint на ~500 MB.
+            // Вместо этого macOS сам управляет eviction — страницы становятся resident
+            // по demand при первом доступе GPU.
+            // Для явного wiring: YTTRI_WIRE_WEIGHTS=1 (см. request_residency()).
+            if std::env::var("YTTRI_WIRE_WEIGHTS").map(|v| v == "1").unwrap_or(false) {
+                inner.rset.requestResidency();
+                inner.resident = true;
+            }
+            let alloc_size = inner.rset.allocatedSize();
+            let alloc_mb = alloc_size / (1024 * 1024);
+            eprintln!(
+                "[yttri] MTLResidencySet committed: {} allocations, ~{} MB tracked",
+                inner.rset.allocationCount(),
+                alloc_mb,
+            );
+        }
+    }
+
+    /// Вернуть true если residency уже запрошена.
+    pub fn is_resident(&self) -> bool {
+        self.inner.lock().map(|g| g.resident).unwrap_or(false)
+    }
+
+    /// Принудительно завершить residency (обычно вызывается через Drop).
+    fn end_residency_inner(inner: &mut ResidencyInner) {
+        if inner.resident {
+            inner.rset.endResidency();
+            inner.rset.removeAllAllocations();
+            inner.rset.commit();
+            inner.resident = false;
+        }
+    }
+}
+
+impl Drop for WeightResidencySet {
+    fn drop(&mut self) {
+        // Останавливаем background thread
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut guard) = self.thread_handle.lock() {
+            if let Some(handle) = guard.take() {
+                // Не ждём join чтобы не блокировать Drop — thread сам завершится
+                // после текущего sleep интервала.
+                let _ = handle.join();
+            }
+        }
+        // Снимаем residency
+        if let Ok(mut inner) = self.inner.lock() {
+            Self::end_residency_inner(&mut inner);
+        }
+    }
+}
+
 use super::MetalError;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,6 +417,15 @@ pub struct MetalDevice {
     /// Last seed value set on this device.
     pub(crate) seed_value: Arc<RwLock<u64>>,
     pub(crate) completion_aware_pool: bool,
+
+    /// MTLResidencySet для weight buffers (T-271 Phase 4 redux).
+    ///
+    /// Создаётся через `new_weight_residency_set()` после init device.
+    /// None = macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1.
+    /// `new_buffer_no_copy` автоматически добавляет буферы в этот set.
+    ///
+    /// Arc<Mutex<>> чтобы можно было менять через &self (MetalDevice Clone).
+    pub(crate) weight_residency: Arc<Mutex<Option<Arc<WeightResidencySet>>>>,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -440,6 +712,51 @@ impl MetalDevice {
         &self.device
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // WeightResidencySet API (T-271 Phase 4 redux)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Создать WeightResidencySet для данного device и установить его
+    /// как активный. После этого каждый `new_buffer_no_copy` (GGUF weights)
+    /// автоматически добавляет буфер в set.
+    ///
+    /// Возвращает `Arc<WeightResidencySet>` — сохранить пока модель живёт.
+    /// Вызвать `commit_weight_residency()` после загрузки всех весов.
+    ///
+    /// Если macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1 — возвращает None.
+    /// Создать WeightResidencySet для данного device и установить его
+    /// как активный. После этого каждый `new_buffer_no_copy` (GGUF weights)
+    /// автоматически добавляет буфер в set.
+    ///
+    /// Возвращает `Arc<WeightResidencySet>` — сохранить пока модель живёт.
+    /// Вызвать `commit_weight_residency()` после загрузки всех весов.
+    ///
+    /// Если macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1 — возвращает None.
+    pub fn new_weight_residency_set(&self) -> Option<Arc<WeightResidencySet>> {
+        let rset = WeightResidencySet::new(&self.device)?;
+        if let Ok(mut guard) = self.weight_residency.lock() {
+            *guard = Some(rset.clone());
+        }
+        Some(rset)
+    }
+
+    /// Зафиксировать residency set и запросить wiring для всех добавленных
+    /// weight buffers. Вызывать ОДИН РАЗ после загрузки всех весов модели.
+    ///
+    /// No-op если residency set не установлен.
+    pub fn commit_weight_residency(&self) {
+        if let Ok(guard) = self.weight_residency.lock() {
+            if let Some(ref rset) = *guard {
+                rset.commit_and_request();
+            }
+        }
+    }
+
+    /// Получить клон активного WeightResidencySet (если есть).
+    pub fn weight_residency_set(&self) -> Option<Arc<WeightResidencySet>> {
+        self.weight_residency.lock().ok()?.as_ref().cloned()
+    }
+
     /// Creates a new buffer (not necessarily zeroed).
     pub fn new_buffer(
         &self,
@@ -492,6 +809,10 @@ impl MetalDevice {
     /// Буфер НЕ добавляется в пул буферов MetalDevice — он привязан к mmap
     /// и не должен переиспользоваться другими операциями.
     ///
+    /// T-271 Phase 4 redux: если установлен `weight_residency` set,
+    /// автоматически добавляет буфер через `addAllocation()` (uncommitted).
+    /// Вызвать `commit_weight_residency()` после загрузки всех весов.
+    ///
     /// Требования:
     /// - `ptr` ДОЛЖЕН быть page-aligned (mmap гарантирует это)
     /// - `len` ДОЛЖЕН быть кратен page size (иначе Metal вернёт ошибку)
@@ -505,7 +826,15 @@ impl MetalDevice {
             .device
             .new_buffer_no_copy(ptr, len, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        Ok(Arc::new(new_buffer))
+        let new_buffer = Arc::new(new_buffer);
+        // Добавляем в residency set если установлен.
+        // Только крупные буферы (>= 1 MiB) — weight tensors, не промежуточные.
+        if let Ok(guard) = self.weight_residency.lock() {
+            if let Some(ref rset) = *guard {
+                rset.add_buffer(&new_buffer);
+            }
+        }
+        Ok(new_buffer)
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {

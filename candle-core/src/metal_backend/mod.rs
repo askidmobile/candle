@@ -40,7 +40,7 @@ fn inplace_ops_enabled() -> bool {
 mod device;
 pub use device::{
     allocation_trace_active, begin_allocation_trace, end_allocation_trace, skip_arena_next_alloc,
-    DeviceId, MetalDevice, TraceEntry,
+    DeviceId, MetalDevice, TraceEntry, WeightResidencySet,
 };
 
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
@@ -2203,6 +2203,9 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             completion_aware_pool: device::completion_aware_pool_enabled_from_env(),
+            // Residency set инициализируется позже через new_weight_residency_set().
+            // На этом этапе device только создан — весов ещё нет.
+            weight_residency: Arc::new(Mutex::new(None)),
         })
     }
 

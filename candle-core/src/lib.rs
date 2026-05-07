@@ -119,7 +119,7 @@ pub use cuda::{CudaDevice, CudaStorage};
 #[cfg(feature = "metal")]
 pub use metal_backend::{
     allocation_trace_active, begin_allocation_trace, end_allocation_trace, skip_arena_next_alloc,
-    MetalDevice, MetalError, MetalStorage, TraceEntry,
+    MetalDevice, MetalError, MetalStorage, TraceEntry, WeightResidencySet,
 };
 
 #[cfg(not(feature = "metal"))]
