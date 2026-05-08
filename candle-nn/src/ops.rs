@@ -1100,16 +1100,204 @@ impl candle::CustomOp3 for Sdpa {
         "metal-sdpa"
     }
 
+    /// CPU реализация SDPA (T-286).
+    ///
+    /// Поддерживает:
+    /// - mask=None (наиболее частый случай: Yttri quantized_qwen35, RustASR
+    ///   Qwen3-ASR encoder, gigaam conformer).
+    /// - do_causal=false/true.
+    /// - softcapping (любое значение, включая 1.0 — без эффекта).
+    /// - GQA: n_q_heads = group_size × n_kv_heads.
+    /// - F32 / F16 / BF16 dtypes (compute в F32, output в input dtype).
+    ///
+    /// НЕ поддерживает: mask=Some (z_image transformer use case, не Yttri/RustASR).
+    /// Performance: O(b * n_q * q_seq * k_seq * (head_k + head_v)). Parallelism
+    /// через rayon par_iter по (batch, head, q_seq) pairs.
     fn cpu_fwd(
         &self,
-        _s1: &CpuStorage,
-        _l1: &Layout,
-        _s2: &CpuStorage,
-        _l2: &Layout,
-        _s3: &CpuStorage,
-        _l3: &Layout,
+        s_q: &CpuStorage,
+        l_q: &Layout,
+        s_k: &CpuStorage,
+        l_k: &Layout,
+        s_v: &CpuStorage,
+        l_v: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        candle::bail!("SDPA has no cpu impl")
+        use candle::backend::BackendStorage;
+
+        if self.mask.is_some() {
+            candle::bail!(
+                "CPU SDPA: external mask not yet implemented (T-286 minimal scope). \
+                 Use do_causal or pre-merge mask into q/k bias."
+            );
+        }
+        if !l_q.is_contiguous() || !l_k.is_contiguous() || !l_v.is_contiguous() {
+            candle::bail!("CPU SDPA requires contiguous q/k/v inputs");
+        }
+        let dtype = s_q.dtype();
+        if s_k.dtype() != dtype || s_v.dtype() != dtype {
+            candle::bail!(
+                "CPU SDPA: q/k/v must have same dtype, got {:?}/{:?}/{:?}",
+                dtype,
+                s_k.dtype(),
+                s_v.dtype()
+            );
+        }
+
+        let q_dims = l_q.shape().dims();
+        let k_dims = l_k.shape().dims();
+        let v_dims = l_v.shape().dims();
+        if q_dims.len() != 4 || k_dims.len() != 4 || v_dims.len() != 4 {
+            candle::bail!(
+                "CPU SDPA: expected 4D tensors, got q={:?} k={:?} v={:?}",
+                q_dims,
+                k_dims,
+                v_dims
+            );
+        }
+        let (b, n_q, q_seq, head_k) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
+        if k_dims[0] != b || v_dims[0] != b {
+            candle::bail!("CPU SDPA: batch mismatch");
+        }
+        if k_dims[3] != head_k {
+            candle::bail!("CPU SDPA: q/k last dim mismatch ({} != {})", head_k, k_dims[3]);
+        }
+        if k_dims[1] != v_dims[1] || k_dims[2] != v_dims[2] {
+            candle::bail!("CPU SDPA: k/v shape mismatch");
+        }
+        let n_kv = k_dims[1];
+        let k_seq = k_dims[2];
+        let head_v = v_dims[3];
+        if n_q % n_kv != 0 {
+            candle::bail!(
+                "CPU SDPA: n_q_heads ({}) must be multiple of n_kv_heads ({})",
+                n_q,
+                n_kv
+            );
+        }
+        let group = n_q / n_kv;
+
+        // Convert all to F32 for compute.
+        fn to_f32(s: &CpuStorage, l: &Layout) -> Result<Vec<f32>> {
+            let (start, end) = match l.contiguous_offsets() {
+                Some(o) => o,
+                None => candle::bail!("CPU SDPA: non-contiguous input"),
+            };
+            match s {
+                CpuStorage::F32(v) => Ok(v[start..end].to_vec()),
+                CpuStorage::F16(v) => Ok(v[start..end].iter().map(|x| x.to_f32()).collect()),
+                CpuStorage::BF16(v) => Ok(v[start..end].iter().map(|x| x.to_f32()).collect()),
+                other => candle::bail!("CPU SDPA: unsupported dtype {:?}", other.dtype()),
+            }
+        }
+        let q = to_f32(s_q, l_q)?;
+        let k = to_f32(s_k, l_k)?;
+        let v = to_f32(s_v, l_v)?;
+
+        let scale = self.scale;
+        let softcap = self.softcapping;
+        let apply_softcap = (softcap - 1.0).abs() > 1e-6 && softcap > 0.0;
+        let do_causal = self.do_causal;
+
+        let q_stride_b = n_q * q_seq * head_k;
+        let q_stride_h = q_seq * head_k;
+        let q_stride_s = head_k;
+        let k_stride_b = n_kv * k_seq * head_k;
+        let k_stride_h = k_seq * head_k;
+        let k_stride_s = head_k;
+        let v_stride_b = n_kv * k_seq * head_v;
+        let v_stride_h = k_seq * head_v;
+        let v_stride_s = head_v;
+        let out_stride_b = n_q * q_seq * head_v;
+        let out_stride_h = q_seq * head_v;
+        let out_stride_s = head_v;
+
+        // Parallel work: each (b, q_head, q_pos) tuple is independent.
+        let work_items: Vec<(usize, usize, usize)> = (0..b)
+            .flat_map(|bi| {
+                (0..n_q).flat_map(move |qh| (0..q_seq).map(move |qs| (bi, qh, qs)))
+            })
+            .collect();
+
+        let computed: Vec<(usize, Vec<f32>)> = work_items
+            .par_iter()
+            .map(|&(bi, qh, qs)| {
+                let kh = qh / group;
+                let q_base = bi * q_stride_b + qh * q_stride_h + qs * q_stride_s;
+                let q_vec = &q[q_base..q_base + head_k];
+
+                let mut scores = vec![0f32; k_seq];
+                for ks in 0..k_seq {
+                    let k_base = bi * k_stride_b + kh * k_stride_h + ks * k_stride_s;
+                    let k_row = &k[k_base..k_base + head_k];
+                    let dot: f32 = q_vec.iter().zip(k_row.iter()).map(|(a, b)| a * b).sum();
+                    scores[ks] = dot * scale;
+                }
+                if apply_softcap {
+                    // Соответствует Metal kernel (sdpa_vector / sdpa_full):
+                    // score = tanh(scale * q·k) * softcap.
+                    for s in scores.iter_mut() {
+                        *s = softcap * s.tanh();
+                    }
+                }
+                if do_causal {
+                    for s in scores.iter_mut().take(k_seq).skip(qs + 1) {
+                        *s = f32::NEG_INFINITY;
+                    }
+                }
+
+                // Stable softmax.
+                let max = scores
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
+                    for s in scores.iter_mut() {
+                        *s *= inv;
+                    }
+                }
+
+                // Output[d_v] = sum_k(attn[ks] * v[ks, d_v]).
+                let mut out_vec = vec![0f32; head_v];
+                for ks in 0..k_seq {
+                    let attn = scores[ks];
+                    if attn == 0.0 {
+                        continue;
+                    }
+                    let v_base = bi * v_stride_b + kh * v_stride_h + ks * v_stride_s;
+                    let v_row = &v[v_base..v_base + head_v];
+                    for d in 0..head_v {
+                        out_vec[d] += attn * v_row[d];
+                    }
+                }
+
+                let out_idx = bi * out_stride_b + qh * out_stride_h + qs * out_stride_s;
+                (out_idx, out_vec)
+            })
+            .collect();
+
+        let mut out = vec![0f32; b * n_q * q_seq * head_v];
+        for (idx, vec) in computed {
+            out[idx..idx + head_v].copy_from_slice(&vec);
+        }
+
+        let out_storage = match dtype {
+            DType::F32 => CpuStorage::F32(out),
+            DType::F16 => {
+                CpuStorage::F16(out.into_iter().map(half::f16::from_f32).collect())
+            }
+            DType::BF16 => {
+                CpuStorage::BF16(out.into_iter().map(half::bf16::from_f32).collect())
+            }
+            other => candle::bail!("CPU SDPA: unsupported output dtype {:?}", other),
+        };
+        let out_shape = Shape::from_dims(&[b, n_q, q_seq, head_v]);
+        Ok((out_storage, out_shape))
     }
 
     #[cfg(feature = "metal")]
@@ -1376,7 +1564,7 @@ impl candle::CustomOp3 for Sdpa {
 /// - `do_causal`: Apply causal masking. If this is true, the mask does not need to be provided.
 /// - `scale` is applied before softmax.
 /// - If `softcapping` != 1.0:
-///      - Computation is: softmax(tanh(qk^T*scale/cap)*cap)v
+///      - Computation is: softmax(tanh(qk^T * scale) * cap) v
 ///
 /// **Output shape:** (bs, qhead, seq, v_hidden)
 ///

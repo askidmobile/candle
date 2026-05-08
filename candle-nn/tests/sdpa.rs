@@ -185,3 +185,192 @@ mod metal_sdpa_tests {
         Ok(())
     }
 }
+
+mod cpu_sdpa_tests {
+    // T-286: CPU SDPA — критично для Windows embeddings + ASR на машинах
+    // без рабочего CUDA. Тесты проверяют корректность против naive реализации
+    // через matmul + softmax.
+    use candle::{DType, Device, Result, Shape, Tensor};
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+
+    fn randn<S: Into<Shape>>(
+        rng: &mut rand::rngs::StdRng,
+        shape: S,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let shape = shape.into();
+        let elem_count = shape.elem_count();
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let vs: Vec<f32> = (0..elem_count).map(|_| normal.sample(rng)).collect();
+        Tensor::from_vec(vs, &shape, dev)
+    }
+
+    fn naive_sdpa(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        do_causal: bool,
+        softcap: f32,
+    ) -> Result<Tensor> {
+        // GQA expansion: repeat k/v вдоль head dim, если n_q > n_kv.
+        let q_dims = q.dims();
+        let k_dims = k.dims();
+        let n_q = q_dims[1];
+        let n_kv = k_dims[1];
+        let group = n_q / n_kv;
+        let k = if group > 1 {
+            // (b, n_kv, kseq, dk) -> (b, n_q, kseq, dk)
+            k.unsqueeze(2)?
+                .expand((k_dims[0], n_kv, group, k_dims[2], k_dims[3]))?
+                .reshape((k_dims[0], n_q, k_dims[2], k_dims[3]))?
+        } else {
+            k.clone()
+        };
+        let v_dims = v.dims();
+        let v = if group > 1 {
+            v.unsqueeze(2)?
+                .expand((v_dims[0], n_kv, group, v_dims[2], v_dims[3]))?
+                .reshape((v_dims[0], n_q, v_dims[2], v_dims[3]))?
+        } else {
+            v.clone()
+        };
+        let mut att = (q * scale as f64)?.matmul(&k.t()?)?;
+        if (softcap - 1.0).abs() > 1e-6 {
+            att = (att.tanh()? * softcap as f64)?;
+        }
+        if do_causal {
+            // Build causal mask (qseq, kseq) с -inf над диагональю.
+            let q_seq = q_dims[2];
+            let k_seq = k_dims[2];
+            let mut mask = vec![0f32; q_seq * k_seq];
+            for qi in 0..q_seq {
+                for kj in (qi + 1)..k_seq {
+                    mask[qi * k_seq + kj] = f32::NEG_INFINITY;
+                }
+            }
+            let mask_t = Tensor::from_vec(mask, (q_seq, k_seq), q.device())?
+                .to_dtype(att.dtype())?
+                .broadcast_as(att.shape())?;
+            att = (&att + &mask_t)?;
+        }
+        let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            .to_dtype(q.dtype())?;
+        att.matmul(&v)
+    }
+
+    #[test]
+    fn cpu_sdpa_basic_f32() -> Result<()> {
+        const BS: usize = 2;
+        const H: usize = 4;
+        const R: usize = 5;
+        const L: usize = 7;
+        const DK: usize = 16;
+        let scale = (DK as f32).sqrt().recip();
+        let device = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let q = randn(&mut rng, (BS, H, R, DK), &device)?;
+        let k = randn(&mut rng, (BS, H, L, DK), &device)?;
+        let v = randn(&mut rng, (BS, H, L, DK), &device)?;
+        let truth = naive_sdpa(&q, &k, &v, scale, false, 1.0)?;
+        let got = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
+        assert_eq!(truth.shape(), got.shape());
+        let err: f32 = ((&truth - &got)?.abs()?.sum_all()?).to_scalar()?;
+        let norm: f32 = truth.abs()?.sum_all()?.to_scalar()?;
+        assert!(err / norm < 1e-5, "rel err {} / norm {}", err, norm);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_sdpa_gqa_f32() -> Result<()> {
+        // Yttri Qwen3.5-4B attention layers: n_q=16, n_kv=4, group=4.
+        const BS: usize = 1;
+        const N_Q: usize = 16;
+        const N_KV: usize = 4;
+        const R: usize = 3;
+        const L: usize = 8;
+        const DK: usize = 32;
+        let scale = (DK as f32).sqrt().recip();
+        let device = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(22);
+        let q = randn(&mut rng, (BS, N_Q, R, DK), &device)?;
+        let k = randn(&mut rng, (BS, N_KV, L, DK), &device)?;
+        let v = randn(&mut rng, (BS, N_KV, L, DK), &device)?;
+        let truth = naive_sdpa(&q, &k, &v, scale, false, 1.0)?;
+        let got = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
+        assert_eq!(truth.shape(), got.shape());
+        let err: f32 = ((&truth - &got)?.abs()?.sum_all()?).to_scalar()?;
+        let norm: f32 = truth.abs()?.sum_all()?.to_scalar()?;
+        assert!(err / norm < 1e-5, "rel err {} / norm {}", err, norm);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_sdpa_causal_f32() -> Result<()> {
+        const BS: usize = 1;
+        const H: usize = 2;
+        const N: usize = 6;
+        const DK: usize = 16;
+        let scale = (DK as f32).sqrt().recip();
+        let device = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(33);
+        let q = randn(&mut rng, (BS, H, N, DK), &device)?;
+        let k = randn(&mut rng, (BS, H, N, DK), &device)?;
+        let v = randn(&mut rng, (BS, H, N, DK), &device)?;
+        let truth = naive_sdpa(&q, &k, &v, scale, true, 1.0)?;
+        let got = candle_nn::ops::sdpa(&q, &k, &v, None, true, scale, 1.0)?;
+        let err: f32 = ((&truth - &got)?.abs()?.sum_all()?).to_scalar()?;
+        let norm: f32 = truth.abs()?.sum_all()?.to_scalar()?;
+        assert!(err / norm < 1e-5, "rel err {} / norm {}", err, norm);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_sdpa_softcap_f32() -> Result<()> {
+        const BS: usize = 1;
+        const H: usize = 2;
+        const R: usize = 4;
+        const L: usize = 5;
+        const DK: usize = 16;
+        let scale = (DK as f32).sqrt().recip();
+        let softcap = 30.0_f32;
+        let device = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(44);
+        let q = randn(&mut rng, (BS, H, R, DK), &device)?;
+        let k = randn(&mut rng, (BS, H, L, DK), &device)?;
+        let v = randn(&mut rng, (BS, H, L, DK), &device)?;
+        let truth = naive_sdpa(&q, &k, &v, scale, false, softcap)?;
+        let got = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, softcap)?;
+        let err: f32 = ((&truth - &got)?.abs()?.sum_all()?).to_scalar()?;
+        let norm: f32 = truth.abs()?.sum_all()?.to_scalar()?;
+        assert!(err / norm < 1e-5, "rel err {} / norm {}", err, norm);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_sdpa_f16() -> Result<()> {
+        const BS: usize = 1;
+        const H: usize = 2;
+        const R: usize = 3;
+        const L: usize = 4;
+        const DK: usize = 16;
+        let scale = (DK as f32).sqrt().recip();
+        let device = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(55);
+        let q = randn(&mut rng, (BS, H, R, DK), &device)?.to_dtype(DType::F16)?;
+        let k = randn(&mut rng, (BS, H, L, DK), &device)?.to_dtype(DType::F16)?;
+        let v = randn(&mut rng, (BS, H, L, DK), &device)?.to_dtype(DType::F16)?;
+        let truth = naive_sdpa(&q, &k, &v, scale, false, 1.0)?;
+        let got = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
+        assert_eq!(truth.dtype(), DType::F16);
+        assert_eq!(got.dtype(), DType::F16);
+        let truth_f32 = truth.to_dtype(DType::F32)?;
+        let got_f32 = got.to_dtype(DType::F32)?;
+        let err: f32 = ((&truth_f32 - &got_f32)?.abs()?.sum_all()?).to_scalar()?;
+        let norm: f32 = truth_f32.abs()?.sum_all()?.to_scalar()?;
+        // F16 имеет меньшую precision — допускаем 1% относительной ошибки.
+        assert!(err / norm < 1e-2, "rel err {} / norm {}", err, norm);
+        Ok(())
+    }
+}
