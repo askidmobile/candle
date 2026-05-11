@@ -8131,6 +8131,7 @@ kernel void kernel_pool_2d_avg_f32(
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
+// Exact port of llama.cpp ggml-metal.metal:9315-9431
 template<
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 kernel void kernel_mul_mm_mpp(
@@ -8156,62 +8157,58 @@ kernel void kernel_mul_mm_mpp(
     ushort tiitg [[thread_index_in_threadgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]])
 {
+    (void)sgitg;
     const int K = (int)ne00, M = (int)ne0, N = (int)ne1;
     const int im = (int)tgpig.z, i12 = im % (int)ne12, i13 = im / (int)ne12;
 
-    constexpr int NRB = 32, NRA = 64, NK_TILE = 32;
+    // Tile: 128×64 (как llama.cpp)
+    constexpr int NRB = 64, NRA = 128, NK_T = 32;
+    constexpr int A_ITEMS = NRA * NK_T / 16;  // = 256
+    constexpr int N_THREADS = 128;
 
     const uint64_t off0 = ((uint64_t)i12 / r2) * nb02 + ((uint64_t)i13 / r3) * nb03;
     const int ra = (int)tgpig.y * NRA, rb = (int)tgpig.x * NRB;
 
-    threadgroup half  * sa    = (threadgroup half  *)(shmem);
-    threadgroup float * accum = (threadgroup float *)(shmem + NRA * NK_TILE * sizeof(half));
-
-    for (int i = (int)tiitg; i < NRA * NRB; i += 128) accum[i] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    auto tA = tensor(sa, dextents<int32_t, 2>(NK_TILE, NRA));
-    auto tC = tensor(accum, dextents<int32_t, 2>(NRB, NRA));
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    auto tA = tensor(sa, dextents<int32_t, 2>(NK_T, NRA));
 
     device half * ptrB = srcB + nb12 * (int64_t)i12 + nb13 * (int64_t)i13;
     const int strideB = (int)(nb11 / sizeof(half));
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
 
     mpp::tensor_ops::matmul2d<
-        mpp::tensor_ops::matmul2d_descriptor(NRB, NRA, NK_TILE, false, true, true,
+        mpp::tensor_ops::matmul2d_descriptor(NRB, NRA, NK_T, false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    for (int lk = 0; lk < K; lk += NK_TILE) {
-        const int A_ITEMS = NRA * NK_TILE / 16;
-        for (int w = (int)tiitg; w < A_ITEMS; w += 128) {
-            const int row = w / (NK_TILE / 16), kc = w % (NK_TILE / 16);
-            const int kp = lk + kc * 16, bi = kp / (16 * nl);
-            const short il = (short)((kp / 16) % nl);
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    for (int lk = 0; lk < K; lk += NK_T) {
+        for (int w = (int)tiitg; w < A_ITEMS; w += N_THREADS) {
+            const int row = w / (NK_T / 16), kc = w % (NK_T / 16);
+            const int kp = lk + kc * 16;
             if (ra + row < M) {
+                const int bi = kp / (16 * nl);
+                const short il = (short)((kp / 16) % nl);
                 device const block_q * rp = (device const block_q *)(srcA + nb01 * (int64_t)(ra + row) + off0);
                 half4x4 ta; dequantize_func(rp + bi, il, ta);
                 for (short i = 0; i < 16; i++)
-                    sa[row * NK_TILE + kc * 16 + i] = (kp + i < K) ? ta[i/4][i%4] : (half)0;
+                    sa[row * NK_T + kc * 16 + i] = (kp + i < K) ? ta[i/4][i%4] : (half)0;
             } else {
-                for (short i = 0; i < 16; i++) sa[row * NK_TILE + kc * 16 + i] = (half)0;
+                for (short i = 0; i < 16; i++) sa[row * NK_T + kc * 16 + i] = (half)0;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         auto mB = tB.slice(lk, rb);
         auto mA = tA.slice(0, 0);
-        mm.run(mB, mA, tC);
+        mm.run(mB, mA, cT);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     device float * dstB = dst + (int64_t)im * N * M;
-    for (int col = (int)tiitg; col < NRB; col += 128) {
-        if (rb + col >= N) break;
-        for (int row = 0; row < NRA && ra + row < M; row++) {
-            dstB[(ra + row) + (rb + col) * M] = accum[row * NRB + col];
-        }
-    }
+    auto tD = tensor(dstB, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
+    cT.store(tD.slice(ra, rb));
 }
 
 template [[host_name("kernel_mul_mm_mpp_q4_K_f16")]]

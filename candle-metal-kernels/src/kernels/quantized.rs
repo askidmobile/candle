@@ -293,11 +293,6 @@ pub fn call_quantized_matmul_mm_t(
     let r2 = (ne12 / ne02) as u32;
     let r3 = (ne13 / ne03) as u32;
 
-    let thread_groups_count = MTLSize {
-        width: divide(ne11 as usize, 32),
-        height: divide(ne01 as usize, 64),
-        depth: (ne12 * ne13) as usize,
-    };
     let threads_per_threadgroup = MTLSize {
         width: 128,
         height: 1,
@@ -372,16 +367,25 @@ pub fn call_quantized_matmul_mm_t(
 
     // Пробуем MPP kernel (Metal 4+) для F16 Q4K/Q6K. Fallback → regular.
     let try_mpp = input_is_f16 && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K);
-    let pipeline = if try_mpp {
+    let (pipeline, is_mpp) = if try_mpp {
         let mpp_name = match dtype {
             GgmlDType::Q4K => "kernel_mul_mm_mpp_q4_K_f16",
             GgmlDType::Q6K => "kernel_mul_mm_mpp_q6_K_f16",
             _ => unreachable!(),
         };
-        kernels.load_pipeline(device, Source::Quantized, mpp_name)
-            .unwrap_or_else(|_| kernels.load_pipeline(device, Source::Quantized, name).unwrap())
+        if let Ok(p) = kernels.load_pipeline(device, Source::Quantized, mpp_name) {
+            (p, true)
+        } else {
+            (kernels.load_pipeline(device, Source::Quantized, name)?, false)
+        }
     } else {
-        kernels.load_pipeline(device, Source::Quantized, name)?
+        (kernels.load_pipeline(device, Source::Quantized, name)?, false)
+    };
+
+    let thread_groups_count = if is_mpp {
+        MTLSize { width: divide(ne11 as usize, 64), height: divide(ne01 as usize, 128), depth: (ne12 * ne13) as usize }
+    } else {
+        MTLSize { width: divide(ne11 as usize, 32), height: divide(ne01 as usize, 64), depth: (ne12 * ne13) as usize }
     };
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
