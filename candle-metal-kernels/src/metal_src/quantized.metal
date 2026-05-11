@@ -8183,17 +8183,17 @@ kernel void kernel_mul_mm_mpp(
     const int rb = (int)tgpig.x * NRB;
 
     threadgroup half * sa = (threadgroup half *)(shmem);
-    auto tA = mpp::tensor(sa, mpp::dextents<int32_t, 2>(NK, NRA));
+    auto tA = tensor(sa, dextents<int32_t, 2>(NK, NRA));
 
     device const half * ptrB = srcB + nb12 * (int64_t)i12 + nb13 * (int64_t)i13;
     const int strideB = (int)(nb11 / sizeof(half));
-    auto tB = mpp::tensor(ptrB, mpp::dextents<int32_t, 2>(K, N), mpp::array<int, 2>({1, strideB}));
+    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
             NRB, NRA, NK, false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-        mpp::execution_simdgroups<4>> mm;
+        execution_simdgroups<4>> mm;
 
     auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
@@ -8226,7 +8226,7 @@ kernel void kernel_mul_mm_mpp(
     }
 
     device float * dstBatch = dst + (int64_t)im * N * M;
-    auto tD = mpp::tensor(dstBatch, mpp::dextents<int32_t, 2>(M, N), mpp::array<int, 2>({1, M}));
+    auto tD = tensor(dstBatch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
     cT.store(tD.slice(ra, rb));
 }
 
