@@ -2004,6 +2004,168 @@ impl MetalStorage {
         }
     }
 
+    pub fn argmax_suppressed_f32(&self, layout: &Layout, suppress_ids: &[u32]) -> Result<u32> {
+        if self.dtype != DType::F32 {
+            crate::bail!("argmax_suppressed_f32 requires F32 tensor, got {:?}", self.dtype);
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("argmax_suppressed_f32 requires contiguous tensor");
+        }
+        let vocab_size = layout.shape().elem_count();
+        if vocab_size == 0 {
+            return Err(crate::Error::EmptyTensor { op: "argmax_suppressed_f32" }.bt());
+        }
+        if suppress_ids.is_empty() {
+            crate::bail!("argmax_suppressed_f32 requires at least one suppressed token");
+        }
+
+        let suppress = self.device.new_buffer_with_data(suppress_ids)?;
+        let output = self.device.new_buffer(1, DType::U32, "argmax_suppressed_f32")?;
+        let input = self.buffer_slice(layout, self.dtype);
+        {
+            let encoder = self.device.command_encoder()?;
+            encoder.set_label("argmax_suppressed_f32");
+            candle_metal_kernels::call_argmax_suppressed_f32(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                vocab_size,
+                input,
+                &suppress,
+                suppress_ids.len(),
+                &output,
+                0,
+            )
+            .map_err(MetalError::from)?;
+        }
+        self.device.wait_until_completed_fast()?;
+        let values: Vec<u32> = read_to_vec(&output, 1);
+        Ok(values[0])
+    }
+
+    pub fn topk_suppressed_f32(
+        &self,
+        layout: &Layout,
+        suppress_ids: &[u32],
+        k: usize,
+    ) -> Result<Vec<(u32, f32)>> {
+        if self.dtype != DType::F32 {
+            crate::bail!("topk_suppressed_f32 requires F32 tensor, got {:?}", self.dtype);
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("topk_suppressed_f32 requires contiguous tensor");
+        }
+        let vocab_size = layout.shape().elem_count();
+        if vocab_size == 0 {
+            return Err(crate::Error::EmptyTensor { op: "topk_suppressed_f32" }.bt());
+        }
+        let k = k.min(vocab_size).max(1);
+
+        const THREADS: usize = 256;
+        let tile_count = (vocab_size + THREADS - 1) / THREADS;
+        let per_tile_els = THREADS * k;
+
+        let suppress = if suppress_ids.is_empty() {
+            self.device.allocate_buffer(4)?
+        } else {
+            self.device.new_buffer_with_data(suppress_ids)?
+        };
+        let tile_values =
+            self.device.new_buffer(per_tile_els * tile_count, DType::F32, "topk_vals")?;
+        let tile_indices =
+            self.device.new_buffer(per_tile_els * tile_count, DType::U32, "topk_idxs")?;
+        let input = self.buffer_slice(layout, self.dtype);
+        {
+            let encoder = self.device.command_encoder()?;
+            encoder.set_label("topk_suppressed_f32");
+            candle_metal_kernels::call_topk_suppressed_f32(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                vocab_size,
+                k,
+                THREADS,
+                tile_count,
+                input,
+                &suppress,
+                suppress_ids.len(),
+                &tile_values,
+                &tile_indices,
+            )
+            .map_err(MetalError::from)?;
+        }
+        self.device.wait_until_completed_fast()?;
+
+        let all_vals: Vec<f32> = read_to_vec(&tile_values, per_tile_els * tile_count);
+        let all_idxs: Vec<u32> = read_to_vec(&tile_indices, per_tile_els * tile_count);
+
+        let mut merged: Vec<(u32, f32)> = all_idxs.iter().zip(all_vals.iter())
+            .filter(|(_, &v)| v.is_finite())
+            .map(|(&idx, &val)| (idx, val))
+            .collect();
+        merged.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.dedup_by_key(|(idx, _)| *idx);
+        merged.truncate(k);
+        Ok(merged)
+    }
+
+    /// Fused `add + rms_norm`: computes rms_norm(a + b, weight)
+    /// in a single Metal kernel dispatch instead of two (add then rms_norm).
+    /// Saves one intermediate buffer allocation and one kernel launch.
+    pub fn add_and_rms_norm(
+        &self,
+        layout: &Layout,
+        rhs: &Self,
+        rhs_l: &Layout,
+        alpha: &Self,
+        alpha_l: &Layout,
+        eps: f32,
+    ) -> Result<Self> {
+        if self.dtype != rhs.dtype || self.dtype != alpha.dtype {
+            crate::bail!(
+                "add_and_rms_norm: dtype mismatch a={:?} b={:?} alpha={:?}",
+                self.dtype, rhs.dtype, alpha.dtype
+            );
+        }
+        if !(layout.is_contiguous() && rhs_l.is_contiguous() && alpha_l.is_contiguous()) {
+            crate::bail!("add_and_rms_norm: non-contiguous input");
+        }
+
+        let device = self.device();
+        let kernel_name = match self.dtype {
+            DType::F16 => "add_rmsnorm_f16",
+            DType::F32 => "add_rmsnorm_f32",
+            dt => crate::bail!("add_and_rms_norm: unsupported dtype {:?}", dt),
+        };
+
+        let elem_count = layout.shape().elem_count();
+        let last_dim = layout.dims()[layout.shape().rank() - 1];
+        let output = device.new_buffer(elem_count, self.dtype, "add_rmsnorm")?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("add_rms_norm");
+
+        candle_metal_kernels::call_add_rms_norm(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            kernel_name,
+            elem_count,
+            last_dim,
+            eps,
+            self.buffer(),
+            layout.start_offset() * self.dtype.size_in_bytes(),
+            rhs.buffer(),
+            rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
+            alpha.buffer(),
+            alpha_l.start_offset() * alpha.dtype.size_in_bytes(),
+            &output,
+            0,
+        )
+        .map_err(crate::Error::wrap)?;
+
+        Ok(Self::new(output, device.clone(), elem_count, self.dtype))
+    }
+
     pub fn binary(
         &self,
         op: &'static str,

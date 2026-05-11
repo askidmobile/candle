@@ -119,6 +119,99 @@ pub fn call_reduce_strided(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn call_argmax_suppressed_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    vocab_size: usize,
+    input: BufferOffset,
+    suppress_ids: &Buffer,
+    suppress_len: usize,
+    output: &Buffer,
+    output_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, "argmax_suppressed_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (&input, suppress_ids, (output, output_offset), vocab_size as u32, suppress_len as u32)
+    );
+
+    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), 256).max(1);
+    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
+    encoder.use_resource(suppress_ids, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_topk_suppressed_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    vocab_size: usize,
+    k: usize,
+    threads_per_tile: usize,
+    tile_count: usize,
+    input: BufferOffset,
+    suppress_ids: &Buffer,
+    suppress_len: usize,
+    tile_values: &Buffer,
+    tile_indices: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, "topk_suppressed_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            &input,
+            suppress_ids,
+            (tile_values, 0),
+            (tile_indices, 0),
+            vocab_size as u32,
+            suppress_len as u32,
+            k as u32
+        )
+    );
+
+    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
+    encoder.use_resource(suppress_ids, MTLResourceUsage::Read);
+    encoder.use_resource(tile_values, MTLResourceUsage::Write);
+    encoder.use_resource(tile_indices, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: tile_count,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads_per_tile,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn call_last_softmax(
     device: &Device,
     ep: impl EncoderProvider,
@@ -220,6 +313,69 @@ pub fn call_rms_norm(
         depth: 1,
     };
     encoder.use_resource(input, MTLResourceUsage::Read);
+    encoder.use_resource(alpha, MTLResourceUsage::Read);
+    encoder.use_resource(output, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_add_rms_norm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements_per_block: usize,
+    eps: f32,
+    input_a: &Buffer,
+    input_a_offset: usize,
+    input_b: &Buffer,
+    input_b_offset: usize,
+    alpha: &Buffer,
+    alpha_offset: usize,
+    output: &Buffer,
+    output_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            length,
+            elements_per_block,
+            (input_a, input_a_offset),
+            (input_b, input_b_offset),
+            (output, output_offset),
+            (alpha, alpha_offset),
+            eps
+        )
+    );
+    let work_per_threadgroup = elements_per_block;
+
+    let out_length = length / work_per_threadgroup;
+
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (work_per_threadgroup / 2).next_power_of_two(),
+    );
+
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.use_resource(input_a, MTLResourceUsage::Read);
+    encoder.use_resource(input_b, MTLResourceUsage::Read);
     encoder.use_resource(alpha, MTLResourceUsage::Read);
     encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);

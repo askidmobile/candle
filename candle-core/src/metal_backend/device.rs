@@ -160,12 +160,10 @@ impl WeightResidencySet {
             return None;
         }
         let desc = MTLResidencySetDescriptor::new();
-        unsafe { desc.setLabel(Some(&NSString::from_str("yttri-weights"))); }
+        desc.setLabel(Some(&NSString::from_str("yttri-weights")));
         let raw_device: &ProtocolObject<dyn MTLDeviceProtocol> =
             ProtocolObject::from_ref(device.as_ref());
-        let rset = unsafe {
-            raw_device.newResidencySetWithDescriptor_error(&desc).ok()?
-        };
+        let rset = raw_device.newResidencySetWithDescriptor_error(&desc).ok()?;
         let rset = SendableRset(rset);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop.clone();
@@ -693,6 +691,40 @@ impl MetalDevice {
         result
     }
 
+    /// Like `with_shared_encoder` but does NOT wait for GPU completion on exit.
+    ///
+    /// All Metal ops inside the closure go into a single CB (no auto-commits).
+    /// The CB is committed when the pool entry is next flushed, but the caller
+    /// MUST call `wait_until_completed_fast()` before reading any GPU outputs
+    /// from CPU, or before any operation that might reuse buffers from this scope.
+    ///
+    /// Designed for Yttri's multi-CB prefill: the prefill loop encodes all 32
+    /// layers into one CB, then the caller waits once at the very end. This
+    /// removes ~6 unnecessary commit→swap cycles during the prefill encoding
+    /// phase, reducing CPU dispatch overhead.
+    pub fn with_single_cb_scope<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce() -> Result<R>,
+    {
+        const SCOPE_LIMIT: usize = 1_000_000;
+
+        let prev_limit = candle_metal_kernels::metal::commands::graph_scope_limit();
+        candle_metal_kernels::metal::commands::set_graph_scope_limit(SCOPE_LIMIT);
+
+        struct ScopeGuard {
+            prev: usize,
+        }
+        impl Drop for ScopeGuard {
+            fn drop(&mut self) {
+                candle_metal_kernels::metal::commands::set_graph_scope_limit(self.prev);
+            }
+        }
+        let _guard = ScopeGuard { prev: prev_limit };
+
+        // No wait! Caller handles GPU sync later.
+        f()
+    }
+
     /// Get and reset accumulated sync timing stats from flush_and_wait_fast.
     /// Returns: (count, sem_us, lock_us, commit_us, wait_us, total_us)
     pub fn take_sync_timings(&self) -> (u64, u64, u64, u64, u64, u64) {
@@ -978,6 +1010,11 @@ impl MetalDevice {
     /// Вызывать ВСЕГДА после prefill loop (даже при панике — используй RAII guard).
     pub fn deactivate_scratch_arena(&self) {
         ACTIVE_ARENA.with(|a| *a.borrow_mut() = None);
+    }
+
+    /// Получить текущую активную scratch arena (для диагностики).
+    pub fn active_scratch_arena(&self) -> Option<Arc<ScratchArena>> {
+        ACTIVE_ARENA.with(|a| a.borrow().clone())
     }
 
     /// The critical allocator algorithm

@@ -1113,6 +1113,107 @@ METAL_FUNC void rms_norm(
     }
 }
 
+template<typename T, ushort BLOCKSIZE>
+METAL_FUNC void add_rms_norm_core(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src_a,
+    device const T *src_b,
+    device T *dst,
+    device const T *alpha,
+    constant float &eps,
+    threadgroup RMS<float> shared[BLOCKSIZE],
+    threadgroup float &total,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]]
+) {
+    using Indexer = indexer_t<uint, false>;
+    Indexer indexer;
+    Divide fast_divide;
+    loader<T, RMS<float>, RMSLoadOp<float>, BLOCKSIZE, Indexer, uint> load;
+    block_reducer<RMS<float>, RMSReduceOp<float>, BLOCKSIZE> reduce(shared);
+
+    const uint offset = dst_id * el_per_block;
+    const uint stop_idx = min(el_per_block + offset, src_numel);
+    const uint idx = tid + offset;
+
+    RMS<float> value = RMSLoadOp<float>::init();
+    for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
+        float sum = static_cast<float>(src_a[i]) + static_cast<float>(src_b[i]);
+        value = RMSLoadOp<float>()(value, RMS<float>{ 1, sum * sum });
+    }
+    RMS<float> result = RMS<float>{ value.count, static_cast<float>(value.mean) };
+
+    result = reduce(result, tid);
+    if (tid == 0) {
+        total = rsqrt(fast_divide(result.mean, float(el_per_block)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (alpha == nullptr) {
+        #pragma clang loop unroll(full)
+        for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
+            float sum = static_cast<float>(src_a[i]) + static_cast<float>(src_b[i]);
+            dst[i] = static_cast<T>(sum * total);
+        }
+    } else {
+        #pragma clang loop unroll(full)
+        for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
+            float sum = static_cast<float>(src_a[i]) + static_cast<float>(src_b[i]);
+            T val = static_cast<T>(sum * total);
+            val *= alpha[i - offset];
+            dst[i] = val;
+        }
+    }
+}
+
+#define add_rms_norm_case(T, N)                             \
+case N: {                                                   \
+    threadgroup RMS<float> shared[N];                       \
+    threadgroup float total;                                \
+    add_rms_norm_core<T, N>(                                 \
+        src_numel,                                          \
+        el_per_block,                                       \
+        src_a,                                              \
+        src_b,                                              \
+        dst,                                                \
+        alpha,                                              \
+        eps,                                                \
+        shared,                                             \
+        total,                                              \
+        tid,                                                \
+        dst_id);                                            \
+    break;                                                  \
+}
+
+#define impl_add_rms_norm(NAME, T)                          \
+kernel void NAME(                                           \
+    constant uint &src_numel,                               \
+    constant uint &el_per_block,                            \
+    device const T *src_a,                                  \
+    device const T *src_b,                                  \
+    device T *dst,                                          \
+    device const T *alpha,                                  \
+    constant float &eps,                                    \
+    uint tid [[ thread_index_in_threadgroup ]],             \
+    uint dst_id [[ threadgroup_position_in_grid ]],         \
+    uint block_dim [[ threads_per_threadgroup ]]            \
+) {                                                         \
+    switch (max_shared_mem<float>(block_dim)) {             \
+        add_rms_norm_case(T, 1024);                         \
+        add_rms_norm_case(T,  512);                         \
+        add_rms_norm_case(T,  256);                         \
+        add_rms_norm_case(T,  128);                         \
+        add_rms_norm_case(T,   64);                         \
+        add_rms_norm_case(T,   32);                         \
+        add_rms_norm_case(T,   16);                         \
+        add_rms_norm_case(T,    8);                         \
+        add_rms_norm_case(T,    4);                         \
+        add_rms_norm_case(T,    2);                         \
+        add_rms_norm_case(T,    1);                         \
+    }                                                       \
+}
+
 
 #define rms_norm_case(T, N)                             \
 case N: {                                               \
@@ -1494,6 +1595,7 @@ kernel void FN_NAME_THD( \
 
 impl_rms_norm(rmsnorm_f32, float)
 impl_rms_norm(rmsnorm_f16, half)
+impl_add_rms_norm(add_rmsnorm_f16, half)
 impl_layer_norm(layernorm_f32, float)
 impl_layer_norm(layernorm_f16, half)
 ROPE(rope_f32, rope_i_f32, rope_thd_f32, float)
@@ -1557,3 +1659,141 @@ impl_rms_norm(rmsnorm_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 #endif
+
+kernel void argmax_suppressed_f32(
+    device const float *logits,
+    device const uint *suppress_ids,
+    device uint *out,
+    constant uint &vocab_size,
+    constant uint &suppress_len,
+    uint tid [[thread_index_in_threadgroup]],
+    uint block_dim [[threads_per_threadgroup]]
+) {
+    float local_max = -INFINITY;
+    uint local_idx = 0;
+
+    for (uint i = tid; i < vocab_size; i += block_dim) {
+        bool suppressed = false;
+        for (uint j = 0; j < suppress_len; j++) {
+            if (i == suppress_ids[j]) {
+                suppressed = true;
+                break;
+            }
+        }
+        if (suppressed) {
+            continue;
+        }
+
+        float val = logits[i];
+        if (val > local_max || (val == local_max && i < local_idx)) {
+            local_max = val;
+            local_idx = i;
+        }
+    }
+
+    for (ushort offset = 16; offset > 0; offset >>= 1) {
+        float other_max = simd_shuffle_down(local_max, offset);
+        uint other_idx = simd_shuffle_down(local_idx, offset);
+        if (other_max > local_max || (other_max == local_max && other_idx < local_idx)) {
+            local_max = other_max;
+            local_idx = other_idx;
+        }
+    }
+
+    threadgroup float shared_max[32];
+    threadgroup uint shared_idx[32];
+
+    uint simd_lane = tid % 32;
+    uint simd_id = tid / 32;
+    if (simd_lane == 0) {
+        shared_max[simd_id] = local_max;
+        shared_idx[simd_id] = local_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 32) {
+        uint num_groups = (block_dim + 31) / 32;
+        local_max = (tid < num_groups) ? shared_max[tid] : -INFINITY;
+        local_idx = (tid < num_groups) ? shared_idx[tid] : 0;
+
+        for (ushort offset = 16; offset > 0; offset >>= 1) {
+            float other_max = simd_shuffle_down(local_max, offset);
+            uint other_idx = simd_shuffle_down(local_idx, offset);
+            if (other_max > local_max || (other_max == local_max && other_idx < local_idx)) {
+                local_max = other_max;
+                local_idx = other_idx;
+            }
+        }
+
+        if (tid == 0) {
+            out[0] = local_idx;
+        }
+    }
+}
+
+kernel void topk_suppressed_f32(
+    device const float *logits,
+    device const uint *suppress_ids,
+    device float *tile_values,
+    device uint *tile_indices,
+    constant uint &vocab_size,
+    constant uint &suppress_len,
+    constant uint &k,
+    uint tid [[thread_index_in_threadgroup]],
+    uint tile_id [[threadgroup_position_in_grid]],
+    uint block_dim [[threads_per_threadgroup]]
+) {
+    const uint max_heap = 64;
+    float top_values[64];
+    uint top_indices[64];
+    uint heap_size = 0;
+
+    for (uint i = tid; i < vocab_size; i += block_dim) {
+        bool suppressed = false;
+        for (uint j = 0; j < suppress_len; j++) {
+            if (i == suppress_ids[j]) { suppressed = true; break; }
+        }
+        if (suppressed) continue;
+
+        float val = logits[i];
+        if (heap_size < k) {
+            top_values[heap_size] = val;
+            top_indices[heap_size] = i;
+            heap_size++;
+            uint pos = heap_size - 1;
+            while (pos > 0) {
+                uint parent = (pos - 1) / 2;
+                if (top_values[pos] < top_values[parent]) {
+                    float tv = top_values[pos]; top_values[pos] = top_values[parent]; top_values[parent] = tv;
+                    uint ti = top_indices[pos]; top_indices[pos] = top_indices[parent]; top_indices[parent] = ti;
+                    pos = parent;
+                } else break;
+            }
+        } else if (val > top_values[0]) {
+            top_values[0] = val;
+            top_indices[0] = i;
+            uint pos = 0;
+            while (true) {
+                uint left = 2 * pos + 1, right = 2 * pos + 2, smallest = pos;
+                if (left < heap_size && top_values[left] < top_values[smallest]) smallest = left;
+                if (right < heap_size && top_values[right] < top_values[smallest]) smallest = right;
+                if (smallest != pos) {
+                    float tv = top_values[pos]; top_values[pos] = top_values[smallest]; top_values[smallest] = tv;
+                    uint ti = top_indices[pos]; top_indices[pos] = top_indices[smallest]; top_indices[smallest] = ti;
+                    pos = smallest;
+                } else break;
+            }
+        }
+    }
+
+    uint out_vals_base = tile_id * block_dim * k + tid * k;
+    uint out_idxs_base = tile_id * block_dim * k + tid * k;
+    for (uint i = 0; i < heap_size; i++) {
+        tile_values[out_vals_base + i] = top_values[i];
+        tile_indices[out_idxs_base + i] = top_indices[i];
+    }
+    for (uint i = heap_size; i < k; i++) {
+        tile_values[out_vals_base + i] = -INFINITY;
+        tile_indices[out_idxs_base + i] = 0;
+    }
+}

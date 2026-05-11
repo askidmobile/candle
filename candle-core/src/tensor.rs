@@ -1147,6 +1147,83 @@ impl Tensor {
         self.reduce_impl(dim, false, ReduceOp::ArgMax)
     }
 
+    /// Argmax for 1D F32 logits with a small list of token ids excluded.
+    ///
+    /// On Metal this uses a fused GPU kernel and transfers only the scalar
+    /// token id back to CPU. Other backends fall back to CPU scan.
+    pub fn argmax_suppressed(&self, suppress_ids: &[u32]) -> Result<u32> {
+        if self.dtype() != DType::F32 {
+            bail!("argmax_suppressed requires F32 tensor, got {:?}", self.dtype());
+        }
+        if self.rank() != 1 {
+            bail!("argmax_suppressed requires rank-1 tensor, got shape {:?}", self.dims());
+        }
+        if self.elem_count() == 0 {
+            return Err(Error::EmptyTensor { op: "argmax_suppressed" }.bt());
+        }
+        if suppress_ids.is_empty() {
+            return self.argmax(crate::D::Minus1)?.to_scalar::<u32>();
+        }
+
+        {
+            let storage = self.storage();
+            if let Storage::Metal(storage) = &*storage {
+                if self.layout().is_contiguous() {
+                    return storage.argmax_suppressed_f32(self.layout(), suppress_ids);
+                }
+            }
+        }
+
+        let logits = self.to_vec1::<f32>()?;
+        let mut best_token = None;
+        let mut best_logit = f32::NEG_INFINITY;
+        for (idx, &logit) in logits.iter().enumerate() {
+            let token = idx as u32;
+            if suppress_ids.contains(&token) {
+                continue;
+            }
+            if logit.is_finite() && (logit > best_logit || (logit == best_logit && Some(token) < best_token)) {
+                best_logit = logit;
+                best_token = Some(token);
+            }
+        }
+        best_token.ok_or_else(|| Error::Msg("argmax_suppressed: no valid token".into()))
+    }
+
+    /// GPU-side top-k with suppression for stochastic sampling.
+    ///
+    /// Returns up to `k` (token_id, logit) pairs sorted by logit descending.
+    /// Metal path uses a fused tile-local kernel and merges on CPU.
+    /// Other backends fall back to full CPU scan.
+    pub fn topk_suppressed(&self, suppress_ids: &[u32], k: usize) -> Result<Vec<(u32, f32)>> {
+        if self.dtype() != DType::F32 {
+            bail!("topk_suppressed requires F32 tensor, got {:?}", self.dtype());
+        }
+        if self.rank() != 1 {
+            bail!("topk_suppressed requires rank-1 tensor, got shape {:?}", self.dims());
+        }
+        let k = k.min(self.elem_count()).max(1);
+
+        {
+            let storage = self.storage();
+            if let Storage::Metal(storage) = &*storage {
+                if self.layout().is_contiguous() {
+                    return storage.topk_suppressed_f32(self.layout(), suppress_ids, k);
+                }
+            }
+        }
+
+        let logits = self.to_vec1::<f32>()?;
+        let mut results: Vec<(u32, f32)> = logits.iter().enumerate()
+            .filter(|(i, &v)| v.is_finite() && !suppress_ids.contains(&(*i as u32)))
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.dedup_by_key(|(idx, _)| *idx);
+        results.truncate(k);
+        Ok(results)
+    }
+
     pub fn argmin_keepdim<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, true, ReduceOp::ArgMin)
     }
@@ -1154,6 +1231,36 @@ impl Tensor {
     /// Similar to `argmin_keepdim` but the target dimension is squeezed.
     pub fn argmin<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, false, ReduceOp::ArgMin)
+    }
+
+    /// Fused `(self + rhs) → rms_norm(alpha, eps)` in a single Metal kernel.
+    /// Saves one intermediate allocation and one kernel dispatch vs separate
+    /// `(self + rhs)` + `RmsNorm::forward`.
+    #[cfg(feature = "metal")]
+    pub fn add_and_rms_norm(&self, rhs: &Self, alpha: &Self, eps: f32) -> Result<Self> {
+        let storage = self.storage();
+        let rhs_storage = rhs.storage();
+        let alpha_storage = alpha.storage();
+        if let (crate::Storage::Metal(s), crate::Storage::Metal(r), crate::Storage::Metal(a)) =
+            (&*storage, &*rhs_storage, &*alpha_storage)
+        {
+            let newstorage =
+                s.add_and_rms_norm(self.layout(), r, rhs.layout(), a, alpha.layout(), eps)?;
+            let shape = self.shape().clone();
+            return Ok(Self::from_storage(
+                crate::Storage::Metal(newstorage),
+                shape,
+                crate::op::BackpropOp::none(),
+                false,
+            ));
+        }
+        // CPU fallback: add then rms_norm
+        let sum = (self + rhs)?;
+        let sq = sum.sqr()?;
+        let hidden_size = sum.dim(crate::D::Minus1)?;
+        let norm = (sq.sum_keepdim(crate::D::Minus1)? / hidden_size as f64)?;
+        let inv_norm = (norm + eps as f64)?.sqrt()?.recip()?;
+        sum.broadcast_mul(&inv_norm)?.broadcast_mul(alpha)
     }
 
     /// Element-wise comparison between two tensors, e.g. equality, greater than, ... The actual
