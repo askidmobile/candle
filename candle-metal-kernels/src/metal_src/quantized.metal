@@ -7317,7 +7317,8 @@ kernel void kernel_dequantize_q_f(
 #define SG_MAT_ROW 8
 
 // each block_q contains 16*nl weights
-template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &), typename T_input = float>
+// FAST_PATH: compile-time specialization for aligned dimensions (no bounds checking).
+template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &), typename T_input = float, bool FAST_PATH = false>
 kernel void kernel_mul_mm(device const  uchar * src0,
                           device const  uchar * src1,
                           device        float * dst,
@@ -7348,12 +7349,18 @@ kernel void kernel_mul_mm(device const  uchar * src0,
     const uint im = tgpig.z;
 
     // if this block is of 64x32 shape or smaller
-    short n_rows = (ne0 - r0*BLOCK_SIZE_M < BLOCK_SIZE_M) ? (ne0 - r0*BLOCK_SIZE_M) : BLOCK_SIZE_M;
-    short n_cols = (ne1 - r1*BLOCK_SIZE_N < BLOCK_SIZE_N) ? (ne1 - r1*BLOCK_SIZE_N) : BLOCK_SIZE_N;
-
-    // a thread shouldn't load data outside of the matrix
-    short thread_row = ((short)tiitg/THREAD_PER_ROW) < n_rows ? ((short)tiitg/THREAD_PER_ROW) : n_rows - 1;
-    short thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
+    short n_rows, n_cols, thread_row, thread_col;
+    if (FAST_PATH) {
+        n_rows = BLOCK_SIZE_M;
+        n_cols = BLOCK_SIZE_N;
+        thread_row = ((short)tiitg/THREAD_PER_ROW);
+        thread_col = ((short)tiitg/THREAD_PER_COL);
+    } else {
+        n_rows = (ne0 - r0*BLOCK_SIZE_M < BLOCK_SIZE_M) ? (ne0 - r0*BLOCK_SIZE_M) : BLOCK_SIZE_M;
+        n_cols = (ne1 - r1*BLOCK_SIZE_N < BLOCK_SIZE_N) ? (ne1 - r1*BLOCK_SIZE_N) : BLOCK_SIZE_N;
+        thread_row = ((short)tiitg/THREAD_PER_ROW) < n_rows ? ((short)tiitg/THREAD_PER_ROW) : n_rows - 1;
+        thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
+    }
 
     simdgroup_T8x8     ma[4];
     simdgroup_float8x8 mb[2];
@@ -7429,7 +7436,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
         }
     }
 
-    if ((r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1) {
+    if (FAST_PATH || ((r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1)) {
         device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg &  1)) \
                                + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
         for (short i = 0; i < 8; i++) {
@@ -7748,6 +7755,19 @@ template [[host_name("kernel_mul_mm_q3_K_f32")]]    kernel mat_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_q4_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q4_K,    QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_q5_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q5_K,    QK_NL, dequantize_q5_K>;
 template [[host_name("kernel_mul_mm_q6_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q6_K,    QK_NL, dequantize_q6_K>;
+
+// Fast-path variants: без bounds checking для aligned dimensions
+// (используется Yttri для Qwen3.5-4B где все размерности кратны tile=64×32)
+// F32 input variants
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, true>) mat_mm_t_fast32_q4;
+template [[host_name("kernel_mul_mm_q4_K_f32_fast")]] kernel mat_mm_t_fast32_q4 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, true>;
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, true>) mat_mm_t_fast32_q6;
+template [[host_name("kernel_mul_mm_q6_K_f32_fast")]] kernel mat_mm_t_fast32_q6 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, true>;
+// F16 input variants
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, true>) mat_mm_t_fast16_q4;
+template [[host_name("kernel_mul_mm_q4_K_f16_fast")]] kernel mat_mm_t_fast16_q4 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, true>;
+typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, half, true>) mat_mm_t_fast16_q6;
+template [[host_name("kernel_mul_mm_q6_K_f16_fast")]] kernel mat_mm_t_fast16_q6 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, half, true>;
 
 // F16 input variants — accept half input directly (no external F32 cast needed).
 template [[host_name("kernel_mul_mm_q4_0_f16")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0,    half>;

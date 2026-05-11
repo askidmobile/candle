@@ -303,10 +303,26 @@ pub fn call_quantized_matmul_mm_t(
         height: 1,
         depth: 1,
     };
-    // F16 input variants пока поддержаны только для базовых Q-типов
-    // (Phase 1 плана). IQ кванты, Q8_1, Q8K, F32/F16/BF16 weights —
-    // F32 input only (Phase 7 опц.).
-    let name: &str = if input_is_f16 {
+    // Проверка alignment для fast-path kernel (без bounds checking).
+    // Fast-path variants доступны для Q4K и Q6K когда M%64==0 и N%32==0.
+    let use_fast_path = matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K)
+        && (ne01 % 64 == 0)
+        && (ne11 % 32 == 0);
+    let name: &str = if use_fast_path {
+        if input_is_f16 {
+            match dtype {
+                GgmlDType::Q4K => "kernel_mul_mm_q4_K_f16_fast",
+                GgmlDType::Q6K => "kernel_mul_mm_q6_K_f16_fast",
+                _ => unreachable!(),
+            }
+        } else {
+            match dtype {
+                GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32_fast",
+                GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32_fast",
+                _ => unreachable!(),
+            }
+        }
+    } else if input_is_f16 {
         match dtype {
             GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f16",
             GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f16",
