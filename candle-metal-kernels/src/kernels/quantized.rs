@@ -241,7 +241,7 @@ pub fn call_quantized_matmul_mv_t(
             | GgmlDType::IQ4XS
             | GgmlDType::IQ1M
     ) {
-        encoder.set_threadgroup_memory_length(0, 8192);
+    encoder.set_threadgroup_memory_length(0, 16384); // 12KB для MPP, 8KB для legacy
     }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
