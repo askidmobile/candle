@@ -1087,7 +1087,6 @@ impl MetalDevice {
         let descriptor = MTLCaptureDescriptor::new();
         descriptor.setDestination(MTLCaptureDestination::GPUTraceDocument);
         descriptor.set_capture_device(self.device().as_ref());
-        // The [set_output_url] call requires an absolute path so we convert it if needed.
         if path.as_ref().is_absolute() {
             let url = NSURL::from_file_path(path);
             descriptor.setOutputURL(url.as_deref());
@@ -1096,11 +1095,15 @@ impl MetalDevice {
             let url = NSURL::from_file_path(path);
             descriptor.setOutputURL(url.as_deref());
         }
-
         capture
             .startCaptureWithDescriptor_error(&descriptor)
             .map_err(|e| MetalError::from(e.to_string()))?;
         Ok(())
+    }
+
+    /// Stop the current GPU capture.
+    pub fn stop_capture(&self) {
+        unsafe { MTLCaptureManager::sharedCaptureManager() }.stopCapture();
     }
 }
 
