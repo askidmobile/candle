@@ -365,8 +365,11 @@ pub fn call_quantized_matmul_mm_t(
         }
     };
 
-    // Пробуем MPP kernel (Metal 4+) для F16 Q4K/Q6K. Fallback → regular.
-    let try_mpp = input_is_f16 && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K);
+    // MPP kernel — только на M5+/A19+ (на M4 не даёт ускорения, см. llama.cpp device.m)
+    // llama.cpp benchmark: M2 Ultra +5% slower, M4/M4 Max no significant difference.
+    // Причина: hardware tensor-ускорение только с M5/A19.
+    let try_mpp = false; // отключено до M5 — см. GGML_METAL_TENSOR_ENABLE
+    // input_is_f16 && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K);
     let (pipeline, is_mpp) = if try_mpp {
         let mpp_name = match dtype {
             GgmlDType::Q4K => "kernel_mul_mm_mpp_q4_K_f16",
