@@ -370,7 +370,19 @@ pub fn call_quantized_matmul_mm_t(
         }
     };
 
-    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    // Пробуем MPP kernel (Metal 4+) для F16 Q4K/Q6K. Fallback → regular.
+    let try_mpp = input_is_f16 && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K);
+    let pipeline = if try_mpp {
+        let mpp_name = match dtype {
+            GgmlDType::Q4K => "kernel_mul_mm_mpp_q4_K_f16",
+            GgmlDType::Q6K => "kernel_mul_mm_mpp_q6_K_f16",
+            _ => unreachable!(),
+        };
+        kernels.load_pipeline(device, Source::Quantized, mpp_name)
+            .unwrap_or_else(|_| kernels.load_pipeline(device, Source::Quantized, name).unwrap())
+    } else {
+        kernels.load_pipeline(device, Source::Quantized, name)?
+    };
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

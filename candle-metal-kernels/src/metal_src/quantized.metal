@@ -1,5 +1,10 @@
 #include <metal_stdlib>
 
+#if __METAL_VERSION__ >= 400
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
+
 using namespace metal;
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -8126,3 +8131,119 @@ kernel void kernel_pool_2d_avg_f32(
 
     o_ptr[cur_oh * OW + cur_ow] = res;
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Metal 4 MPP (Metal Performance Primitives) accelerated matmul
+// Требует macOS 26+ / Metal 4. Замена kernel_mul_mm для Q4_K/Q6_K на Apple Silicon.
+// ════════════════════════════════════════════════════════════════════════════════
+
+#if __METAL_VERSION__ >= 400
+
+template<
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_mpp(
+    device const uchar * srcA,
+    device const half  * srcB,
+    device       float * dst,
+    constant    int64_t & ne00,
+    constant    int64_t & ne02,   // unused, для совместимости с legacy set_params!
+    constant   uint64_t & nb01,
+    constant   uint64_t & nb02,
+    constant   uint64_t & nb03,
+    constant    int64_t & ne12,
+    constant   uint64_t & nb10,
+    constant   uint64_t & nb11,
+    constant   uint64_t & nb12,
+    constant   uint64_t & nb13,
+    constant    int64_t & ne0,
+    constant    int64_t & ne1,
+    constant       uint & r2,
+    constant       uint & r3,
+    threadgroup  char * shmem [[threadgroup(0)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    (void)sgitg;
+
+    const int K = (int)ne00;
+    const int M = (int)ne0;
+    const int N = (int)ne1;
+    const int im = (int)tgpig.z;
+    const int i12 = im % (int)ne12;
+    const int i13 = im / (int)ne12;
+
+    constexpr int NRB = 64;
+    constexpr int NRA = 128;
+    constexpr int NK  = 32;
+    constexpr int A_WORK_ITEMS = NRA * NK / 16;
+
+    const uint64_t offset0 = ((uint64_t)i12 / r2) * nb02 + ((uint64_t)i13 / r3) * nb03;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    auto tA = mpp::tensor(sa, mpp::dextents<int32_t, 2>(NK, NRA));
+
+    device const half * ptrB = srcB + nb12 * (int64_t)i12 + nb13 * (int64_t)i13;
+    const int strideB = (int)(nb11 / sizeof(half));
+    auto tB = mpp::tensor(ptrB, mpp::dextents<int32_t, 2>(K, N), mpp::array<int, 2>({1, strideB}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            NRB, NRA, NK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        mpp::execution_simdgroups<4>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = (int)tiitg; work < A_WORK_ITEMS; work += 128) {
+            const int row = work / (NK / 16);
+            const int k_chunk = work % (NK / 16);
+            const int k_pos = loop_k + k_chunk * 16;
+            const short k_base = (short)(k_chunk * 16);
+
+            if (ra + row < M) {
+                const int block_idx = k_pos / (16 * nl);
+                const short il = (short)((k_pos / 16) % nl);
+                device const block_q * row_ptr = (device const block_q *)(srcA + nb01 * (int64_t)(ra + row) + offset0);
+                half4x4 temp_a;
+                dequantize_func(row_ptr + block_idx, il, temp_a);
+                for (short i = 0; i < 16; i++) {
+                    sa[row * NK + (k_base + i)] = (k_pos + i < K) ? temp_a[i/4][i%4] : (half)0;
+                }
+            } else {
+                for (short i = 0; i < 16; i++) sa[row * NK + (k_base + i)] = (half)0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float * dstBatch = dst + (int64_t)im * N * M;
+    auto tD = mpp::tensor(dstBatch, mpp::dextents<int32_t, 2>(M, N), mpp::array<int, 2>({1, M}));
+    cT.store(tD.slice(ra, rb));
+}
+
+template [[host_name("kernel_mul_mm_mpp_q4_K_f16")]]
+kernel void kernel_mul_mm_mpp<block_q4_K, QK_NL, dequantize_q4_K>(
+    device const uchar *, device const half *, device float *,
+    constant int64_t &, constant int64_t &, constant uint64_t &, constant uint64_t &, constant uint64_t &,
+    constant int64_t &, constant uint64_t &, constant uint64_t &, constant uint64_t &, constant uint64_t &,
+    constant int64_t &, constant int64_t &, constant uint &, constant uint &,
+    threadgroup char *, uint3, ushort, ushort);
+
+template [[host_name("kernel_mul_mm_mpp_q6_K_f16")]]
+kernel void kernel_mul_mm_mpp<block_q6_K, QK_NL, dequantize_q6_K>(
+    device const uchar *, device const half *, device float *,
+    constant int64_t &, constant int64_t &, constant uint64_t &, constant uint64_t &, constant uint64_t &,
+    constant int64_t &, constant uint64_t &, constant uint64_t &, constant uint64_t &, constant uint64_t &,
+    constant int64_t &, constant int64_t &, constant uint &, constant uint &,
+    threadgroup char *, uint3, ushort, ushort);
+
+#endif // __METAL_VERSION__ >= 400
