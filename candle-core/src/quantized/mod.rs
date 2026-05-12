@@ -13,6 +13,7 @@ pub mod gguf_file;
 pub mod imatrix_file;
 pub mod k_quants;
 pub mod q4k_opt;
+pub mod q4k_v3;
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(feature = "metal"))]

@@ -8024,6 +8024,150 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// T-278 Phase 0: kernel_mul_mm_q4_K_f32_v3 — skeleton для Level 1 threadgroup tile cache.
+//
+// SKELETON STATE (Фаза 0): функционально идентичен kernel_mul_mm_q4_K_f32_opt.
+// Будет переписан в Фазе 1 для добавления:
+//   - threadgroup half tile_weights[K_TILE * N_TILE] (cooperative weight tile, 64×32 baseline)
+//   - cooperative_load_q4k_to_tile inline function
+//   - threadgroup_barrier sync ПЕРЕД hot inner loop
+//   - Hot inner loop reads weights ИЗ tile вместо повторного dequant per iteration
+//
+// Expected gain после Фазы 1: bandwidth utilization 35% → ≥50%, prefill +8-15%.
+// Risk: numerical drift из-за изменённого accumulation order — parity gate cosine ≥ 0.9999.
+// ════════════════════════════════════════════════════════════════════════════════
+kernel void kernel_mul_mm_q4_K_f32_v3(
+    device const  uchar * src0                                                [[buffer(0)]],
+    device const  half  * scales_repacked                                     [[buffer(1)]],
+    device const  uchar * src1                                                [[buffer(2)]],
+    device       float  * dst                                                 [[buffer(3)]],
+    constant    int64_t & ne00                                                [[buffer(4)]],
+    constant    int64_t & ne02                                                [[buffer(5)]],
+    constant   uint64_t & nb01                                                [[buffer(6)]],
+    constant   uint64_t & nb02                                                [[buffer(7)]],
+    constant   uint64_t & nb03                                                [[buffer(8)]],
+    constant    int64_t & ne12                                                [[buffer(9)]],
+    constant   uint64_t & nb10                                                [[buffer(10)]],
+    constant   uint64_t & nb11                                                [[buffer(11)]],
+    constant   uint64_t & nb12                                                [[buffer(12)]],
+    constant   uint64_t & nb13                                                [[buffer(13)]],
+    constant    int64_t & ne0                                                 [[buffer(14)]],
+    constant    int64_t & ne1                                                 [[buffer(15)]],
+    constant       uint & r2                                                  [[buffer(16)]],
+    constant       uint & r3                                                  [[buffer(17)]],
+    threadgroup   uchar * shared_memory                                       [[threadgroup(0)]],
+    uint3                 tgpig                                               [[threadgroup_position_in_grid]],
+    uint                  tiitg                                               [[thread_index_in_threadgroup]],
+    uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
+) {
+    // TODO Фаза 1: добавить threadgroup half tile_weights[BLOCK_SIZE_M * BLOCK_SIZE_K]
+    // + cooperative_load_q4k_to_tile + barrier ПЕРЕД hot inner loop.
+    // Текущая body — копия kernel_mul_mm_q4_K_f32_opt (Фаза 0 skeleton).
+
+    constexpr short BLOCK_Q_NL       = QK_NL;
+    constexpr short SCALES_PER_BLOCK = 16;
+
+    threadgroup half  * sa = (threadgroup half  *)(shared_memory);
+    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+
+    const uint r0 = tgpig.y;
+    const uint r1 = tgpig.x;
+    const uint im = tgpig.z;
+
+    const short n_rows     = BLOCK_SIZE_M;
+    const short n_cols     = BLOCK_SIZE_N;
+    const short thread_row = ((short)tiitg / THREAD_PER_ROW);
+    const short thread_col = ((short)tiitg / THREAD_PER_COL);
+    (void)n_rows; (void)n_cols;
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_float8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    short il = (tiitg % THREAD_PER_ROW);
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+
+    uint   offset0 = (i12/r2)*nb02 + (i13/r3)*nb03;
+    ushort offset1 = il / BLOCK_Q_NL;
+
+    device const block_q4_K * x = (device const block_q4_K *)(
+        src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
+    device const float * y = (device const float *)(src1
+        + nb13 * i13
+        + nb12 * i12
+        + nb11 * (r1 * BLOCK_SIZE_N + thread_col)
+        + nb10 * (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL)));
+
+    const uint blocks_per_row = (uint)ne00 / (uint)QK_K;
+    const uint row_idx        = (uint)r0 * BLOCK_SIZE_M + (uint)thread_row;
+    device const half * scales = scales_repacked
+        + (row_idx * blocks_per_row + (uint)offset1) * SCALES_PER_BLOCK;
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
+        half4x4 temp_a;
+        dequantize_q4_K_opt(x, scales, il, temp_a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll(16)
+        for (short i = 0; i < 16; i++) {
+            *(sa + SG_MAT_SIZE * ((tiitg/THREAD_PER_ROW/8) \
+            +                     (tiitg%THREAD_PER_ROW)*16 + (i/8)*8) \
+            +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
+        }
+
+        device const float4 * y4 = (device const float4 *) y;
+        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
+            = float2x4(y4[0], y4[1]);
+
+        const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
+        if (il_next < 2) {
+            x      += 1;
+            scales += SCALES_PER_BLOCK;
+        }
+        il = il_next;
+        y += BLOCK_SIZE_K;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
+        threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+
+        #pragma unroll(4)
+        for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
+            #pragma unroll(4)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + SG_MAT_SIZE * i);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll(2)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
+            }
+
+            lsma += BLOCK_SIZE_M/SG_MAT_ROW * SG_MAT_SIZE;
+            lsmb += BLOCK_SIZE_N/SG_MAT_ROW * SG_MAT_SIZE;
+
+            #pragma unroll(8)
+            for (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+        }
+    }
+
+    device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
+                           + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], C + 8 * (i%4) + 8 * ne0 * (i/4), ne0);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // T-277 Phase 2.5: kernel_mul_mm_q4_K_f32_opt_groupscale — group-level scale rewriting.
 //
 // SKELETON STATE (commit TBD после Xcode AI consultation на math details):
