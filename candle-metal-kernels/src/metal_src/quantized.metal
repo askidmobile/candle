@@ -6983,6 +6983,53 @@ void dequantize_q4_K_opt(
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+// T-277 Phase 2.5: dequantize_q4_K_opt_no_ml — returns dl*nibble БЕЗ ml subtract.
+//
+// Используется в kernel_mul_mm_q4_K_f32_opt_groupscale для group-level scale
+// rewriting (recipe item 3): ml subtract выносится из dequant в финальную
+// коррекцию accumulator'а через `acc -= ml * sum_x` один раз per sub-block.
+//
+// Recipe item 3 (Xcode AI):
+//   Avoid: `deq = scale * (q - zero); acc += deq * x`  ← per element
+//   Prefer: `partial += q * x; sumX += x; acc = scale*partial - ml*sumX`  ← per group
+//
+// Снижает 16 subtracts per dequant call (256 elements / 16 sub-blocks × 16 ops) ⟹ 0 в dequant.
+// Замена: 1 ml*sum_x correction после inner K-loop per sub-block в outer matmul.
+// ════════════════════════════════════════════════════════════════════════════════
+template <typename type4x4>
+void dequantize_q4_K_opt_no_ml(
+    device const block_q4_K * xb,
+    device const half * scales_repacked,
+    short il,
+    thread type4x4 & reg
+) {
+    // Hoisted invariants — то же что в dequantize_q4_K_opt.
+    const short sb = il / 2;
+    const half  dl = scales_repacked[sb * 2 + 0];
+    // ml deliberately НЕ читаем — applied at acc-correction time.
+    const bool  hi = (il & 2) != 0;
+
+    device const uchar * q = xb->qs + (il/4) * 32 + 16 * (il&1);
+    device const uint32_t * q32 = (device const uint32_t *)q;
+    const uint32_t p0 = q32[0];
+    const uint32_t p1 = q32[1];
+    const uint32_t p2 = q32[2];
+    const uint32_t p3 = q32[3];
+
+    #pragma unroll(4)
+    for (short chunk = 0; chunk < 4; ++chunk) {
+        const uint32_t packed = chunk == 0 ? p0 : (chunk == 1 ? p1 : (chunk == 2 ? p2 : p3));
+        #pragma unroll(4)
+        for (short j = 0; j < 4; ++j) {
+            const uchar byte = (packed >> (j * 8)) & 0xFF;
+            const uchar nibble = hi ? (byte >> 4) : (byte & 0x0F);
+            // Без ml subtract: только dl * nibble (half intermediate).
+            reg[chunk][j] = float(dl * half(nibble));
+        }
+    }
+}
+
 template <typename type4x4>
 void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg) {
     device const uint8_t * q  = xb->qs;
@@ -7969,6 +8016,183 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
     }
 
     // FAST_PATH store: dimensions aligned, прямая запись в dst без bounds check.
+    device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
+                           + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], C + 8 * (i%4) + 8 * ne0 * (i/4), ne0);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// T-277 Phase 2.5: kernel_mul_mm_q4_K_f32_opt_groupscale — group-level scale rewriting.
+//
+// SKELETON STATE (commit TBD после Xcode AI consultation на math details):
+//   ✅ Structure: copy of kernel_mul_mm_q4_K_f32_opt
+//   ✅ dequantize_q4_K_opt_no_ml вместо dequantize_q4_K_opt
+//   ⏳ TODO 1: Дополнительный accumulator для sum_x per N-tile
+//   ⏳ TODO 2: ml lookup отдельно (НЕ через dequant, на correction step)
+//   ⏳ TODO 3: Финальная коррекция `mc -= ml * sum_x` per sub-block
+//   ⏳ TODO 4: simdgroup primitive для column sum (sum_x) — efficient reduction
+//
+// Expected gain после math fill-in: ALU 482 → ~400 (-16%), prefill +10-15%.
+// Risk: numerical drift из-за reordering FP accumulation — parity test (cosine>0.999) gate.
+// ════════════════════════════════════════════════════════════════════════════════
+kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
+    device const  uchar * src0                                                [[buffer(0)]],
+    device const  half  * scales_repacked                                     [[buffer(1)]],
+    device const  uchar * src1                                                [[buffer(2)]],
+    device       float  * dst                                                 [[buffer(3)]],
+    constant    int64_t & ne00                                                [[buffer(4)]],
+    constant    int64_t & ne02                                                [[buffer(5)]],
+    constant   uint64_t & nb01                                                [[buffer(6)]],
+    constant   uint64_t & nb02                                                [[buffer(7)]],
+    constant   uint64_t & nb03                                                [[buffer(8)]],
+    constant    int64_t & ne12                                                [[buffer(9)]],
+    constant   uint64_t & nb10                                                [[buffer(10)]],
+    constant   uint64_t & nb11                                                [[buffer(11)]],
+    constant   uint64_t & nb12                                                [[buffer(12)]],
+    constant   uint64_t & nb13                                                [[buffer(13)]],
+    constant    int64_t & ne0                                                 [[buffer(14)]],
+    constant    int64_t & ne1                                                 [[buffer(15)]],
+    constant       uint & r2                                                  [[buffer(16)]],
+    constant       uint & r3                                                  [[buffer(17)]],
+    threadgroup   uchar * shared_memory                                       [[threadgroup(0)]],
+    uint3                 tgpig                                               [[threadgroup_position_in_grid]],
+    uint                  tiitg                                               [[thread_index_in_threadgroup]],
+    uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short BLOCK_Q_NL       = QK_NL;
+    constexpr short SCALES_PER_BLOCK = 16;
+
+    threadgroup half  * sa = (threadgroup half  *)(shared_memory);
+    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+
+    const uint r0 = tgpig.y;
+    const uint r1 = tgpig.x;
+    const uint im = tgpig.z;
+
+    const short n_rows     = BLOCK_SIZE_M;
+    const short n_cols     = BLOCK_SIZE_N;
+    const short thread_row = ((short)tiitg / THREAD_PER_ROW);
+    const short thread_col = ((short)tiitg / THREAD_PER_COL);
+    (void)n_rows; (void)n_cols;
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_float8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+
+    // TODO 1: Add accumulators для sum_x corrections.
+    //   - Один simdgroup_float8x8 m_sumx[2] (matches mb shape) для column sum of input X
+    //   - Или per-mc correction вектор (8 × float scalar — column sum per output column)
+    //   Решение зависит от Xcode AI рекомендации (Q1, Q3 в промпте).
+    //
+    //   Tentative skeleton:
+    //   simdgroup_float8x8 m_sumx[2];     // accumulates raw column sums of B tile
+    //   simdgroup_float8x8 m_ml_corr[8];  // ml × sum_x per output element
+    //   for (short i = 0; i < 2; i++) m_sumx[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    //   for (short i = 0; i < 8; i++) m_ml_corr[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    short il = (tiitg % THREAD_PER_ROW);
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+
+    uint   offset0 = (i12/r2)*nb02 + (i13/r3)*nb03;
+    ushort offset1 = il / BLOCK_Q_NL;
+
+    device const block_q4_K * x = (device const block_q4_K *)(
+        src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
+    device const float * y = (device const float *)(src1
+        + nb13 * i13
+        + nb12 * i12
+        + nb11 * (r1 * BLOCK_SIZE_N + thread_col)
+        + nb10 * (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL)));
+
+    const uint blocks_per_row = (uint)ne00 / (uint)QK_K;
+    const uint row_idx        = (uint)r0 * BLOCK_SIZE_M + (uint)thread_row;
+    device const half * scales = scales_repacked
+        + (row_idx * blocks_per_row + (uint)offset1) * SCALES_PER_BLOCK;
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
+        // Dequant БЕЗ ml subtract (just dl * nibble).
+        half4x4 temp_a;
+        dequantize_q4_K_opt_no_ml(x, scales, il, temp_a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll(16)
+        for (short i = 0; i < 16; i++) {
+            *(sa + SG_MAT_SIZE * ((tiitg/THREAD_PER_ROW/8) \
+            +                     (tiitg%THREAD_PER_ROW)*16 + (i/8)*8) \
+            +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
+        }
+
+        device const float4 * y4 = (device const float4 *) y;
+        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
+            = float2x4(y4[0], y4[1]);
+
+        // TODO 2: Read ml для текущего sub-block (one ml per il/2 step).
+        //   const short sb = il / 2;
+        //   const half ml = scales[sb * 2 + 1];
+        //   Это short scope: используется в correction step ниже.
+
+        const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
+        if (il_next < 2) {
+            x      += 1;
+            scales += SCALES_PER_BLOCK;
+        }
+        il = il_next;
+        y += BLOCK_SIZE_K;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
+        threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+
+        #pragma unroll(4)
+        for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
+            #pragma unroll(4)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + SG_MAT_SIZE * i);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll(2)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
+            }
+
+            lsma += BLOCK_SIZE_M/SG_MAT_ROW * SG_MAT_SIZE;
+            lsmb += BLOCK_SIZE_N/SG_MAT_ROW * SG_MAT_SIZE;
+
+            #pragma unroll(8)
+            for (short i = 0; i < 8; i++){
+                // mc accumulates dl*q*x (без ml correction).
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+
+                // TODO 3: Параллельно accumulate sum_x для correction.
+                //   Идея A — sum_x as separate simdgroup matrix accumulation:
+                //     simdgroup_multiply_accumulate(m_sumx[i%4], mb[i/4], ones_matrix, m_sumx[i%4]);
+                //   Идея B — column sum через simdgroup_reduce (если есть primitive):
+                //     simdgroup_reduce_add(mb[i/4]) → scalar per column
+                //
+                // TODO 4: Accumulate ml correction:
+                //   m_ml_corr[i] += ml * sum_x_contribution
+                //   Это нужно делать **per sub-block transition** (когда il/2 changes),
+                //   а не каждую ik iteration. Точное место — TBD.
+            }
+        }
+    }
+
+    // TODO 5: Финальная коррекция mc → mc - m_ml_corr.
+    //   for (short i = 0; i < 8; i++) {
+    //       // subtract correction matrix from mc
+    //       // — exact API simdgroup_matrix subtract нужно проверить
+    //   }
+
+    // Store: пока identical с _opt kernel (skeleton state).
     device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
                            + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
     for (short i = 0; i < 8; i++) {
