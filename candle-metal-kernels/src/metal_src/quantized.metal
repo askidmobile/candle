@@ -8024,17 +8024,26 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-278 Phase 0: kernel_mul_mm_q4_K_f32_v3 — skeleton для Level 1 threadgroup tile cache.
+// T-279 Level 2: kernel_mul_mm_q4_K_f32_v3 — Half pipeline mb/sb (activation precision).
 //
-// SKELETON STATE (Фаза 0): функционально идентичен kernel_mul_mm_q4_K_f32_opt.
-// Будет переписан в Фазе 1 для добавления:
-//   - threadgroup half tile_weights[K_TILE * N_TILE] (cooperative weight tile, 64×32 baseline)
-//   - cooperative_load_q4k_to_tile inline function
-//   - threadgroup_barrier sync ПЕРЕД hot inner loop
-//   - Hot inner loop reads weights ИЗ tile вместо повторного dequant per iteration
+// T-278 closure обнаружила что threadgroup tile cache pattern уже в _opt (T-275)
+// — Level 1 hypothesis invalidated. РЕАЛЬНОЕ архитектурное отличие к llama.cpp
+// kernel_mul_mm_q4_K_f32 (ggml-metal.metal:9297) = precision pipeline mb/sb:
+//   - llama.cpp: S1=half, simdgroup_half8x8 mb, threadgroup half sb
+//   - наш _opt:  float, simdgroup_float8x8 mb, threadgroup float sb
 //
-// Expected gain после Фазы 1: bandwidth utilization 35% → ≥50%, prefill +8-15%.
-// Risk: numerical drift из-за изменённого accumulation order — parity gate cosine ≥ 0.9999.
+// T-279 = 4 точечные изменения в этом kernel body:
+//   1. sb: threadgroup float → threadgroup half (line ниже)
+//   2. mb: simdgroup_float8x8 → simdgroup_half8x8
+//   3. Activation store: F32 input → half2x4 cast при store в sb
+//   4. lsmb pointer: threadgroup float → threadgroup half
+// Weight pipeline (ma/sa) уже half — не трогаем. Accumulator (mc) остаётся float
+// для финальной precision.
+//
+// Expected gain: Float32 cost 67.88% → 40-50%, prefill mail-cat-1200 ≤1950 ms
+// (-10% от T-275 baseline 2167 ms), Memory delta -2048 bytes (sb shrinks 4096→2048).
+// Risk: numerical drift fp16 × fp16 matmul intermediates — parity gate
+// relaxed cosine ≥ 0.999 + semantic eq ≥ 9/10 (см. T-279 spec).
 // ════════════════════════════════════════════════════════════════════════════════
 kernel void kernel_mul_mm_q4_K_f32_v3(
     device const  uchar * src0                                                [[buffer(0)]],
@@ -8060,15 +8069,14 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
     uint                  tiitg                                               [[thread_index_in_threadgroup]],
     uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
 ) {
-    // TODO Фаза 1: добавить threadgroup half tile_weights[BLOCK_SIZE_M * BLOCK_SIZE_K]
-    // + cooperative_load_q4k_to_tile + barrier ПЕРЕД hot inner loop.
-    // Текущая body — копия kernel_mul_mm_q4_K_f32_opt (Фаза 0 skeleton).
+    // T-279: Half pipeline для activation tile (sb) и matmul mb. Weight tile (sa)
+    // остаётся half как в _opt. См. header comment выше для подробного rationale.
 
     constexpr short BLOCK_Q_NL       = QK_NL;
     constexpr short SCALES_PER_BLOCK = 16;
 
     threadgroup half  * sa = (threadgroup half  *)(shared_memory);
-    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  // T-279: float → half
 
     const uint r0 = tgpig.y;
     const uint r1 = tgpig.x;
@@ -8081,8 +8089,8 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
     (void)n_rows; (void)n_cols;
 
     simdgroup_half8x8  ma[4];
-    simdgroup_float8x8 mb[2];
-    simdgroup_float8x8 mc[8];
+    simdgroup_half8x8  mb[2];  // T-279: float → half (matches llama.cpp S1_8x8)
+    simdgroup_float8x8 mc[8];  // accumulator stays float для финальной precision
 
     for (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
@@ -8121,9 +8129,10 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
+        // T-279: F32 input → half cast при store в sb (matches llama.cpp pattern)
         device const float4 * y4 = (device const float4 *) y;
-        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
-            = float2x4(y4[0], y4[1]);
+        *(threadgroup half2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
+            = half2x4(half4(y4[0]), half4(y4[1]));
 
         const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
         if (il_next < 2) {
@@ -8136,7 +8145,7 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
-        threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+        threadgroup half  * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));  // T-279: float → half
 
         #pragma unroll(4)
         for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
