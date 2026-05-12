@@ -8177,6 +8177,180 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+// T-280 Level 3: kernel_mul_mm_q4_K_f32_v4 — Full Half Pipeline (final piece).
+//
+// T-279 closure обнаружил что F32 Limiter = 92.28% (V3 measurement) — kernel
+// throughput limited by fp32 accumulator (mc) MMA throughput. mb half conversion
+// (T-279) дало bit-exact но no gain потому что mc остаётся fp32.
+//
+// T-280 = final architectural change: mc accumulator → HALF.
+// 3 точечные изменения относительно V3:
+//   1. mc: simdgroup_float8x8 → simdgroup_half8x8
+//   2. mc init: make_filled_simdgroup_matrix<float,8>(0.f) → <half,8>((half)0.0)
+//   3. simdgroup_store: half mc → float* dst (Metal auto-conversion verified)
+//
+// Expected gain:
+//   - F32 Limiter 92.28% → ≤40% (target ≤25%)
+//   - F16 Limiter 3.05% → ≥50% (new dominant limiter)
+//   - Prefill mail-1200 ≤ 1700 ms (-15%+ от T-275 baseline 2167 ms)
+// Risks:
+//   - fp16 accumulator over K=2560-9216 → rounding drift (особенно GatedAttention)
+//   - fp16 max=65504 — edge case overflow possible на larger activations
+// Mitigation:
+//   - Cosine V4 vs V2 ≥ 0.99 + semantic eq ≥ 8/10 (relaxed gate per T-280 spec)
+//   - Automatic fallback к V3/V2 через dispatch_q4k_matmul (T-280 spec FR-010)
+// ════════════════════════════════════════════════════════════════════════════════
+kernel void kernel_mul_mm_q4_K_f32_v4(
+    device const  uchar * src0                                                [[buffer(0)]],
+    device const  half  * scales_repacked                                     [[buffer(1)]],
+    device const  uchar * src1                                                [[buffer(2)]],
+    device       float  * dst                                                 [[buffer(3)]],
+    constant    int64_t & ne00                                                [[buffer(4)]],
+    constant    int64_t & ne02                                                [[buffer(5)]],
+    constant   uint64_t & nb01                                                [[buffer(6)]],
+    constant   uint64_t & nb02                                                [[buffer(7)]],
+    constant   uint64_t & nb03                                                [[buffer(8)]],
+    constant    int64_t & ne12                                                [[buffer(9)]],
+    constant   uint64_t & nb10                                                [[buffer(10)]],
+    constant   uint64_t & nb11                                                [[buffer(11)]],
+    constant   uint64_t & nb12                                                [[buffer(12)]],
+    constant   uint64_t & nb13                                                [[buffer(13)]],
+    constant    int64_t & ne0                                                 [[buffer(14)]],
+    constant    int64_t & ne1                                                 [[buffer(15)]],
+    constant       uint & r2                                                  [[buffer(16)]],
+    constant       uint & r3                                                  [[buffer(17)]],
+    threadgroup   uchar * shared_memory                                       [[threadgroup(0)]],
+    uint3                 tgpig                                               [[threadgroup_position_in_grid]],
+    uint                  tiitg                                               [[thread_index_in_threadgroup]],
+    uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
+) {
+    // T-280: Full half pipeline. Body identical to V3 except mc accumulator
+    // — ma/sa/mb/sb inherited unchanged from V3.
+
+    constexpr short BLOCK_Q_NL       = QK_NL;
+    constexpr short SCALES_PER_BLOCK = 16;
+
+    threadgroup half  * sa = (threadgroup half  *)(shared_memory);
+    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);
+
+    const uint r0 = tgpig.y;
+    const uint r1 = tgpig.x;
+    const uint im = tgpig.z;
+
+    const short n_rows     = BLOCK_SIZE_M;
+    const short n_cols     = BLOCK_SIZE_N;
+    const short thread_row = ((short)tiitg / THREAD_PER_ROW);
+    const short thread_col = ((short)tiitg / THREAD_PER_COL);
+    (void)n_rows; (void)n_cols;
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_half8x8  mb[2];
+    simdgroup_half8x8  mc[8];  // T-280: float → half (bypass F32 Limiter)
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<half, 8>((half)0.0);  // T-280: half init
+    }
+
+    short il = (tiitg % THREAD_PER_ROW);
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+
+    uint   offset0 = (i12/r2)*nb02 + (i13/r3)*nb03;
+    ushort offset1 = il / BLOCK_Q_NL;
+
+    device const block_q4_K * x = (device const block_q4_K *)(
+        src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
+    device const float * y = (device const float *)(src1
+        + nb13 * i13
+        + nb12 * i12
+        + nb11 * (r1 * BLOCK_SIZE_N + thread_col)
+        + nb10 * (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL)));
+
+    const uint blocks_per_row = (uint)ne00 / (uint)QK_K;
+    const uint row_idx        = (uint)r0 * BLOCK_SIZE_M + (uint)thread_row;
+    device const half * scales = scales_repacked
+        + (row_idx * blocks_per_row + (uint)offset1) * SCALES_PER_BLOCK;
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
+        half4x4 temp_a;
+        dequantize_q4_K_opt(x, scales, il, temp_a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll(16)
+        for (short i = 0; i < 16; i++) {
+            *(sa + SG_MAT_SIZE * ((tiitg/THREAD_PER_ROW/8) \
+            +                     (tiitg%THREAD_PER_ROW)*16 + (i/8)*8) \
+            +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
+        }
+
+        device const float4 * y4 = (device const float4 *) y;
+        *(threadgroup half2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
+            = half2x4(half4(y4[0]), half4(y4[1]));
+
+        const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
+        if (il_next < 2) {
+            x      += 1;
+            scales += SCALES_PER_BLOCK;
+        }
+        il = il_next;
+        y += BLOCK_SIZE_K;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
+        threadgroup half  * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+
+        #pragma unroll(4)
+        for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
+            #pragma unroll(4)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + SG_MAT_SIZE * i);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll(2)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
+            }
+
+            lsma += BLOCK_SIZE_M/SG_MAT_ROW * SG_MAT_SIZE;
+            lsmb += BLOCK_SIZE_N/SG_MAT_ROW * SG_MAT_SIZE;
+
+            #pragma unroll(8)
+            for (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);  // T-280: half × half → half acc
+            }
+        }
+    }
+
+    // T-280: half mc → float* dst conversion path.
+    // Metal `simdgroup_store` НЕ поддерживает implicit half → float type conversion
+    // (template T deduction conflict — error confirmed Phase 1 smoke). Manual path:
+    //   1. simdgroup_store half mc → threadgroup half buffer (per-simdgroup slot)
+    //   2. simdgroup_barrier (sync threads within simdgroup)
+    //   3. Per-thread half→float conversion + write to device dst
+    //
+    // Memory: 4 simdgroups × 64 halves = 512 bytes threadgroup (fits в spare budget).
+    // Each thread в simdgroup пишет 2 элемента (32 threads × 2 = 64 elements per matrix).
+    threadgroup half mc_tile_buf[4 * 64];  // T-280: per-simdgroup half storage for conversion
+
+    device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
+                           + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
+    for (short i = 0; i < 8; i++) {
+        threadgroup half * my_buf = mc_tile_buf + sgitg * 64;
+        simdgroup_store(mc[i], my_buf, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        device float * dst_block = C + 8 * (i % 4) + 8 * ne0 * (i / 4);
+        short t = (short)(tiitg & 31);
+        short row = t / 4;
+        short col_base = (t & 3) * 2;
+        dst_block[row * ne0 + col_base]     = (float) my_buf[row * 8 + col_base];
+        dst_block[row * ne0 + col_base + 1] = (float) my_buf[row * 8 + col_base + 1];
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // T-277 Phase 2.5: kernel_mul_mm_q4_K_f32_opt_groupscale — group-level scale rewriting.
 //
 // SKELETON STATE (commit TBD после Xcode AI consultation на math details):

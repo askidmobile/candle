@@ -659,6 +659,116 @@ pub fn call_quantized_matmul_mm_q4k_v3(
     Ok(())
 }
 
+/// T-280 Level 3: bridge для kernel_mul_mm_q4_K_f32_v4.
+///
+/// Full half pipeline kernel: ma+mb+mc all half. Bypasses F32 Limiter (92.28%
+/// в V3 measurement) через half mc accumulator. См. T-280 spec для подробного
+/// rationale + risk model (lossy fp16 accumulation).
+///
+/// Predicate / contract — те же что V3 / `_opt`:
+/// - Q4_K_M weights с pre-packed `scales_repacked` metadata
+/// - F32 activations
+/// - FAST_PATH alignment: `ne01 % 64 == 0 && ne11 % 32 == 0`
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_q4k_v4(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src0_shape: &[usize],
+    src0_stride: &[usize],
+    src0: &Buffer,
+    src0_offset: usize,
+    scales_repacked: &Buffer,
+    src1_shape: &[usize],
+    src1_stride: &[usize],
+    src1: &Buffer,
+    src1_offset: usize,
+    dst_shape: &[usize],
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = src0_shape[src0_shape.len() - 1] as i64;
+    let ne01 = src0_shape[src0_shape.len() - 2] as i64;
+    let ne02 = src0_shape[src0_shape.len() - 3] as i64;
+    let ne03 = src0_shape[src0_shape.len() - 4] as i64;
+
+    let nb01 = src0_stride[src0_stride.len() - 2] as i64;
+    let nb02 = src0_stride[src0_stride.len() - 3] as i64;
+    let nb03 = src0_stride[src0_stride.len() - 4] as i64;
+
+    let ne11 = src1_shape[src1_shape.len() - 2] as i64;
+    let ne12 = src1_shape[src1_shape.len() - 3] as i64;
+    let ne13 = src1_shape[src1_shape.len() - 4] as i64;
+
+    let nb10 = src1_stride[src1_stride.len() - 1] as i64;
+    let nb11 = src1_stride[src1_stride.len() - 2] as i64;
+    let nb12 = src1_stride[src1_stride.len() - 3] as i64;
+    let nb13 = src1_stride[src1_stride.len() - 4] as i64;
+
+    let ne0 = dst_shape[dst_shape.len() - 1] as i64;
+    let ne1 = dst_shape[dst_shape.len() - 2] as i64;
+    let r2 = (ne12 / ne02) as u32;
+    let r3 = (ne13 / ne03) as u32;
+
+    if ne01 % 64 != 0 || ne11 % 32 != 0 {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "kernel_mul_mm_q4_K_f32_v4 requires ne01%64==0 && ne11%32==0",
+            "qmatmul_mm_v4",
+        ));
+    }
+
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    let thread_groups_count = MTLSize {
+        width: divide(ne11 as usize, 32),
+        height: divide(ne01 as usize, 64),
+        depth: (ne12 * ne13) as usize,
+    };
+
+    let pipeline =
+        kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mm_q4_K_f32_v4")?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            (src0, src0_offset),
+            (scales_repacked, 0_usize),
+            (src1, src1_offset),
+            (dst, dst_offset),
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            nb03,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            nb13,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.use_resource(src0, MTLResourceUsage::Read);
+    encoder.use_resource(scales_repacked, MTLResourceUsage::Read);
+    encoder.use_resource(src1, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+
+    encoder.set_threadgroup_memory_length(0, 8192);
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// Полная дequantization квантованного буфера в F16 (half) на GPU.
 ///
 /// Используется при `CANDLE_DEQUANTIZE_ALL_F16=1` для материализации весов в F16
