@@ -6923,6 +6923,66 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 & reg
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+// T-275 Phase 2: dequantize_q4_K_opt — optimized Q4_K dequant с pre-packed scales/mins.
+//
+// Применённые recipe items (Xcode AI):
+//   1. ✅ Pre-packed dl/ml — обходит get_scale_min_k4_just2 + division by 16
+//   2. ✅ uint32-level unpack — 4 loads × 4 nibbles вместо 16 byte loads
+//   3. ⚠️ Group-level scale — НЕ применено (требует rewriting outer matmul loop,
+//          отдельная задача Phase 2.5)
+//   4. ✅ Hoisted invariants — `hi`, `sb` computed once per call
+//   5. ✅ half intermediates — half dl × half nibble (вместо float × float)
+//
+// scales_repacked layout per block (16 f16 values):
+//   [dl_0, ml_0, dl_1, ml_1, ..., dl_7, ml_7]
+//   где dl_i = d * scales[i], ml_i = dmin * mins[i].
+//
+// Эквивалентность original `dequantize_q4_K`:
+//   Original применяет /16 factor для il>=2 (high nibble): `d / 16.h`.
+//   Combined: `dl_hi * (q & 0xF0) = (d/16 * scale) * (upper * 16) = d * scale * upper`.
+//   Здесь:    `dl * (q >> 4)     = (d * scale)    * upper            = d * scale * upper`.
+//   Одинаковый результат с одним dl per sub-block, без /16. Math saved: 8 divisions.
+// ════════════════════════════════════════════════════════════════════════════════
+template <typename type4x4>
+void dequantize_q4_K_opt(
+    device const block_q4_K * xb,
+    device const half * scales_repacked,   // 16 f16 per block (8 sub-blocks × dl/ml interleaved)
+    short il,                              // il in [0..15] (= nl for Q4_K)
+    thread type4x4 & reg
+) {
+    // Hoisted invariants — per-call вычисляются один раз вне inner unpack loop.
+    const short sb = il / 2;                       // sub-block index: 0..7
+    const half  dl = scales_repacked[sb * 2 + 0];
+    const half  ml = scales_repacked[sb * 2 + 1];
+    const bool  hi = (il & 2) != 0;                // il in {2,3,6,7,10,11,14,15} → high nibble
+
+    // 16-byte chunk of qs[] для этого il (16 bytes = 16 nibbles в low_path / high_path).
+    device const uchar * q = xb->qs + (il/4) * 32 + 16 * (il&1);
+
+    // uint32-level unpack: 16 bytes = 4 × uint32. qs[] aligned to 16-byte boundary
+    // внутри block_q4_K (offset 16 после d/dmin/scales = total 16+128, divisible by 16).
+    device const uint32_t * q32 = (device const uint32_t *)q;
+    const uint32_t p0 = q32[0];
+    const uint32_t p1 = q32[1];
+    const uint32_t p2 = q32[2];
+    const uint32_t p3 = q32[3];
+
+    // 16 elements: 4 chunks × 4 nibbles each. half intermediate, float final.
+    // Compiler разворачивает loop (constant bounds + #pragma unroll даёт fully unrolled).
+    #pragma unroll(4)
+    for (short chunk = 0; chunk < 4; ++chunk) {
+        const uint32_t packed = chunk == 0 ? p0 : (chunk == 1 ? p1 : (chunk == 2 ? p2 : p3));
+        #pragma unroll(4)
+        for (short j = 0; j < 4; ++j) {
+            const uchar byte = (packed >> (j * 8)) & 0xFF;
+            const uchar nibble = hi ? (byte >> 4) : (byte & 0x0F);
+            // half × half multiply, subtract ml, convert на финальном store.
+            reg[chunk][j] = float(dl * half(nibble)) - float(ml);
+        }
+    }
+}
+
 template <typename type4x4>
 void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg) {
     device const uint8_t * q  = xb->qs;
@@ -7768,6 +7828,153 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_
 template [[host_name("kernel_mul_mm_q4_K_f16_fast")]] kernel mat_mm_t_fast16_q4 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, true>;
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, half, true>) mat_mm_t_fast16_q6;
 template [[host_name("kernel_mul_mm_q6_K_f16_fast")]] kernel mat_mm_t_fast16_q6 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, half, true>;
+
+// ════════════════════════════════════════════════════════════════════════════════
+// T-275 Phase 2: kernel_mul_mm_q4_K_f32_opt — standalone optimized matmul kernel.
+//
+// Specialized для Q4_K_M weights + F32 input + FAST_PATH (aligned dimensions
+// для Qwen3.5-4B). Использует pre-packed dl/ml metadata через extra parameter
+// `scales_repacked`, обходя on-the-fly Q4_K dequant pipeline.
+//
+// Ожидаемое снижение ALU: 487 → ~410 instructions per dispatch (≈16% reduction).
+//
+// Compatibility: vanilla kernel_mul_mm_q4_K_f32_fast НЕ удалён, остаётся доступен
+// как v1 fallback через ENV var YTTRI_Q4K_KERNEL=v1.
+// ════════════════════════════════════════════════════════════════════════════════
+kernel void kernel_mul_mm_q4_K_f32_opt(
+    device const  uchar * src0                                                [[buffer(0)]],
+    device const  half  * scales_repacked                                     [[buffer(1)]],
+    device const  uchar * src1                                                [[buffer(2)]],
+    device       float  * dst                                                 [[buffer(3)]],
+    constant    int64_t & ne00                                                [[buffer(4)]],
+    constant    int64_t & ne02                                                [[buffer(5)]],
+    constant   uint64_t & nb01                                                [[buffer(6)]],
+    constant   uint64_t & nb02                                                [[buffer(7)]],
+    constant   uint64_t & nb03                                                [[buffer(8)]],
+    constant    int64_t & ne12                                                [[buffer(9)]],
+    constant   uint64_t & nb10                                                [[buffer(10)]],
+    constant   uint64_t & nb11                                                [[buffer(11)]],
+    constant   uint64_t & nb12                                                [[buffer(12)]],
+    constant   uint64_t & nb13                                                [[buffer(13)]],
+    constant    int64_t & ne0                                                 [[buffer(14)]],
+    constant    int64_t & ne1                                                 [[buffer(15)]],
+    constant       uint & r2                                                  [[buffer(16)]],
+    constant       uint & r3                                                  [[buffer(17)]],
+    threadgroup   uchar * shared_memory                                       [[threadgroup(0)]],
+    uint3                 tgpig                                               [[threadgroup_position_in_grid]],
+    uint                  tiitg                                               [[thread_index_in_threadgroup]],
+    uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short BLOCK_Q_NL       = QK_NL;   // = 16 для Q4_K
+    constexpr short SCALES_PER_BLOCK = 16;      // 8 sub-blocks × (dl, ml) interleaved
+
+    threadgroup half  * sa = (threadgroup half  *)(shared_memory);
+    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+
+    const uint r0 = tgpig.y;
+    const uint r1 = tgpig.x;
+    const uint im = tgpig.z;
+
+    // FAST_PATH: dimensions assumed aligned to BLOCK_SIZE_M/N (для Qwen3.5-4B всегда true).
+    const short n_rows     = BLOCK_SIZE_M;
+    const short n_cols     = BLOCK_SIZE_N;
+    const short thread_row = ((short)tiitg / THREAD_PER_ROW);
+    const short thread_col = ((short)tiitg / THREAD_PER_COL);
+    (void)n_rows; (void)n_cols;  // не используются в FAST_PATH store
+
+    simdgroup_half8x8  ma[4];
+    simdgroup_float8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    short il = (tiitg % THREAD_PER_ROW);
+
+    const uint i12 = im % ne12;
+    const uint i13 = im / ne12;
+
+    uint   offset0 = (i12/r2)*nb02 + (i13/r3)*nb03;
+    ushort offset1 = il / BLOCK_Q_NL;   // = 0 для Q4_K (il < 16 = BLOCK_Q_NL)
+
+    device const block_q4_K * x = (device const block_q4_K *)(
+        src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
+    device const float * y = (device const float *)(src1
+        + nb13 * i13
+        + nb12 * i12
+        + nb11 * (r1 * BLOCK_SIZE_N + thread_col)
+        + nb10 * (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL)));
+
+    // scales_repacked pointer: row-major. blocks_per_row = ne00 / QK_K.
+    // Per block 16 half (= 32 bytes) для 8 sub-blocks × (dl, ml).
+    const uint blocks_per_row = (uint)ne00 / (uint)QK_K;
+    const uint row_idx        = (uint)r0 * BLOCK_SIZE_M + (uint)thread_row;
+    device const half * scales = scales_repacked
+        + (row_idx * blocks_per_row + (uint)offset1) * SCALES_PER_BLOCK;
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
+        // Dequant 16 elements через pre-packed dl/ml + uint32 unpack (Recipe items 1, 2, 4, 5).
+        half4x4 temp_a;
+        dequantize_q4_K_opt(x, scales, il, temp_a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll(16)
+        for (short i = 0; i < 16; i++) {
+            *(sa + SG_MAT_SIZE * ((tiitg/THREAD_PER_ROW/8) \
+            +                     (tiitg%THREAD_PER_ROW)*16 + (i/8)*8) \
+            +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
+        }
+
+        // F32 input: 8 элементов через vectorized float4 load.
+        device const float4 * y4 = (device const float4 *) y;
+        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
+            = float2x4(y4[0], y4[1]);
+
+        // Increment il + opt: x и scales advance simultaneously (1 block = 16 half).
+        const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
+        if (il_next < 2) {
+            x      += 1;
+            scales += SCALES_PER_BLOCK;
+        }
+        il = il_next;
+        y += BLOCK_SIZE_K;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Matmul: 8 × simdgroup outer products (как в kernel_mul_mm).
+        threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
+        threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+
+        #pragma unroll(4)
+        for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
+            #pragma unroll(4)
+            for (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + SG_MAT_SIZE * i);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            #pragma unroll(2)
+            for (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
+            }
+
+            lsma += BLOCK_SIZE_M/SG_MAT_ROW * SG_MAT_SIZE;
+            lsmb += BLOCK_SIZE_N/SG_MAT_ROW * SG_MAT_SIZE;
+
+            #pragma unroll(8)
+            for (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+        }
+    }
+
+    // FAST_PATH store: dimensions aligned, прямая запись в dst без bounds check.
+    device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
+                           + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
+    for (short i = 0; i < 8; i++) {
+        simdgroup_store(mc[i], C + 8 * (i%4) + 8 * ne0 * (i/4), ne0);
+    }
+}
 
 // F16 input variants — accept half input directly (no external F32 cast needed).
 template [[host_name("kernel_mul_mm_q4_0_f16")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q4_0,    2,     dequantize_q4_0,    half>;
