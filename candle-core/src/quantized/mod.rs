@@ -775,6 +775,11 @@ impl QTensor {
         &self.shape
     }
 
+    /// Внутренний accessor к QStorage (для intra-crate dispatch helpers как `q4k_opt::matmul_q4k_opt_metal`).
+    pub(crate) fn storage(&self) -> &QStorage {
+        &self.storage
+    }
+
     pub fn dequantize(&self, device: &Device) -> Result<Tensor> {
         let storage = self.storage.dequantize(self.shape.elem_count())?;
         let none = crate::op::BackpropOp::none();
