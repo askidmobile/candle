@@ -1165,6 +1165,7 @@ impl Tensor {
             return self.argmax(crate::D::Minus1)?.to_scalar::<u32>();
         }
 
+        #[cfg(feature = "metal")]
         {
             let storage = self.storage();
             if let Storage::Metal(storage) = &*storage {
@@ -1204,6 +1205,7 @@ impl Tensor {
         }
         let k = k.min(self.elem_count()).max(1);
 
+        #[cfg(feature = "metal")]
         {
             let storage = self.storage();
             if let Storage::Metal(storage) = &*storage {
