@@ -1,3 +1,9 @@
+// Apple-only crate: всё содержимое — Metal/Objective-C bindings через
+// objc2-metal. На Linux/Windows crate должен быть empty, чтобы candle-core
+// мог транзитивно tянуть его без compile-fails (включая feature unification
+// сценарии). Cargo.toml также guard'ит objc2*/block2 deps под target-cond.
+#![cfg(target_os = "macos")]
+
 pub mod err;
 pub mod kernel;
 pub mod kernels;
