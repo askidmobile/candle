@@ -176,6 +176,20 @@ impl VarBuilder {
         })
     }
 
+    /// Construct from a pre-built tensor map. Useful когда тензоры уже извлечены
+    /// (например после name remapping из stranger GGUF naming) и нужно подать
+    /// в существующий quantized_nn loader.
+    pub fn from_tensors_map(
+        data: std::collections::HashMap<String, Arc<QTensor>>,
+        device: &Device,
+    ) -> Self {
+        Self {
+            data: Arc::new(data),
+            path: Vec::new(),
+            device: device.clone(),
+        }
+    }
+
     pub fn pp<S: ToString>(&self, s: S) -> Self {
         let mut path = self.path.clone();
         path.push(s.to_string());
