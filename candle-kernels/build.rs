@@ -21,43 +21,13 @@ fn main() -> Result<()> {
 
     bindings.write(&ptx_path)?;
 
-    let mut moe_builder = KernelBuilder::default()
-        .source_files(vec![
-            "src/moe/moe_gguf.cu",
-            "src/moe/moe_wmma.cu",
-            "src/moe/moe_wmma_gguf.cu",
-        ])
-        .arg("--expt-relaxed-constexpr")
-        .arg("-std=c++17")
-        .arg("-O3");
-
-    // Disable bf16 WMMA kernels on GPUs older than sm_80 (Ampere).
-    // bf16 WMMA fragments require compute capability >= 8.0.
-    let compute_cap = cudaforge::detect_compute_cap()
-        .map(|arch| arch.base())
-        .unwrap_or(80);
-    if compute_cap < 80 {
-        moe_builder = moe_builder.arg("-DNO_BF16_KERNEL");
-    }
-
-    let mut is_target_msvc = false;
-    if let Ok(target) = std::env::var("TARGET") {
-        if target.contains("msvc") {
-            is_target_msvc = true;
-            moe_builder = moe_builder.arg("-D_USE_MATH_DEFINES");
-        }
-    }
-
-    if !is_target_msvc {
-        moe_builder = moe_builder.arg("-Xcompiler").arg("-fPIC");
-    }
-
-    moe_builder.build_lib(out_dir.join("libmoe.a"))?;
-    println!("cargo:rustc-link-search={}", out_dir.display());
-    println!("cargo:rustc-link-lib=moe");
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    if !is_target_msvc {
-        println!("cargo:rustc-link-lib=stdc++");
-    }
+    // T-331 / Фаза 0 (dynamic-loading): MoE-ядра (libmoe.a) и сопутствующий
+    // `rustc-link-lib=dylib=cudart` УДАЛЕНЫ. cudart-линк здесь делал exe жёстко
+    // зависимым от cudart64_*.dll на старте (STATUS_ENTRYPOINT_NOT_FOUND на
+    // машинах без CUDA), что подрывает цель dynamic-loading (cudarc грузит CUDA-
+    // либы в рантайме через LoadLibrary). MoE-путь (`indexed_moe_forward`) грузит
+    // ядра через `get_or_load_func` (PTX-рантайм), НЕ через FFI в libmoe.a, так что
+    // link-time зависимости от libmoe.a нет. Целевые модели Yttri — dense (Qwen3.5-4B),
+    // не MoE. Если MoE на CUDA понадобится — вернуть под dynamic-loading-совместимой схемой.
     Ok(())
 }
