@@ -1,11 +1,24 @@
 // Adapted from https://github.com/guoqingbao/attention.rs/blob/main/src/moe.rs
-#[cfg(feature = "cuda")]
+//
+// T-331 Фаза 0 (dynamic-loading) удалила MoE CUDA-ядра (`libmoe.a`) из
+// `candle-kernels/build.rs`, чтобы exe не имел link-time зависимости от
+// `cudart64_*.dll` (см. комментарий там). Но FFI-функции `moe_gemm`/
+// `moe_gemm_gguf` ниже линковались с символами из `libmoe.a` (moe_gemm_wmma/
+// moe_gemm_gguf[_prefill]) → `LNK2019 unresolved external` при cuda-сборке,
+// даже у dense-моделей (Qwen3.5-4B), которые MoE не вызывают (символы тянутся
+// link-time через `candle-transformers::fused_moe`).
+//
+// Фикс: MoE CUDA-GEMM спрятан за feature `cuda_moe` (OFF по умолчанию) →
+// дефолтная cuda-сборка берёт bail-версии и линкуется. Чтобы реально включить
+// MoE на CUDA: feature `cuda_moe` + восстановить `libmoe.a` в candle-kernels
+// под dynamic-loading-совместимой схемой (PTX-runtime, без cudart hard-link).
+#[cfg(all(feature = "cuda", feature = "cuda_moe"))]
 use candle::cuda_backend::kernels::ffi;
 #[allow(unused_imports)]
 use candle::quantized::{self, QTensor};
 use candle::{Result, Tensor};
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cuda_moe"))]
 pub fn moe_gemm(
     input: &Tensor,
     weights: &Tensor,
@@ -151,7 +164,7 @@ pub fn moe_gemm(
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(all(feature = "cuda", feature = "cuda_moe")))]
 pub fn moe_gemm(
     _: &Tensor,
     _: &Tensor,
@@ -164,7 +177,7 @@ pub fn moe_gemm(
     candle::bail!("moe_gemm is only implemented for the cuda backend")
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cuda_moe"))]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
     input: &Tensor,
@@ -336,7 +349,7 @@ pub fn moe_gemm_gguf(
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(all(feature = "cuda", feature = "cuda_moe")))]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
     _: &Tensor,
