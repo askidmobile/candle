@@ -2062,7 +2062,16 @@ impl MetalStorage {
         let k = k.min(vocab_size).max(1);
 
         const THREADS: usize = 256;
-        let tile_count = (vocab_size + THREADS - 1) / THREADS;
+        // FIX (Yttri 2026-06-30): было `(vocab_size + THREADS - 1) / THREADS` (~970 для
+        // vocab=248K). Но кернел стрейдит ВЕСЬ vocab по `tid` (`i += block_dim`), НЕ по
+        // `tile_id` → все ~970 тредгрупп делали ИДЕНТИЧНУЮ работу (970× редунданс), а
+        // выходной буфер раздувался до `tile_count*THREADS*k = vocab*k` (~10М эл-тов),
+        // что переносилось ~80МБ GPU→CPU и CPU-сортировалось КАЖДЫЙ токен — медленнее, чем
+        // полный CPU-сэмплинг, который этот путь должен был ускорить. Одной тредгруппы (256
+        // тредов) достаточно: каждый тред покрывает vocab/256 элементов, каждый элемент
+        // ровно раз. Top-k на выходе ИДЕНТИЧЕН (редундантные тайлы и так схлопывались
+        // dedup'ом в wrapper'е) — фикс parity-safe, лишь убирает 970× мусорной работы.
+        let tile_count = 1;
         let per_tile_els = THREADS * k;
 
         let suppress = if suppress_ids.is_empty() {
