@@ -8,6 +8,9 @@
 pub mod adapter;
 #[cfg(feature = "cuda")]
 pub mod delta_rule_cuda;
+/// Phase 2: true batched decode (ось slot B) — CUDA.
+#[cfg(feature = "cuda")]
+pub mod delta_rule_batched_cuda;
 #[cfg(target_os = "macos")]
 pub mod metal;
 #[cfg(target_os = "macos")]

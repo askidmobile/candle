@@ -10,6 +10,8 @@ pub enum Id {
     Cast,
     Conv,
     DeltaRule,
+    /// Phase 2: true batched decode (сть slot B) — Qwen35-batching.
+    DeltaRuleBatched,
     Fill,
     Indexing,
     Quantized,
@@ -19,12 +21,13 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 12] = [
+pub const ALL_IDS: [Id; 13] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
     Id::Conv,
     Id::DeltaRule,
+    Id::DeltaRuleBatched,
     Id::Fill,
     Id::Indexing,
     Id::Quantized,
@@ -74,6 +77,7 @@ mdl!(BINARY, Binary);
 mdl!(CAST, Cast);
 mdl!(CONV, Conv);
 mdl!(DELTA_RULE, DeltaRule);
+mdl!(DELTA_RULE_BATCHED, DeltaRuleBatched);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
 mdl!(QUANTIZED, Quantized);
