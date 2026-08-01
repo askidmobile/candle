@@ -27,6 +27,8 @@ use candle_nn::{Module, RmsNorm};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 #[cfg(feature = "cuda")]
+use super::delta_rule_batched_cuda;
+#[cfg(feature = "cuda")]
 use super::delta_rule_cuda;
 #[cfg(target_os = "macos")]
 use super::metal;
@@ -1401,6 +1403,35 @@ struct DeltaNetCudaContext {
     params: delta_rule_cuda::DeltaParams,
 }
 
+/// Максимальное число одновременных слотов для batched decode. State/temp
+/// batched-буферы аллоцируются под полный capacity; активный batch_size должен
+/// быть ≤ capacity. B=4 покрывает целевой continuous-batching throughput
+/// (aggregate B=4 > B=1, см. Phase 6 benchmark). GPU cost batched state:
+/// ~B × n_v×head_v_dim² × 4 байт ≈ KB–MB per layer — пренебрежимо vs весов.
+const DECODE_BATCH_CAPACITY: u32 = 4;
+
+/// Metal GPU batched-контекст DeltaNet (Phase 3 true batched decode).
+/// Pipelines + temp — shared (Arc) через все слои (один compile/аллокация);
+/// per-layer state — batched persistent буферы (leading B, capacity_b).
+#[cfg(target_os = "macos")]
+struct DeltaNetMetalContextBatched {
+    pipelines: Arc<metal::delta_rule_batched_metal::DeltaRuleBatchedPipelines>,
+    temp: Arc<metal::delta_rule_batched_metal::DeltaNetTempBuffersBatched>,
+    layer_state: metal::delta_rule_batched_metal::DeltaNetMetalStateBatched,
+    params: metal::delta_rule_batched_metal::DeltaParams,
+}
+
+/// CUDA GPU batched-контекст DeltaNet (Phase 3, NVIDIA Win/Linux).
+/// Temp — shared Arc (один на модель, слои выполняются последовательно);
+/// per-layer state — batched persistent CudaSlice (leading B, capacity_b).
+#[cfg(feature = "cuda")]
+struct DeltaNetCudaContextBatched {
+    dev: candle_core::CudaDevice,
+    temp: Arc<delta_rule_batched_cuda::DeltaNetCudaTempBatched>,
+    layer_state: delta_rule_batched_cuda::DeltaNetCudaStateBatched,
+    params: delta_rule_batched_cuda::DeltaParams,
+}
+
 /// Веса и логика DeltaNet слоя.
 ///
 /// DeltaNet использует линейную рекуррентность вместо attention:
@@ -1446,6 +1477,14 @@ struct DeltaNetLayer {
     /// CUDA GPU контекст — если Some, forward() использует CUDA path (0 GPU↔CPU syncs)
     #[cfg(feature = "cuda")]
     cuda_ctx: Option<DeltaNetCudaContext>,
+    /// Metal batched GPU контекст — Phase 3 true batched decode: [B,1,n_embd] ввод,
+    /// B независимых слотов за один passage (continuous batching). Если Some,
+    /// `forward_decode_batch` использует batched path; веса читаются один раз на B слотов.
+    #[cfg(target_os = "macos")]
+    metal_ctx_batched: Option<DeltaNetMetalContextBatched>,
+    /// CUDA batched GPU контекст — Phase 3 true batched decode (NVIDIA Win/Linux).
+    #[cfg(feature = "cuda")]
+    cuda_ctx_batched: Option<DeltaNetCudaContextBatched>,
     /// Конфигурация размерностей
     n_k_heads: usize,
     n_v_heads: usize,
@@ -1685,6 +1724,103 @@ impl DeltaNetLayer {
         acc_us!(delta_out_proj_us, t_out);
 
         Ok(result)
+    }
+
+    /// True batched decode forward: B одновременных слотов за один passage.
+    ///
+    /// Вход: x shape [B, 1, n_embd] на device — B независимых токенов (continuous
+    /// batching). Выход: [B, 1, n_embd].
+    ///
+    /// Diff vs `forward` (single-token):
+    /// - Проекции: batched QMatMul `[B,1,n_embd] @ W` → `[B,1,...]` (один вызов
+    ///   на B токенов; веса читаются один раз — bandwidth выигрыш). Для B не
+    ///   кратного 32 Q4_K fast path не активен — используется стандартный Candle
+    ///   batched matmul (correctness сохранена; fast path — future perf).
+    /// - Delta rule: batched kernel (`delta_rule_batched`) — grid добавляет slot
+    ///   ось B, state/scratch с leading B. State изолирован per slot; parity
+    ///   bit-exact на B=1/3/4 доказана в Phase 1 (Metal) / Phase 2 (CUDA).
+    /// - ssm_out: batched QMatMul `[B,1,value_dim] @ W` → `[B,1,n_embd]`.
+    ///
+    /// Требует `metal_ctx_batched` или `cuda_ctx_batched` (batched persistent state).
+    fn forward_decode_batch(&mut self, x: &Tensor) -> Result<Tensor> {
+        let device = x.device().clone();
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        if seq_len != 1 {
+            candle_core::bail!(
+                "forward_decode_batch: seq_len должен быть 1 (decode), got {seq_len}"
+            );
+        }
+        let b = b_sz;
+
+        // 1. Batched проекции (один QMatMul на B токенов; веса — shared read).
+        #[cfg(target_os = "macos")]
+        let qkv_t = dispatch_q4k_matmul(&self.wqkv, self.wqkv_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let z_t = dispatch_q4k_matmul(&self.wgate, self.wgate_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let beta_t = dispatch_q4k_matmul(&self.w_beta, self.w_beta_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
+        #[cfg(not(target_os = "macos"))]
+        let qkv_t = self.wqkv.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let z_t = self.wgate.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let beta_t = self.w_beta.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let alpha_t = self.w_alpha.forward(x)?;
+
+        // ── Metal batched path: 4 batched kernel'а на GPU (slot ось B) ──
+        #[cfg(target_os = "macos")]
+        let mut batched_out_metal: Option<Tensor> = None;
+        #[cfg(target_os = "macos")]
+        if let Some(ctx) = self.metal_ctx_batched.as_mut() {
+            let metal_device = device.as_metal_device()?;
+            ctx.params.batch_size = b as u32;
+            batched_out_metal = Some(metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
+                metal_device,
+                &ctx.pipelines,
+                &ctx.layer_state,
+                &ctx.temp,
+                &ctx.params,
+                &qkv_t,
+                &z_t,
+                &beta_t,
+                &alpha_t,
+            )?);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(out) = batched_out_metal {
+            return dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &out);
+        }
+
+        // ── CUDA batched path: 4 batched kernel'а на GPU (blockIdx.y = slot) ──
+        #[cfg(feature = "cuda")]
+        let mut batched_out_cuda: Option<Tensor> = None;
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = self.cuda_ctx_batched.as_mut() {
+            ctx.params.batch_size = b as u32;
+            batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
+                &ctx.dev,
+                &ctx.layer_state,
+                &ctx.temp,
+                &ctx.params,
+                &qkv_t,
+                &z_t,
+                &beta_t,
+                &alpha_t,
+            )?);
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(out) = batched_out_cuda {
+            return self.ssm_out.forward(&out);
+        }
+
+        candle_core::bail!(
+            "forward_decode_batch: batched GPU контекст отсутствует (capacity_b={}). \
+             Batched decode требует metal_ctx_batched/cuda_ctx_batched (Phase 3 wiring).",
+            DECODE_BATCH_CAPACITY
+        );
     }
 
     /// Batch prefill для DeltaNet.
@@ -2186,6 +2322,16 @@ pub(crate) struct GatedAttentionLayer {
     /// DeltaNet слои (24/32) уже хранят полную историю в SSM state,
     /// поэтому attention окно не теряет долгосрочный контекст.
     attn_window: usize,
+    /// Per-slot KV-cache для true batched decode (Phase 5). Каждый слот имеет
+    /// свой [1, n_kv_head, cap, hd] F16 буфер + длину. Размер = capacity B
+    /// (DECODE_BATCH_CAPACITY). Используется ТОЛЬКО в forward_attn_decode_batch;
+    /// single-slot `forward_attn` использует `kv_cache` выше (shared path).
+    kv_cache_batched: Vec<Option<(Tensor, Tensor)>>,
+    /// Per-slot длина заполненного KV-cache (для batched path).
+    kv_cache_len_batched: Vec<usize>,
+    /// Pre-allocated ёмкость KV-кэша для batched path (== attn_window cap).
+    /// Одно значение для всех слотов.
+    kv_cache_cap_batched: usize,
 }
 
 impl GatedAttentionLayer {
@@ -2573,6 +2719,202 @@ impl GatedAttentionLayer {
         Ok(y)
     }
 
+    /// True batched decode forward для Gated Attention (Phase 5).
+    ///
+    /// Вход: x shape [B, 1, n_embd], `positions` — per-slot позиция (RoPE + KV
+    /// cache append), длина B. Выход: [B, 1, n_embd].
+    ///
+    /// Архитектура (incremental true batching):
+    /// - Проекции Wq/Wk/Wv — batched QMatMul `[B,1,n_embd] @ W` (веса читаются
+    ///   один раз на B слотов — bandwidth выигрыш).
+    /// - RoPE / KV-cache / SDPA — per-slot loop (B <= DECODE_BATCH_CAPACITY=4,
+    ///   seq_len=1, дёшево). Per-slot KV живёт в `kv_cache_batched[slot]`.
+    ///   Math per slot идентична `forward_attn` decode path -> bit-exact parity.
+    /// - Wo проекция — batched QMatMul (веса один раз на B слотов).
+    ///
+    /// Per-slot KV-cache: lazy allocate [1, n_kv_head, cap, hd] F16, cap растёт
+    ///   по мере необходимости (как `forward_attn` growth branch). Не
+    ///   pre-аллоцируем полный attn_window × B (4× context_length = ~10 ГБ).
+    fn forward_attn_decode_batch(
+        &mut self,
+        x: &Tensor,
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        debug_assert_eq!(seq_len, 1, "forward_attn_decode_batch: decode only (seq=1)");
+        debug_assert_eq!(positions.len(), b_sz, "positions.len must == batch");
+        let device = x.device().clone();
+
+        // 1. Batched projections (веса один раз на B слотов).
+        #[cfg(target_os = "macos")]
+        let qg = dispatch_q4k_matmul(&self.attention_wq, self.attention_wq_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let k = dispatch_q4k_matmul(&self.attention_wk, self.attention_wk_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let v = dispatch_q4k_matmul(&self.attention_wv, self.attention_wv_opt.as_ref(), x)?;
+        #[cfg(not(target_os = "macos"))]
+        let qg = self.attention_wq.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let k = self.attention_wk.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let v = self.attention_wv.forward(x)?;
+
+        // 2. Reshape [B,1,n_head,head_dim*2] -> q [B,n_head,1,hd], gate [B,n_head,1,hd]
+        let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+        let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
+        let gate_all = qg.narrow(3, self.head_dim, self.head_dim)?.contiguous()?.transpose(1, 2)?;
+        let k_all = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let v_all = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+
+        // Q-Norm / K-Norm (batched — flatten(0,2) по B*n_head корректно).
+        let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
+            b_sz, self.n_head, seq_len, self.head_dim,
+        ))?;
+        let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
+            b_sz, self.n_kv_head, seq_len, self.head_dim,
+        ))?;
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut slot_outs: Vec<Tensor> = Vec::with_capacity(b_sz);
+
+        // 3-7. Per-slot RoPE + KV-cache + SDPA (math идентичен forward_attn decode).
+        for slot in 0..b_sz {
+            let pos = positions[slot];
+            // Per-slot narrow: [1, n_head, 1, hd]
+            let q = q_all.narrow(0, slot, 1)?.contiguous()?;
+            let k = k_all.narrow(0, slot, 1)?.contiguous()?;
+            let v = v_all.narrow(0, slot, 1)?.contiguous()?;
+
+            // Partial RoPE per slot (index_pos = pos).
+            let q = self.apply_partial_rotary_emb(&q, pos)?;
+            let k = self.apply_partial_rotary_emb(&k, pos)?;
+
+            // KV-cache append (per-slot). F16 для memory (как single-slot path).
+            let k = k.to_dtype(DType::F16)?;
+            let v = v.to_dtype(DType::F16)?;
+
+            let need_init = self.kv_cache_batched[slot].is_none();
+            if need_init {
+                let init_cap = 512.min(self.attn_window);
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let k_buf = Tensor::zeros(
+                    (1, self.n_kv_head, init_cap, self.head_dim),
+                    DType::F16, &device,
+                )?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let v_buf = Tensor::zeros(
+                    (1, self.n_kv_head, init_cap, self.head_dim),
+                    DType::F16, &device,
+                )?;
+                self.kv_cache_batched[slot] = Some((k_buf, v_buf));
+                self.kv_cache_len_batched[slot] = 0;
+                self.kv_cache_cap_batched = init_cap;
+            }
+
+            let cache_len = self.kv_cache_len_batched[slot];
+            let new_len = cache_len + seq_len;
+            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().0.dim(2)?;
+
+            if seq_len == 1 && new_len > self.attn_window {
+                // Sliding window eviction (decode): отбрасываем 1 старый, пишем 1 новый.
+                let keep = self.attn_window - 1;
+                let (k_cache, v_cache) = self.kv_cache_batched[slot].as_mut().unwrap();
+                let old_k = k_cache.narrow(2, 1, keep)?.contiguous()?;
+                let old_v = v_cache.narrow(2, 1, keep)?.contiguous()?;
+                k_cache.slice_set(&old_k, 2, 0)?;
+                v_cache.slice_set(&old_v, 2, 0)?;
+                k_cache.slice_set(&k, 2, keep)?;
+                v_cache.slice_set(&v, 2, keep)?;
+                self.kv_cache_len_batched[slot] = self.attn_window;
+            } else if new_len > current_cap {
+                // Рост буфера (как forward_attn). Копируем старое + пишем новое.
+                let new_cap = (new_len + 512).min(self.max_cache_len).min(self.attn_window);
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let new_k = Tensor::zeros(
+                    (1, self.n_kv_head, new_cap, self.head_dim), k.dtype(), &device,
+                )?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let new_v = Tensor::zeros(
+                    (1, self.n_kv_head, new_cap, self.head_dim), v.dtype(), &device,
+                )?;
+                let (k_cache, v_cache) = self.kv_cache_batched[slot].as_ref().unwrap();
+                if cache_len > 0 {
+                    let old_k = k_cache.narrow(2, 0, cache_len)?.contiguous()?;
+                    let old_v = v_cache.narrow(2, 0, cache_len)?.contiguous()?;
+                    new_k.slice_set(&old_k, 2, 0)?;
+                    new_v.slice_set(&old_v, 2, 0)?;
+                }
+                new_k.slice_set(&k, 2, cache_len)?;
+                new_v.slice_set(&v, 2, cache_len)?;
+                self.kv_cache_batched[slot] = Some((new_k, new_v));
+                self.kv_cache_len_batched[slot] = new_len;
+                self.kv_cache_cap_batched = new_cap;
+            } else {
+                // Обычный append.
+                let (k_cache, v_cache) = self.kv_cache_batched[slot].as_mut().unwrap();
+                k_cache.slice_set(&k, 2, cache_len)?;
+                v_cache.slice_set(&v, 2, cache_len)?;
+                self.kv_cache_len_batched[slot] = new_len;
+            }
+
+            let kv_len = self.kv_cache_len_batched[slot];
+            let (k_cache, v_cache) = self.kv_cache_batched[slot].as_ref().unwrap();
+            let k = k_cache.narrow(2, 0, kv_len)?.contiguous()?;
+            let v = v_cache.narrow(2, 0, kv_len)?.contiguous()?;
+
+            // SDPA (seq_len=1, decode path — идентичен forward_attn).
+            let y = if q.device().is_metal() || q.device().is_cpu() {
+                let q = q.to_dtype(DType::F16)?.contiguous()?;
+                candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?
+                    .to_dtype(DType::F32)?
+            } else {
+                // CUDA manual matmul (F32, как forward_attn decode).
+                let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
+                let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
+                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
+                let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
+                    let repeats = self.n_head / self.n_kv_head;
+                    let k = k_f32
+                        .unsqueeze(2)?
+                        .broadcast_as((1, self.n_kv_head, repeats, kv_len, self.head_dim))?
+                        .contiguous()?
+                        .reshape((1, self.n_head, kv_len, self.head_dim))?;
+                    let v = v_f32
+                        .unsqueeze(2)?
+                        .broadcast_as((1, self.n_kv_head, repeats, kv_len, self.head_dim))?
+                        .contiguous()?
+                        .reshape((1, self.n_head, kv_len, self.head_dim))?;
+                    (k, v)
+                } else {
+                    (k_f32, v_f32)
+                };
+                let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
+                let attn = candle_nn::ops::softmax_last_dim(&scores)?;
+                attn.matmul(&v_exp)?
+            };
+            slot_outs.push(y);
+        }
+
+        // 8-9. Gate + batched Wo projection.
+        // Собираем [B, n_head, 1, hd] (y F32) -> gate sigmoid per-slot -> batched Wo.
+        let y_all = Tensor::cat(&slot_outs, 0)?; // [B, n_head, 1, hd]
+        let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?; // [B, n_head, 1, hd]
+        let y_all = (y_all * gate_sigmoid)?;
+        let y_all = y_all
+            .transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        #[cfg(target_os = "macos")]
+        let y_all = dispatch_q4k_matmul(&self.attention_wo, self.attention_wo_opt.as_ref(), &y_all)?;
+        #[cfg(not(target_os = "macos"))]
+        let y_all = self.attention_wo.forward(&y_all)?;
+
+        Ok(y_all)
+    }
+
     /// Захват snapshot KV-cache для prompt cache (T-274).
     ///
     /// Если cache не заполнен (kv_cache=None или cache_len=0) — возвращает `Ok(None)`.
@@ -2788,6 +3130,33 @@ impl HybridBlock {
     /// Является ли этот блок DeltaNet слоем?
     fn is_deltanet(&self) -> bool {
         matches!(self.layer, HybridLayerType::DeltaNet(_))
+    }
+
+    /// True batched decode forward: B одновременных слотов за один passage.
+    ///
+    /// Вход: x [B, 1, n_embd], `positions` (len B) — per-slot позиция для attention
+    /// (DeltaNet decode position-независим — нет RoPE).
+    /// Выход: [B, 1, n_embd]. Norms/MLP batched (RmsNorm/Mlp handle [B,1,...]).
+    fn forward_decode_batch(&mut self, x: &Tensor, positions: &[usize]) -> Result<Tensor> {
+        // Pre-norm → layer → residual (batched norm).
+        let residual = x;
+        let normed = self.attn_norm.forward(x)?;
+
+        let layer_out = match &mut self.layer {
+            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed)?,
+            HybridLayerType::Attention(attn) => {
+                attn.forward_attn_decode_batch(&normed, positions)?
+            }
+        };
+        let x = (layer_out + residual)?;
+
+        // FFN norm → MLP → residual (batched).
+        let residual = &x;
+        let normed = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.mlp.forward(&normed)?;
+        let x = (ffn_out + residual)?;
+
+        Ok(x)
     }
 
     /// Захват snapshot state блока для prompt cache (T-274).
@@ -3357,6 +3726,67 @@ impl ModelWeights {
             None
         };
 
+        // ── Metal delta_rule BATCHED (true batched decode, Phase 3): shared pipelines ──
+        // Один compile для всех слоёв + shared temp (Arc). Per-layer batched state
+        // (capacity_b) создаётся в цикле загрузки. batch_size переписывается перед
+        // каждым dispatch на активное число слотов.
+        #[cfg(target_os = "macos")]
+        let metal_batched_shared: Option<(
+            Arc<metal::delta_rule_batched_metal::DeltaRuleBatchedPipelines>,
+            Arc<metal::delta_rule_batched_metal::DeltaNetTempBuffersBatched>,
+            metal::delta_rule_batched_metal::DeltaParams,
+        )> = if let Ok(metal_device) = device.as_metal_device() {
+            let p = metal::delta_rule_batched_metal::DeltaParams {
+                n_k_heads: n_k_heads as u32,
+                n_v_heads: n_v_heads as u32,
+                head_k_dim: head_k_dim_delta as u32,
+                head_v_dim: head_v_dim as u32,
+                key_dim: key_dim as u32,
+                value_dim: value_dim as u32,
+                channels: conv_channels as u32,
+                conv_kernel: conv_kernel as u32,
+                q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
+                rms_norm_eps: rms_norm_eps as f32,
+                heads_per_kv: (n_v_heads / n_k_heads) as u32,
+                batch_size: DECODE_BATCH_CAPACITY,
+            };
+            match metal::delta_rule_batched_metal::compile_delta_rule_batched_pipelines(metal_device)
+            {
+                Ok(pipelines) => {
+                    match metal::delta_rule_batched_metal::create_temp_buffers_batched(
+                        metal_device,
+                        &p,
+                        DECODE_BATCH_CAPACITY,
+                    ) {
+                        Ok(temp) => {
+                            log::info!(
+                                "[{}] Metal delta_rule BATCHED: pipelines compiled, capacity_b={}",
+                                tag,
+                                DECODE_BATCH_CAPACITY
+                            );
+                            Some((Arc::new(pipelines), Arc::new(temp), p))
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[{}] Metal delta_rule BATCHED: temp error: {}. batched decode disabled.",
+                                tag, e
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Metal delta_rule BATCHED: compile error: {}. batched decode disabled.",
+                        tag, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // ── CUDA delta_rule: параметры + device-хэндл (NVIDIA Win/Linux) ──
         // Ядра грузятся лениво (device-кеш), поэтому здесь только параметры.
         #[cfg(feature = "cuda")]
@@ -3377,6 +3807,53 @@ impl ModelWeights {
                 };
                 (cuda_dev.clone(), p)
             });
+
+        // ── CUDA delta_rule BATCHED (true batched decode, Phase 3): shared temp ──
+        // Ядра грузятся лениво (device-кеш); persistent state — per-layer (capacity_b).
+        #[cfg(feature = "cuda")]
+        let cuda_batched_shared: Option<(
+            candle_core::CudaDevice,
+            Arc<delta_rule_batched_cuda::DeltaNetCudaTempBatched>,
+            delta_rule_batched_cuda::DeltaParams,
+        )> = if let Some((ref cuda_dev, _single_p)) = cuda_params {
+            let p = delta_rule_batched_cuda::DeltaParams {
+                n_k_heads: n_k_heads as u32,
+                n_v_heads: n_v_heads as u32,
+                head_k_dim: head_k_dim_delta as u32,
+                head_v_dim: head_v_dim as u32,
+                key_dim: key_dim as u32,
+                value_dim: value_dim as u32,
+                channels: conv_channels as u32,
+                conv_kernel: conv_kernel as u32,
+                q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
+                rms_norm_eps: rms_norm_eps as f32,
+                heads_per_kv: (n_v_heads / n_k_heads) as u32,
+                batch_size: DECODE_BATCH_CAPACITY,
+            };
+            match delta_rule_batched_cuda::create_temp_buffers_batched(
+                cuda_dev,
+                &p,
+                DECODE_BATCH_CAPACITY,
+            ) {
+                Ok(temp) => {
+                    log::info!(
+                        "[{}] CUDA delta_rule BATCHED: temp created, capacity_b={}",
+                        tag,
+                        DECODE_BATCH_CAPACITY
+                    );
+                    Some((cuda_dev.clone(), Arc::new(temp), p))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] CUDA delta_rule BATCHED: temp error: {}. batched decode disabled.",
+                        tag, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // ── Загрузка слоёв ──
         let mut blocks = Vec::with_capacity(block_count);
@@ -3555,6 +4032,69 @@ impl ModelWeights {
                     None
                 };
 
+                // Batched Metal per-layer state (Phase 3 true batched decode).
+                #[cfg(target_os = "macos")]
+                let metal_ctx_batched =
+                    if let Some((ref bpipelines, ref btemp, ref bp)) = metal_batched_shared {
+                        let metal_device = device.as_metal_device()?;
+                        match metal::delta_rule_batched_metal::create_layer_metal_state_batched(
+                            metal_device,
+                            bp,
+                            DECODE_BATCH_CAPACITY,
+                            &conv_kernel_weights,
+                            &dt_bias,
+                            &ssm_a,
+                            &ssm_norm_weight,
+                        ) {
+                            Ok(layer_state) => Some(DeltaNetMetalContextBatched {
+                                pipelines: Arc::clone(bpipelines),
+                                temp: Arc::clone(btemp),
+                                layer_state,
+                                params: *bp,
+                            }),
+                            Err(e) => {
+                                log::warn!(
+                                    "[{}] Metal delta_rule batched layer {}: state error: {}",
+                                    tag, layer_idx, e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                // Batched CUDA per-layer state (Phase 3 true batched decode).
+                #[cfg(feature = "cuda")]
+                let cuda_ctx_batched =
+                    if let Some((ref bcuda_dev, ref btemp, ref bp)) = cuda_batched_shared {
+                        match delta_rule_batched_cuda::create_layer_cuda_state_batched(
+                            bcuda_dev,
+                            bp,
+                            DECODE_BATCH_CAPACITY,
+                            &conv_kernel_weights,
+                            &dt_bias,
+                            &ssm_a,
+                            &ssm_norm_weight,
+                        ) {
+                            Ok(layer_state) => Some(DeltaNetCudaContextBatched {
+                                dev: bcuda_dev.clone(),
+                                temp: Arc::clone(btemp),
+                                layer_state,
+                                params: *bp,
+                            }),
+                            Err(e) => {
+                                log::warn!(
+                                    "[{}] CUDA delta_rule batched layer {}: state error: {}",
+                                    tag, layer_idx, e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                 let qm_wqkv = QMatMul::from_qtensor(wqkv)?;
                 let qm_wgate = QMatMul::from_qtensor(wgate)?;
                 let qm_w_beta = QMatMul::from_qtensor(w_beta)?;
@@ -3586,6 +4126,10 @@ impl ModelWeights {
                     metal_ctx,
                     #[cfg(feature = "cuda")]
                     cuda_ctx,
+                    #[cfg(target_os = "macos")]
+                    metal_ctx_batched,
+                    #[cfg(feature = "cuda")]
+                    cuda_ctx_batched,
                     #[cfg(target_os = "macos")]
                     wqkv_opt,
                     #[cfg(target_os = "macos")]
@@ -3684,6 +4228,9 @@ impl ModelWeights {
                     kv_cache_len: 0,
                     max_cache_len: context_length,
                     attn_window,
+                    kv_cache_batched: (0..DECODE_BATCH_CAPACITY as usize).map(|_| None).collect(),
+                    kv_cache_len_batched: vec![0; DECODE_BATCH_CAPACITY as usize],
+                    kv_cache_cap_batched: 0,
                 })
             };
 
@@ -3778,6 +4325,14 @@ impl ModelWeights {
                 HybridLayerType::Attention(attn) => {
                     attn.kv_cache = None;
                     attn.kv_cache_len = 0;
+                    // Per-slot batched KV cache (Phase 5) — обнуляем для новой беседы.
+                    for slot in 0..attn.kv_cache_batched.len() {
+                        attn.kv_cache_batched[slot] = None;
+                    }
+                    for len in attn.kv_cache_len_batched.iter_mut() {
+                        *len = 0;
+                    }
+                    attn.kv_cache_cap_batched = 0;
                 }
             }
         }
@@ -3917,6 +4472,148 @@ impl ModelWeights {
             block.restore_block(device, block_snap)?;
         }
         Ok(())
+    }
+
+    /// Seed per-slot state в batched decode buffers из snapshot (Phase 4).
+    ///
+    /// Переносит state одного слота из prefill-snapshot в batched persistent
+    /// буферы (оси slot B) для последующего true batched decode через
+    /// `forward_decode_batch`. Вызывается адаптером после prefill (per-slot
+    /// `forward`) перед первым batched decode-шагом.
+    ///
+    /// - DeltaNet слои: htod-копия `snap.ssm_state`/`snap.conv_buf` в slot-регион
+    ///   batched Metal/CUDA буфера (`restore_slot_*_state`). Если batched-контекст
+    ///   отсутствует (batched decode disabled) — no-op (fallback на time-multiplex).
+    /// - Attention слои: deep-clone K/V из snapshot в `kv_cache_batched[slot]`
+    ///   (новый буфер [1, n_kv_head, cache_len, head_dim] F16) + установка длины.
+    ///   `None` snapshot → очистка slot'а (свежий слот).
+    ///
+    /// `slot` — индекс [0, DECODE_BATCH_CAPACITY). Вне диапазона → Err.
+    pub fn seed_slot_batched(
+        &mut self,
+        device: &Device,
+        slot: usize,
+        snap: &StateSnapshot,
+    ) -> Result<()> {
+        if snap.model_nonce != self.instance_nonce {
+            candle_core::bail!(
+                "seed_slot_batched: model nonce mismatch: snap={:#x} vs self={:#x}",
+                snap.model_nonce, self.instance_nonce
+            );
+        }
+        if snap.blocks.len() != self.blocks.len() {
+            candle_core::bail!(
+                "seed_slot_batched: blocks length mismatch: snap={} vs model={}",
+                snap.blocks.len(), self.blocks.len()
+            );
+        }
+        if slot >= DECODE_BATCH_CAPACITY as usize {
+            candle_core::bail!(
+                "seed_slot_batched: slot {slot} >= capacity {}",
+                DECODE_BATCH_CAPACITY
+            );
+        }
+
+        for (block, block_snap) in self.blocks.iter_mut().zip(snap.blocks.iter()) {
+            match (&mut block.layer, block_snap) {
+                (HybridLayerType::DeltaNet(d), BlockStateSnap::DeltaNet(s)) => {
+                    // Metal batched: htod в slot-регион unified-memory буфера.
+                    #[cfg(target_os = "macos")]
+                    if let Some(ctx) = d.metal_ctx_batched.as_ref() {
+                        if let Device::Metal(metal_device) = device {
+                            metal::delta_rule_batched_metal::restore_slot_metal_state(
+                                metal_device,
+                                &ctx.layer_state,
+                                slot,
+                                &s.ssm_state,
+                                &s.conv_buf,
+                            )?;
+                        }
+                    }
+                    // CUDA batched: htod в slot-регион CudaSlice.
+                    #[cfg(feature = "cuda")]
+                    if let Some(ctx) = d.cuda_ctx_batched.as_mut() {
+                        delta_rule_batched_cuda::restore_slot_cuda_state(
+                            &ctx.dev,
+                            &mut ctx.layer_state,
+                            slot,
+                            &s.ssm_state,
+                            &s.conv_buf,
+                        )?;
+                    }
+                    // Если batched-контекст отсутствует — no-op: batched decode
+                    // fallback (адаптер использует time-multiplexed path).
+                }
+                (HybridLayerType::Attention(a), BlockStateSnap::Attention(kv_opt)) => {
+                    match kv_opt {
+                        Some(kv) => {
+                            // Deep-clone K/V из snapshot в per-slot batched буфер.
+                            // Snapshot хранит [1, n_kv_head, cache_len, head_dim];
+                            // клонируем в новую аллокацию (detach от snapshot storage).
+                            let k = tensor_deep_clone(&kv.k)?;
+                            let v = tensor_deep_clone(&kv.v)?;
+                            a.kv_cache_batched[slot] = Some((k, v));
+                            a.kv_cache_len_batched[slot] = kv.cache_len;
+                        }
+                        None => {
+                            a.kv_cache_batched[slot] = None;
+                            a.kv_cache_len_batched[slot] = 0;
+                        }
+                    }
+                }
+                (HybridLayerType::DeltaNet(_), BlockStateSnap::Attention(_)) => {
+                    candle_core::bail!(
+                        "seed_slot_batched: snapshot variant mismatch at slot {slot}: expected DeltaNet"
+                    );
+                }
+                (HybridLayerType::Attention(_), BlockStateSnap::DeltaNet(_)) => {
+                    candle_core::bail!(
+                        "seed_slot_batched: snapshot variant mismatch at slot {slot}: expected Attention"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Очистка batched decode buffers (новая беседа / reset) — Phase 4.
+    ///
+    /// Зануляет batched DeltaNet state (Metal/CUDA) и сбрасывает per-slot
+    /// KV-cache для всех attention слоёв. Вызывается адаптером при reset_first
+    /// перед prefill, чтобы batched decode начинал со свежего state.
+    pub fn clear_state_batched(&mut self, device: &Device) {
+        for block in self.blocks.iter_mut() {
+            match &mut block.layer {
+                HybridLayerType::DeltaNet(d) => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(ctx) = d.metal_ctx_batched.as_ref() {
+                        if let Device::Metal(metal_device) = device {
+                            let _ = metal::delta_rule_batched_metal::clear_metal_state_batched(
+                                metal_device,
+                                &ctx.layer_state,
+                            );
+                        }
+                    }
+                    #[cfg(feature = "cuda")]
+                    if let Some(ctx) = d.cuda_ctx_batched.as_mut() {
+                        let dev = ctx.dev.clone();
+                        let _ = delta_rule_batched_cuda::clear_cuda_state_batched(
+                            &dev,
+                            &mut ctx.layer_state,
+                        );
+                    }
+                }
+                HybridLayerType::Attention(a) => {
+                    for slot in 0..a.kv_cache_batched.len() {
+                        a.kv_cache_batched[slot] = None;
+                    }
+                    for len in a.kv_cache_len_batched.iter_mut() {
+                        *len = 0;
+                    }
+                    a.kv_cache_cap_batched = 0;
+                }
+            }
+        }
     }
 
     /// Isolated capture одного Q4_K_M matmul dispatch для GPU profiling (T-274 GPU Profile follow-up).
@@ -4316,7 +5013,68 @@ impl ModelWeights {
         Ok(logits)
     }
 
-    /// Hidden size модели (== embedding dimension).
+    /// True batched decode forward: B одновременных слотов за один passage.
+    ///
+    /// Вход: `tokens` shape [B, 1] — B независимых токенов (continuous batching);
+    /// `positions` (len B) — per-slot позиция в последовательности (RoPE + KV
+    /// cache append для attention). Выход: logits [B, vocab].
+    ///
+    /// Архитектура (Phases 3+5 true batching):
+    /// - Embedding: [B,1] lookup -> QuantizedEmbedding возвращает [1,B,n_embd]
+    ///   (hardcoded shape) -> reshape в [B,1,n_embd].
+    /// - DeltaNet слои (24): batched projections + batched delta_rule kernel (ось slot B).
+    /// - Attention слои (8): batched Wq/Wk/Wv, per-slot KV cache + per-slot RoPE + SDPA.
+    /// - Norms/MLP: batched (RmsNorm/Mlp handle [B,1,...]).
+    /// - Head: norm -> take last token [B,n_embd] -> output.forward -> [B,vocab].
+    ///
+    /// Per-slot recurrent/KV state живёт в batched persistent буферах (оси B) —
+    /// никаких snapshot/restore shuffle (в отличие от time-multiplexed decode_batch).
+    /// Prefill остаётся per-slot (через forward()); batched path — ТОЛЬКО decode.
+    #[cfg(target_os = "macos")]
+    pub fn forward_decode_batch(
+        &mut self,
+        tokens: &Tensor,
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        crate::real::metal_utils::with_autoreleasepool(|| {
+            self.forward_decode_batch_inner(tokens, positions)
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn forward_decode_batch(
+        &mut self,
+        tokens: &Tensor,
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        self.forward_decode_batch_inner(tokens, positions)
+    }
+
+    fn forward_decode_batch_inner(
+        &mut self,
+        tokens: &Tensor,
+        positions: &[usize],
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len) = tokens.dims2()?;
+        debug_assert_eq!(seq_len, 1, "forward_decode_batch: decode only (seq=1)");
+        debug_assert_eq!(positions.len(), b_sz, "positions.len must == batch");
+
+        // Embedding: QuantizedEmbedding.forward возвращает [1, b_sz, n_embd] (hardcoded
+        // leading 1). Reshape в [b_sz, 1, n_embd] для batched layers.
+        let emb_cpu = self.tok_embeddings.forward(tokens)?; // [1, b_sz, n_embd]
+        let mut layer_in = emb_cpu.to_device(tokens.device())?; // [1, b_sz, n_embd]
+        layer_in = layer_in.reshape((b_sz, 1usize, self.hidden_size()))?; // [b_sz, 1, n_embd]
+
+        // Batched layers (DeltaNet decode_batch + Attention decode_batch).
+        for block in self.blocks.iter_mut() {
+            layer_in = block.forward_decode_batch(&layer_in, positions)?;
+        }
+
+        // Head: norm -> take last token -> output projection -> [b_sz, vocab].
+        let x = self.norm.forward(&layer_in)?; // [b_sz, 1, n_embd]
+        let x = x.i((.., 0, ..))?; // [b_sz, n_embd]
+        self.output.forward(&x) // [b_sz, vocab]
+    }
     ///
     /// Для Qwen3.5-4B = 2560. Используется в multimodal pipeline'ах для
     /// проверки совместимости размерности vision_embeds (после VisionProjector

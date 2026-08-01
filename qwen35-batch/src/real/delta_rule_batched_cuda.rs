@@ -406,6 +406,56 @@ pub fn clear_cuda_state_batched(
     Ok(())
 }
 
+/// Записывает single-slot state в конкретный slot batched-буфера (htod).
+/// Phase 4 adapter: seed per-slot state из prefill snapshot в batched decode
+/// buffers перед первым batched decode-шагом.
+///
+/// `ssm_init` — [n_v_heads * head_v_dim * head_v_dim] (один slot, без B).
+/// `conv_init` — [(conv_kernel - 1) * channels] (один slot, без B).
+/// `slot` — индекс слота [0, capacity_b).
+///
+/// Layout batched-буфера: leading B → slot-регион по смещению `slot * per_slot_len`.
+/// Записываем только per-slot данные (остальные слоты не трогаем).
+pub fn restore_slot_cuda_state(
+    dev: &CudaDevice,
+    state: &mut DeltaNetCudaStateBatched,
+    slot: usize,
+    ssm_init: &[f32],
+    conv_init: &[f32],
+) -> Result<()> {
+    let b = state.capacity_b as usize;
+    debug_assert!(slot < b, "restore_slot: slot {slot} >= capacity_b {b}");
+    let ssm_len = ssm_init.len();
+    let conv_len = conv_init.len();
+    let ssm_off = slot * ssm_len;
+    let conv_off = slot * conv_len;
+
+    debug_assert!(
+        ssm_off + ssm_len <= state.ssm_state.len(),
+        "restore_slot ssm: off {} len {} > cap {}",
+        ssm_off,
+        ssm_len,
+        state.ssm_state.len()
+    );
+    debug_assert!(
+        conv_off + conv_len <= state.conv_state.len(),
+        "restore_slot conv: off {} len {} > cap {}",
+        conv_off,
+        conv_len,
+        state.conv_state.len()
+    );
+
+    {
+        let mut ssm_view = state.ssm_state.slice_mut(ssm_off..ssm_off + ssm_len);
+        dev.memcpy_htod(ssm_init, &mut ssm_view)?;
+    }
+    {
+        let mut conv_view = state.conv_state.slice_mut(conv_off..conv_off + conv_len);
+        dev.memcpy_htod(conv_init, &mut conv_view)?;
+    }
+    Ok(())
+}
+
 /// Достаёт `&CudaDevice` из CUDA-тензора.
 pub fn cuda_device_of(t: &Tensor) -> Result<CudaDevice> {
     match t.device() {

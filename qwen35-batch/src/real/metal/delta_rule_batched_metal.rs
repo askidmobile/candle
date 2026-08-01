@@ -490,6 +490,40 @@ pub fn clear_metal_state_batched(
     Ok(())
 }
 
+/// Записывает single-slot state в конкретный slot batched-буфера (htod в unified
+/// memory). Phase 4 adapter: seed per-slot state из prefill snapshot в batched
+/// decode buffers перед первым batched decode-шагом.
+///
+/// `ssm_init` — [n_v_heads * head_v_dim * head_v_dim] (один slot, без B).
+/// `conv_init` — [(conv_kernel - 1) * channels] (один slot, без B).
+/// `slot` — индекс слота [0, capacity_b).
+///
+/// Layout batched-буфера: leading B → slot-регион начинается по смещению
+/// `slot * per_slot_len`. Записываем только per-slot данные (остальные слоты
+/// не трогаем).
+pub fn restore_slot_metal_state(
+    metal_device: &MetalDevice,
+    layer_state: &DeltaNetMetalStateBatched,
+    slot: usize,
+    ssm_init: &[f32],
+    conv_init: &[f32],
+) -> Result<()> {
+    metal_device.wait_until_completed()?;
+    let b = layer_state.capacity_b as usize;
+    debug_assert!(slot < b, "restore_slot: slot {slot} >= capacity_b {b}");
+    let ssm_len = ssm_init.len();
+    let conv_len = conv_init.len();
+
+    unsafe {
+        let ssm_ptr = layer_state.ssm_state.contents() as *mut f32;
+        std::ptr::copy_nonoverlapping(ssm_init.as_ptr(), ssm_ptr.add(slot * ssm_len), ssm_len);
+
+        let conv_ptr = layer_state.conv_state.contents() as *mut f32;
+        std::ptr::copy_nonoverlapping(conv_init.as_ptr(), conv_ptr.add(slot * conv_len), conv_len);
+    }
+    Ok(())
+}
+
 /// Извлекает raw Metal Buffer из Candle Tensor.
 /// Tensor должен быть F32 contiguous (batched decode kernels работают в F32).
 fn get_metal_buffer(tensor: &Tensor) -> Result<Arc<Buffer>> {
