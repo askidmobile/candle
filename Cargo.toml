@@ -9,6 +9,7 @@ members = [
     "candle-ug",
     "candle-wasm-examples/*",
     "candle-wasm-tests",
+    "qwen35-batch",
     "tensor-tools",
 ]
 exclude = [

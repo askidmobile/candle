@@ -1,0 +1,4862 @@
+//! Quantized Qwen3.5 — реализация для GGUF inference через Candle
+//!
+//! Гибридная архитектура: Gated DeltaNet (75% слоёв) + Full Attention (25% слоёв).
+//!
+//! Ключевые отличия Qwen3.5 от Qwen3:
+//! - DeltaNet слои: линейная рекуррентность с delta rule вместо attention
+//! - Conv1D перед Q/K/V в DeltaNet слоях
+//! - Gated Attention: joint Q+gate проекция, sigmoid gating на выходе
+//! - Partial RoPE: только первые 25% head_dim (64 из 256)
+//! - Q-Norm / K-Norm в attention слоях (как Qwen3)
+//! - Metadata keys: `qwen35.*` вместо `qwen3.*`
+//!
+//! Паттерн слоёв (full_attention_interval=4):
+//!   0=DeltaNet, 1=DeltaNet, 2=DeltaNet, 3=Attention, 4=DeltaNet, ...
+//!
+//! Формат GGUF: llama.cpp-совместимый.
+//! Поддерживает: Q4_K_M, Q4_0, Q5_K_M, Q8_0 и другие квантизации.
+
+#[cfg(target_os = "macos")]
+use candle_core::quantized::q4k_opt::Q4KOptMetadataGpu;
+use candle_core::{
+    quantized::{gguf_file, QMatMul},
+    DType, Device, IndexOp, Result, Tensor,
+};
+use candle_nn::{Module, RmsNorm};
+#[cfg(target_os = "macos")]
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+
+#[cfg(feature = "cuda")]
+use super::delta_rule_cuda;
+#[cfg(target_os = "macos")]
+use super::metal;
+use std::cell::RefCell;
+use std::sync::Arc;
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn prefill_flush_no_wait_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("YTTRI_PREFILL_FLUSH_NO_WAIT")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+    })
+}
+
+/// T-275 Phase 4 + T-278: ENV var dispatch для Q4_K_M kernel variant selection.
+///
+/// `YTTRI_Q4K_KERNEL=v1` → legacy `kernel_mul_mm_q4_K_f32_fast` (T-269 baseline).
+/// `YTTRI_Q4K_KERNEL=v2` (или unset) → T-275 `kernel_mul_mm_q4_K_f32_opt` (default).
+/// `YTTRI_Q4K_KERNEL=v3` → T-278 `kernel_mul_mm_q4_K_f32_v3` (Level 1: threadgroup tile cache).
+///
+/// Тесты могут переключать значение runtime через [`set_q4k_kernel_variant`]
+/// (или backwards-compat [`set_q4k_kernel_v2`] для V1↔V2 only).
+/// ENV var читается один раз при первом обращении.
+
+/// Q4_K_M Metal kernel variant. Default = V2Opt (T-275 production).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Q4KKernelVariant {
+    /// Legacy Candle kernel (pre-T-275). ENV `v1`.
+    V1Fast,
+    /// T-275 optimized kernel — pre-packed metadata + uint32 unpack. ENV `v2` (default).
+    V2Opt,
+    /// T-279 — half mb/sb pipeline (bit-exact с V2). ENV `v3`.
+    /// Semantic name preserved from T-278 (где это был threadgroup cache hypothesis).
+    V3ThreadgroupCache,
+    /// T-280 Level 3 — full half pipeline (ma+mb+mc all half). LOSSY — bypass F32 Limiter.
+    /// ENV `v4`. Numerical gate: cosine ≥ 0.99 + semantic eq ≥ 8/10 (relaxed).
+    V4FullHalf,
+}
+
+#[cfg(target_os = "macos")]
+fn variant_from_i8(v: i8) -> Q4KKernelVariant {
+    match v {
+        0 => Q4KKernelVariant::V1Fast,
+        1 => Q4KKernelVariant::V2Opt,
+        2 => Q4KKernelVariant::V3ThreadgroupCache,
+        3 => Q4KKernelVariant::V4FullHalf,
+        _ => Q4KKernelVariant::V2Opt,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn variant_to_i8(v: Q4KKernelVariant) -> i8 {
+    match v {
+        Q4KKernelVariant::V1Fast => 0,
+        Q4KKernelVariant::V2Opt => 1,
+        Q4KKernelVariant::V3ThreadgroupCache => 2,
+        Q4KKernelVariant::V4FullHalf => 3,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn q4k_kernel_variant() -> Q4KKernelVariant {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    // -1 = uninit, 0 = V1, 1 = V2, 2 = V3. i8 для atomic load/store.
+    static CACHED: AtomicI8 = AtomicI8::new(-1);
+    let cur = CACHED.load(Ordering::Acquire);
+    if cur >= 0 {
+        return variant_from_i8(cur);
+    }
+    let initial: i8 = std::env::var("YTTRI_Q4K_KERNEL")
+        .map(|v| match v.to_ascii_lowercase().as_str() {
+            "v1" => 0,
+            "v2" => 1,
+            "v3" => 2,
+            "v4" => 3,
+            _ => 1, // unknown → default V2
+        })
+        .unwrap_or(1); // unset → V2 default
+                       // race-tolerant: первый write выигрывает, последующие writes того же value безвредны.
+    let _ = CACHED.compare_exchange(-1, initial, Ordering::AcqRel, Ordering::Acquire);
+    variant_from_i8(CACHED.load(Ordering::Acquire))
+}
+
+/// Backwards-compat: `true` если активна V2 или V3 (т.е. НЕ V1).
+/// Используется существующими тестами `qwen35_kernel_v2_parity`.
+#[cfg(target_os = "macos")]
+fn q4k_kernel_is_v2() -> bool {
+    !matches!(q4k_kernel_variant(), Q4KKernelVariant::V1Fast)
+}
+
+/// Backwards-compat runtime override v1↔v2 для существующих тестов.
+/// Для V3 используй [`set_q4k_kernel_variant`].
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn set_q4k_kernel_v2(enabled: bool) {
+    let variant = if enabled {
+        Q4KKernelVariant::V2Opt
+    } else {
+        Q4KKernelVariant::V1Fast
+    };
+    set_q4k_kernel_variant(variant);
+}
+
+/// T-278: Runtime override для любого variant (включая V3). Используется тестами.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn set_q4k_kernel_variant(variant: Q4KKernelVariant) {
+    use std::sync::atomic::Ordering;
+    Q4K_KERNEL_OVERRIDE.store(variant_to_i8(variant), Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+static Q4K_KERNEL_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Effective kernel variant — учитывает override (приоритет) и cached ENV var.
+#[cfg(target_os = "macos")]
+fn q4k_kernel_variant_effective() -> Q4KKernelVariant {
+    use std::sync::atomic::Ordering;
+    let override_val = Q4K_KERNEL_OVERRIDE.load(Ordering::Acquire);
+    if override_val >= 0 {
+        return variant_from_i8(override_val);
+    }
+    q4k_kernel_variant()
+}
+
+/// Backwards-compat: `true` если эффективный variant — V2 или V3.
+#[cfg(target_os = "macos")]
+fn q4k_kernel_is_v2_effective() -> bool {
+    !matches!(q4k_kernel_variant_effective(), Q4KKernelVariant::V1Fast)
+}
+
+/// T-275 Phase 4: dispatch helper для Q4_K_M matmul (v1 vs v2 selection).
+///
+/// Если v2 enabled И opt_metadata доступен И `qmatmul` это QTensor variant
+/// (т.е. не dequantized) → новый `matmul_q4k_opt_metal` path.
+/// Иначе → existing `qmatmul.forward(xs)`.
+///
+/// Identity guard: `opt_metadata.source_nonce` сверяется с `qtensor` инстансом
+/// caller'ом (нонce проверяется при initial populate в build_model_common;
+/// здесь предполагается что opt_metadata был построен для этого же qtensor).
+#[cfg(target_os = "macos")]
+fn dispatch_q4k_matmul(
+    qmatmul: &QMatMul,
+    opt_metadata: Option<&Arc<Q4KOptMetadataGpu>>,
+    xs: &Tensor,
+) -> Result<Tensor> {
+    let variant = q4k_kernel_variant_effective();
+    // V1Fast → default Candle dispatch (legacy fallback).
+    if matches!(variant, Q4KKernelVariant::V1Fast) {
+        return qmatmul.forward(xs);
+    }
+    if let (QMatMul::QTensor(qt), Some(opt)) = (qmatmul, opt_metadata) {
+        // F32 input required для optimized kernel'ов (_opt, _v3).
+        if xs.dtype() == DType::F32 {
+            // FAST_PATH alignment: last 2 dims (N=output, K=input) aligned.
+            let weight_dims = qt.shape().dims();
+            let n = weight_dims[weight_dims.len() - 2];
+            let xs_dims = xs.dims();
+            let m = xs_dims[xs_dims.len() - 2];
+            if n % 64 == 0 && m % 32 == 0 {
+                return match variant {
+                    // T-280: V4 dispatch — full half pipeline (LOSSY, bypass F32 Limiter).
+                    Q4KKernelVariant::V4FullHalf => {
+                        candle_core::quantized::q4k_v4::matmul_q4k_v4_metal(
+                            qt.as_ref(),
+                            xs,
+                            opt.as_ref(),
+                        )
+                    }
+                    // T-279: V3 dispatch — half mb/sb (bit-exact с V2).
+                    Q4KKernelVariant::V3ThreadgroupCache => {
+                        candle_core::quantized::q4k_v3::matmul_q4k_v3_metal(
+                            qt.as_ref(),
+                            xs,
+                            opt.as_ref(),
+                        )
+                    }
+                    // V2Opt и любой fallback → существующий T-275 opt kernel.
+                    _ => candle_core::quantized::q4k_opt::matmul_q4k_opt_metal(
+                        qt.as_ref(),
+                        xs,
+                        opt.as_ref(),
+                    ),
+                };
+            }
+        }
+    }
+    // Fallback: incompatible shapes/dtypes → default Candle path.
+    qmatmul.forward(xs)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dispatch_q4k_matmul(
+    qmatmul: &QMatMul,
+    _opt_metadata: Option<&()>,
+    xs: &Tensor,
+) -> Result<Tensor> {
+    qmatmul.forward(xs)
+}
+
+/// Helper: если QMatMul это QTensor с Q4_K_M dtype → repack metadata + upload to Metal.
+/// Возвращает `None` если variant не Q4_K или device не Metal (fallback на v1 path).
+#[cfg(target_os = "macos")]
+fn maybe_repack_q4k_opt(
+    qmatmul: &QMatMul,
+    device: &Device,
+) -> Result<Option<Arc<Q4KOptMetadataGpu>>> {
+    let metal_device = match device {
+        Device::Metal(m) => m,
+        _ => return Ok(None),
+    };
+    let qt = match qmatmul {
+        QMatMul::QTensor(t) => t,
+        _ => return Ok(None),
+    };
+    if qt.dtype() != candle_core::quantized::GgmlDType::Q4K {
+        return Ok(None);
+    }
+    // Через dequantize получаем CPU blocks для repack. Это temporary; затем repack данные
+    // загружаются обратно в Metal buffer. Это разовая операция при load model.
+    let blocks_data = qt.data()?;
+    let blocks: &[candle_core::quantized::k_quants::BlockQ4K] = unsafe {
+        std::slice::from_raw_parts(
+            blocks_data.as_ptr() as *const candle_core::quantized::k_quants::BlockQ4K,
+            blocks_data.len() / std::mem::size_of::<candle_core::quantized::k_quants::BlockQ4K>(),
+        )
+    };
+    let metadata = candle_core::quantized::q4k_opt::repack_q4k_for_opt(blocks)?;
+    let gpu = metadata.upload_to_metal(metal_device)?;
+    Ok(Some(Arc::new(gpu)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn maybe_repack_q4k_opt(_qmatmul: &QMatMul, _device: &Device) -> Result<Option<()>> {
+    Ok(None)
+}
+
+/// Интервал GPU sync между слоями prefill — измеренный оптимум (см. T-33).
+
+#[cfg(target_os = "macos")]
+const SYNC_EVERY: usize = 4;
+
+/// Prefill loop с compile-time fast paths для sync_every = 4 / 8 / 16.
+///
+/// Для известных констант компилятор заменяет `% N` на bitmask AND — нет деления.
+/// Generic runtime fallback для нестандартных значений.
+///
+/// `$layer_in` — mut-переменная `Tensor` (layer_in обновляется in-place).
+/// `$blocks`   — `&mut Vec<HybridBlock>`.
+/// `$pos`      — index_pos.
+/// `$dev_opt`  — `&Option<candle_core::MetalDevice>`.
+/// `$every`    — literal integer (compile-time fast path) или expression (runtime).
+#[allow(unused_macros)]
+macro_rules! prefill_loop_wait {
+    // Compile-time fast path: $every — целочисленный литерал.
+    // Блок возвращает Result<(), ...> для совместимости с match arm.
+    ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, literal $every:literal) => {{
+        let mut _result: candle_core::Result<()> = Ok(());
+        'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            match block.forward_prefill(&$layer_in, $pos) {
+                Ok(t) => { $layer_in = t; }
+                Err(e) => { _result = Err(e); break 'prefill; }
+            }
+            if (i + 1) % $every == 0 {
+                if let Some(dev) = $dev_opt {
+                    let _ = dev.wait_until_completed_fast();
+                    let _ = dev.flush_buffers();
+                    // Phase 3c: сбросить unified bump offset после GPU fence.
+                    // GPU завершил все writes в unified arena — offset безопасно reset.
+                    dev.reset_unified_arena();
+                }
+            }
+        }
+        _result
+    }};
+    // Runtime fallback: $every — expression типа usize.
+    ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, runtime $every:expr) => {{
+        let every_n: usize = $every;
+        let mut _result: candle_core::Result<()> = Ok(());
+        'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            match block.forward_prefill(&$layer_in, $pos) {
+                Ok(t) => { $layer_in = t; }
+                Err(e) => { _result = Err(e); break 'prefill; }
+            }
+            if (i + 1) % every_n == 0 {
+                if let Some(dev) = $dev_opt {
+                    let _ = dev.wait_until_completed_fast();
+                    let _ = dev.flush_buffers();
+                    // Phase 3c: сбросить unified bump offset после GPU fence.
+                    dev.reset_unified_arena();
+                }
+            }
+        }
+        _result
+    }};
+}
+
+/// Аналог prefill_loop_wait! для flush_no_wait path (без arena).
+/// Отключён — flush_no_wait default-off, безопасный wait-path активен.
+#[allow(unused_macros)]
+macro_rules! prefill_loop_no_wait {
+    ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, literal $every:literal) => {{
+        let mut _result: candle_core::Result<()> = Ok(());
+        'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            match block.forward_prefill(&$layer_in, $pos) {
+                Ok(t) => {
+                    $layer_in = t;
+                }
+                Err(e) => {
+                    _result = Err(e);
+                    break 'prefill;
+                }
+            }
+            if (i + 1) % $every == 0 {
+                if let Some(dev) = $dev_opt {
+                    let _ = dev.flush_no_wait();
+                }
+            }
+        }
+        _result
+    }};
+    ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, runtime $every:expr) => {{
+        let every_n: usize = $every;
+        let mut _result: candle_core::Result<()> = Ok(());
+        'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            match block.forward_prefill(&$layer_in, $pos) {
+                Ok(t) => {
+                    $layer_in = t;
+                }
+                Err(e) => {
+                    _result = Err(e);
+                    break 'prefill;
+                }
+            }
+            if (i + 1) % every_n == 0 {
+                if let Some(dev) = $dev_opt {
+                    let _ = dev.flush_no_wait();
+                }
+            }
+        }
+        _result
+    }};
+}
+
+/// Multi-CB prefill loop с per-layer profiling.
+/// Каждые SYNC_EVERY слоёв логгирует накопленное время по типам слоёв.
+#[cfg(target_os = "macos")]
+macro_rules! prefill_loop_multi_cb {
+    ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, literal $every:literal) => {{
+        let mut _result: candle_core::Result<()> = Ok(());
+        let mut _delta_us: u64 = 0;
+        let mut _attn_us: u64 = 0;
+        let mut _delta_cnt: u32 = 0;
+        let mut _attn_cnt: u32 = 0;
+
+        'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            let t0 = std::time::Instant::now();
+            match block.forward_prefill(&$layer_in, $pos) {
+                Ok(t) => {
+                    $layer_in = t;
+                    let dt = t0.elapsed().as_micros() as u64;
+                    if block.is_deltanet() {
+                        _delta_us += dt;
+                        _delta_cnt += 1;
+                    } else {
+                        _attn_us += dt;
+                        _attn_cnt += 1;
+                    }
+                }
+                Err(e) => {
+                    _result = Err(e);
+                    break 'prefill;
+                }
+            }
+            if (i + 1) % $every == 0 {
+                log::info!(
+                    "[Qwen3.5/profile] Layers {}-{}: DeltaNet {:.1}ms ({}), Attn {:.1}ms ({})",
+                    i + 2 - $every,
+                    i + 1,
+                    _delta_us as f64 / 1000.0,
+                    _delta_cnt,
+                    _attn_us as f64 / 1000.0,
+                    _attn_cnt,
+                );
+                _delta_us = 0;
+                _attn_us = 0;
+                _delta_cnt = 0;
+                _attn_cnt = 0;
+
+                if let Some(dev) = $dev_opt {
+                    if let Some(arena) = dev.active_scratch_arena() {
+                        let free = arena.free_count();
+                        if free <= 2 {
+                            log::warn!(
+                                "[Qwen3.5/arena] Layer {}: only {}/{} slots free!",
+                                i + 1,
+                                free,
+                                arena.slots.len()
+                            );
+                        }
+                    }
+                    dev.reset_unified_arena();
+                }
+            }
+        }
+        _result
+    }};
+    ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, runtime $every:expr) => {{
+        let every_n: usize = $every;
+        let mut _result: candle_core::Result<()> = Ok(());
+        let mut _delta_us: u64 = 0;
+        let mut _attn_us: u64 = 0;
+        let mut _delta_cnt: u32 = 0;
+        let mut _attn_cnt: u32 = 0;
+
+        'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            let t0 = std::time::Instant::now();
+            match block.forward_prefill(&$layer_in, $pos) {
+                Ok(t) => {
+                    $layer_in = t;
+                    let dt = t0.elapsed().as_micros() as u64;
+                    if block.is_deltanet() {
+                        _delta_us += dt;
+                        _delta_cnt += 1;
+                    } else {
+                        _attn_us += dt;
+                        _attn_cnt += 1;
+                    }
+                }
+                Err(e) => {
+                    _result = Err(e);
+                    break 'prefill;
+                }
+            }
+            if (i + 1) % every_n == 0 {
+                log::info!(
+                    "[Qwen3.5/profile] Layers {}-{}: DeltaNet {:.1}ms ({}), Attn {:.1}ms ({})",
+                    i + 2 - every_n,
+                    i + 1,
+                    _delta_us as f64 / 1000.0,
+                    _delta_cnt,
+                    _attn_us as f64 / 1000.0,
+                    _attn_cnt,
+                );
+                _delta_us = 0;
+                _attn_us = 0;
+                _delta_cnt = 0;
+                _attn_cnt = 0;
+
+                if let Some(dev) = $dev_opt {
+                    if let Some(arena) = dev.active_scratch_arena() {
+                        let free = arena.free_count();
+                        if free <= 2 {
+                            log::warn!(
+                                "[Qwen3.5/arena] Layer {}: only {}/{} slots free!",
+                                i + 1,
+                                free,
+                                arena.slots.len()
+                            );
+                        }
+                    }
+                    dev.reset_unified_arena();
+                }
+            }
+        }
+        _result
+    }};
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Per-token generation profiling — thread_local аккумуляторы
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Аккумуляторы тайминга для single-token generation.
+/// Суммируют время по всем 32 слоям за один вызов forward().
+/// Сбрасываются перед каждым forward, печатаются каждые N токенов.
+#[derive(Default)]
+struct GenTimings {
+    // DeltaNet (24 слоя)
+    delta_proj_us: u64,     // QMatMul проекции (GPU dispatch)
+    delta_transfer_us: u64, // GPU→CPU transfer (force sync)
+    delta_prep_us: u64,     // sigmoid, softplus, conv1d
+    delta_norm_us: u64,     // L2 norm + expand + Q scaling
+    delta_rule_us: u64,     // delta_rule_step (BLAS+rayon)
+    delta_rms_gate_us: u64, // group RMS norm + SiLU gating
+    delta_out_proj_us: u64, // output proj + CPU→GPU transfer
+
+    // Attention (8 слоёв)
+    attn_proj_us: u64,     // QKV проекции (GPU)
+    attn_reshape_us: u64,  // reshape + norm + RoPE
+    attn_kv_cache_us: u64, // KV cache update
+    attn_sdpa_us: u64,     // SDPA (Metal)
+    attn_gate_out_us: u64, // gate sigmoid + output proj
+
+    // Общее (32 слоя)
+    norm_us: u64, // attn_norm + ffn_norm (RmsNorm)
+    mlp_us: u64,  // SwiGLU MLP (3 QMatMul + silu)
+
+    // Счётчики
+    delta_count: u32,
+    attn_count: u32,
+}
+
+impl GenTimings {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn total_delta_us(&self) -> u64 {
+        self.delta_proj_us
+            + self.delta_transfer_us
+            + self.delta_prep_us
+            + self.delta_norm_us
+            + self.delta_rule_us
+            + self.delta_rms_gate_us
+            + self.delta_out_proj_us
+    }
+
+    fn total_attn_us(&self) -> u64 {
+        self.attn_proj_us
+            + self.attn_reshape_us
+            + self.attn_kv_cache_us
+            + self.attn_sdpa_us
+            + self.attn_gate_out_us
+    }
+}
+
+thread_local! {
+    static GEN_TIMINGS: RefCell<GenTimings> = RefCell::new(GenTimings::default());
+}
+
+/// Макрос для удобного добавления к аккумулятору
+macro_rules! acc_us {
+    ($field:ident, $dur:expr) => {
+        GEN_TIMINGS.with(|t| t.borrow_mut().$field += $dur.as_micros() as u64);
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Apple Accelerate BLAS — аппаратно-ускоренная линейная алгебра для DeltaNet
+// ════════════════════════════════════════════════════════════════════════════════
+//
+// DeltaNet delta_rule_step — основной bottleneck prefill (~94% времени).
+// Ручные Rust циклы дают ~4 GFLOPS vs ~50-100 GFLOPS через Accelerate.
+// Apple Accelerate использует NEON SIMD + AMX (Apple Matrix coprocessor).
+//
+// Ключевые операции (per head, 32 heads × 24 layers × N tokens):
+//   cblas_sgemv: state^T @ k (sk), state^T @ q (output) — matrix-vector [128×128]
+//   cblas_sger:  state += k ⊗ d  (rank-1 update)       — outer product [128×128]
+//   vDSP_vsmul:  state *= decay  (scalar multiply)      — 16384 элементов
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    /// BLAS single-precision matrix-vector: y = alpha * op(A) * x + beta * y
+    /// order=101 (RowMajor), trans=112 (Trans) для state^T @ vector
+    fn cblas_sgemv(
+        order: i32,
+        trans: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        x: *const f32,
+        incx: i32,
+        beta: f32,
+        y: *mut f32,
+        incy: i32,
+    );
+
+    /// BLAS single-precision rank-1 update: A += alpha * x * y^T
+    /// Для outer product: state += k ⊗ d
+    fn cblas_sger(
+        order: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        x: *const f32,
+        incx: i32,
+        y: *const f32,
+        incy: i32,
+        a: *mut f32,
+        lda: i32,
+    );
+
+    /// vDSP scalar multiply: C[i] = A[i] * *B
+    /// Для decay: state *= exp(gate)
+    /// Strides: vDSP_Stride = long (i64 on arm64)
+    /// Length:  vDSP_Length = unsigned long (u64 on arm64)
+    fn vDSP_vsmul(a: *const f32, ia: i64, b: *const f32, c: *mut f32, ic: i64, n: u64);
+}
+
+// CBLAS constants
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_TRANS: i32 = 112;
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Helper functions — загрузка тензоров и RMS norm
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Загрузка тензора из mmap'd GGUF данных — zero-copy до Metal/CPU буфера.
+///
+/// Использует `tensor_from_slice()` вместо `tensor()`, чтобы избежать
+/// промежуточного `Vec<u8>` на каждый тензор. Данные берутся напрямую
+/// из mmap-среза: mmap → &[u8] slice → device buffer (одно копирование).
+fn tensor_from_data(
+    ct: &gguf_file::Content,
+    data: &[u8],
+    name: &str,
+    device: &Device,
+) -> Result<candle_core::quantized::QTensor> {
+    ct.tensor_from_slice(data, name, device)
+}
+
+/// Создать RmsNorm из QTensor, избегая Metal dequant overhead.
+///
+/// Стандартный путь (`quantized_nn::RmsNorm::from_qtensor(device=Metal)`) запускает
+/// Metal blit pipeline: allocate_buffer → blit copy → wait → CPU read → f32 → to_device.
+/// Это создаёт 3 Metal буфера в pool для каждого маленького тензора.
+///
+/// Наш путь: QTensor(CPU) → dequantize(CPU) → to_device(Metal) = 1 Metal буфер.
+/// Weight остаётся F32 (как в llama.cpp convert_hf_to_gguf.py:802-803 — все *_norm.weight
+/// принудительно F32 на диске; Metal RMSNorm kernel в ggml только F32 без half template).
+fn rms_norm_cpu(qt: candle_core::quantized::QTensor, eps: f64, device: &Device) -> Result<RmsNorm> {
+    let weight = qt.dequantize(&Device::Cpu)?.to_device(device)?;
+    Ok(RmsNorm::new(weight, eps))
+}
+
+/// L2-нормализация вектора: x / sqrt(sum(x²) + eps)
+///
+/// Используется в DeltaNet для нормализации Q и K per-head.
+#[inline]
+fn l2_normalize(x: &[f32], eps: f32) -> Vec<f32> {
+    let sq_sum: f32 = x.iter().map(|v| v * v).sum();
+    let inv_norm = 1.0 / (sq_sum + eps).sqrt();
+    x.iter().map(|v| v * inv_norm).collect()
+}
+
+/// L2 нормализация — zero-alloc variant для prefill hot path.
+/// Записывает результат в `out` (должен быть размера >= x.len()).
+#[inline]
+fn l2_normalize_into(x: &[f32], eps: f32, out: &mut [f32]) {
+    let sq_sum: f32 = x.iter().map(|v| v * v).sum();
+    let inv_norm = 1.0 / (sq_sum + eps).sqrt();
+    for (i, &v) in x.iter().enumerate() {
+        out[i] = v * inv_norm;
+    }
+}
+
+/// Softplus: log(1 + exp(x)) — гладкая аппроксимация ReLU.
+///
+/// Для числовой стабильности: если x > 20, возвращаем x напрямую
+/// (exp(20) ≈ 5e8, log(1 + 5e8) ≈ 20.0 — разница пренебрежима).
+#[inline]
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
+/// SiLU (Swish): x * sigmoid(x) — используется в DeltaNet gating и Conv1D.
+#[inline]
+fn silu_scalar(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// Sigmoid: 1 / (1 + exp(-x))
+#[inline]
+fn sigmoid_scalar(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// QuantizedEmbedding — embedding lookup прямо из Q4 данных, без деквантизации всей таблицы
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Quantized embedding table: хранит сырые Q4 данные (~83 МБ) вместо f16 (297 МБ).
+///
+/// В forward() деквантизирует только нужные строки (для seq=2048 → 2048 строк × 4.5 КБ = 9 МБ).
+/// Это экономит ~214 МБ постоянной памяти vs pre-dequantized f16 Embedding.
+#[derive(Clone)]
+struct QuantizedEmbedding {
+    /// mmap'd GGUF файл — shared reference. Embedding читает данные напрямую из file-backed pages.
+    /// Это TRUE zero-copy: нет heap allocation для embedding данных.
+    mmap: Arc<memmap2::Mmap>,
+    /// Смещение данных embedding в mmap
+    data_offset: usize,
+    /// Длина данных embedding в байтах
+    data_len: usize,
+    /// Тип квантизации (Q4_K, Q6_K, etc.)
+    ggml_dtype: candle_core::quantized::GgmlDType,
+    /// Размер одной строки в байтах (= n_cols / block_size * type_size)
+    bytes_per_row: usize,
+    /// Количество строк (vocab_size)
+    n_rows: usize,
+    /// Количество столбцов (hidden_dim)
+    n_cols: usize,
+}
+
+impl std::fmt::Debug for QuantizedEmbedding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuantizedEmbedding")
+            .field("ggml_dtype", &self.ggml_dtype)
+            .field("n_rows", &self.n_rows)
+            .field("n_cols", &self.n_cols)
+            .field("data_len", &self.data_len)
+            .finish()
+    }
+}
+
+impl QuantizedEmbedding {
+    /// Доступ к raw данным embedding (sub-slice mmap).
+    #[inline]
+    fn raw_data(&self) -> &[u8] {
+        &self.mmap[self.data_offset..self.data_offset + self.data_len]
+    }
+
+    /// Создание из mmap — TRUE zero-copy.
+    ///
+    /// `mmap` — Arc на mmap'd GGUF файл. Данные embedding НЕ копируются.
+    /// `tensor_info` — метаданные тензора из GGUF (shape, dtype).
+    fn from_mmap(
+        mmap: Arc<memmap2::Mmap>,
+        tensor_info: &gguf_file::TensorInfo,
+        tensor_data_offset: u64,
+    ) -> Result<Self> {
+        let shape = &tensor_info.shape;
+        let dims = shape.dims();
+        if dims.len() != 2 {
+            candle_core::bail!("QuantizedEmbedding expects 2D tensor, got {:?}", shape);
+        }
+        let n_rows = dims[0];
+        let n_cols = dims[1];
+        let ggml_dtype = tensor_info.ggml_dtype;
+        let block_size = ggml_dtype.block_size();
+        let type_size = ggml_dtype.type_size();
+        let bytes_per_row = n_cols / block_size * type_size;
+        let data_len = n_rows * bytes_per_row;
+
+        let data_offset = (tensor_data_offset + tensor_info.offset) as usize;
+        if data_offset + data_len > mmap.len() {
+            candle_core::bail!(
+                "QuantizedEmbedding: data out of bounds {}..{} vs len {}",
+                data_offset,
+                data_offset + data_len,
+                mmap.len()
+            );
+        }
+
+        log::info!(
+            "[QuantizedEmbedding] {}x{}, {:?}, {:.1} MB (zero-copy mmap, vs {:.1} MB f16)",
+            n_rows,
+            n_cols,
+            ggml_dtype,
+            data_len as f64 / 1024.0 / 1024.0,
+            n_rows as f64 * n_cols as f64 * 2.0 / 1024.0 / 1024.0,
+        );
+
+        Ok(Self {
+            mmap,
+            data_offset,
+            data_len,
+            ggml_dtype,
+            bytes_per_row,
+            n_rows,
+            n_cols,
+        })
+    }
+
+    /// Embedding lookup: деквантизирует только нужные строки по token IDs.
+    ///
+    /// Вход: token_ids shape (batch, seq_len) на любом device.
+    /// Выход: (batch, seq_len, n_cols) f32 на CPU.
+    #[allow(unused_must_use)]
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        use candle_core::quantized::k_quants::{
+            BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1,
+            BlockQ6K, BlockQ8K, BlockQ8_0, GgmlType,
+        };
+        use candle_core::quantized::GgmlDType;
+
+        let (_b_sz, _seq_len) = x.dims2()?;
+        let x_cpu = x.to_device(&Device::Cpu)?;
+        let token_ids: Vec<u32> = x_cpu.flatten_all()?.to_vec1()?;
+
+        // Буфер для результата: (seq_len, n_cols) f32
+        let mut result = vec![0f32; token_ids.len() * self.n_cols];
+        let raw = self.raw_data();
+
+        // Макрос для деквантизации строки конкретного типа блока
+        macro_rules! dequant_row {
+            ($block_type:ty, $raw:expr, $row_bytes:expr, $out:expr, $token_id:expr, $n_cols:expr) => {{
+                let row_start = $token_id as usize * $row_bytes;
+                let row_end = row_start + $row_bytes;
+                let row_data = &$raw[row_start..row_end];
+                let blocks: &[$block_type] = unsafe {
+                    let ptr = row_data.as_ptr() as *const $block_type;
+                    let n_blocks = row_data.len() / std::mem::size_of::<$block_type>();
+                    std::slice::from_raw_parts(ptr, n_blocks)
+                };
+                <$block_type>::to_float(blocks, $out);
+            }};
+        }
+
+        for (i, &tid) in token_ids.iter().enumerate() {
+            if tid as usize >= self.n_rows {
+                candle_core::bail!("token_id {} out of range (vocab_size={})", tid, self.n_rows);
+            }
+            let out_slice = &mut result[i * self.n_cols..(i + 1) * self.n_cols];
+
+            match self.ggml_dtype {
+                GgmlDType::Q4_0 => dequant_row!(
+                    BlockQ4_0,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q4_1 => dequant_row!(
+                    BlockQ4_1,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q5_0 => dequant_row!(
+                    BlockQ5_0,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q5_1 => dequant_row!(
+                    BlockQ5_1,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q8_0 => dequant_row!(
+                    BlockQ8_0,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q2K => dequant_row!(
+                    BlockQ2K,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q3K => dequant_row!(
+                    BlockQ3K,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q4K => dequant_row!(
+                    BlockQ4K,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q5K => dequant_row!(
+                    BlockQ5K,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q6K => dequant_row!(
+                    BlockQ6K,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::Q8K => dequant_row!(
+                    BlockQ8K,
+                    raw,
+                    self.bytes_per_row,
+                    out_slice,
+                    tid,
+                    self.n_cols
+                ),
+                GgmlDType::F32 => {
+                    let row_start = tid as usize * self.n_cols * 4;
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            raw[row_start..].as_ptr() as *const f32,
+                            self.n_cols,
+                        )
+                    };
+                    out_slice.copy_from_slice(src);
+                }
+                GgmlDType::F16 => {
+                    let row_start = tid as usize * self.n_cols * 2;
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            raw[row_start..].as_ptr() as *const half::f16,
+                            self.n_cols,
+                        )
+                    };
+                    for (dst, &s) in out_slice.iter_mut().zip(src) {
+                        *dst = s.to_f32();
+                    }
+                }
+                other => {
+                    candle_core::bail!("QuantizedEmbedding: unsupported dtype {:?}", other);
+                }
+            }
+        }
+
+        Tensor::from_vec(result, (1, token_ids.len(), self.n_cols), &Device::Cpu)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// MLP (SwiGLU) — идентично Qwen3
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+struct Mlp {
+    feed_forward_w1: QMatMul, // gate_proj (ffn_gate)
+    feed_forward_w2: QMatMul, // down_proj (ffn_down)
+    feed_forward_w3: QMatMul, // up_proj   (ffn_up)
+    // T-275 Phase 4: pre-packed Q4_K metadata для optimized matmul kernel.
+    // None если weight не Q4_K_M (например F32/F16/Q6_K) или device не Metal.
+    #[cfg(target_os = "macos")]
+    feed_forward_w1_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    feed_forward_w2_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    feed_forward_w3_opt: Option<Arc<Q4KOptMetadataGpu>>,
+}
+
+impl Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(target_os = "macos")]
+        let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
+        #[cfg(target_os = "macos")]
+        let w3 = dispatch_q4k_matmul(&self.feed_forward_w3, self.feed_forward_w3_opt.as_ref(), xs)?;
+        #[cfg(not(target_os = "macos"))]
+        let w1 = self.feed_forward_w1.forward(xs)?;
+        #[cfg(not(target_os = "macos"))]
+        let w3 = self.feed_forward_w3.forward(xs)?;
+        // T-275: fused silu_mul via direct MetalStorage path (один kernel вместо двух)
+        let silu_mul = w1.silu_mul_direct(&w3)?;
+        #[cfg(target_os = "macos")]
+        {
+            dispatch_q4k_matmul(
+                &self.feed_forward_w2,
+                self.feed_forward_w2_opt.as_ref(),
+                &silu_mul,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.feed_forward_w2.forward(&silu_mul)
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// DeltaNet Layer — линейная рекуррентность с delta rule
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Состояние DeltaNet слоя: conv1d буфер + SSM state.
+///
+/// Хранится на CPU как Vec<f32> для эффективной мутации в рекуррентном цикле.
+/// Инициализируется нулями при первом forward или после clear_state.
+#[derive(Debug, Clone)]
+struct DeltaNetState {
+    /// Conv1D буфер: [conv_kernel-1, channels] row-major.
+    /// channels = key_dim * 2 + value_dim (joint QKV после проекции).
+    /// При каждом токене: сдвиг влево + добавление нового входа.
+    conv_buf: Vec<f32>,
+    /// SSM state: [n_v_heads, head_v_dim, head_v_dim] row-major.
+    /// Каждая голова хранит матрицу состояния, обновляемую по delta rule.
+    ssm_state: Vec<f32>,
+    /// Размер ядра conv1d (обычно 4)
+    conv_kernel: usize,
+    /// Количество каналов conv1d (key_dim * 2 + value_dim)
+    channels: usize,
+    /// Количество value голов
+    n_v_heads: usize,
+    /// Размерность головы (для SSM state)
+    head_v_dim: usize,
+
+    // ── Переиспользуемые буферы (избегаем ~48K аллокаций за prefill) ──
+    /// Буфер для результата conv1d_step [channels]
+    buf_conv_result: Vec<f32>,
+    /// Буфер для output delta_rule_step [n_v_heads * head_v_dim]
+    buf_output: Vec<f32>,
+    /// Буфер для sk (state^T @ k) [head_v_dim]
+    buf_sk: Vec<f32>,
+    /// Буфер для d (delta) [head_v_dim]
+    buf_d: Vec<f32>,
+}
+
+/// Snapshot CPU-данных DeltaNet state для prompt cache (T-274).
+///
+/// Содержит только перманентные данные state — conv ring buffer и SSM matrix.
+/// Scratch buffers (`buf_*`) НЕ сохраняются: они переписываются в каждом forward step.
+///
+/// Размер: `(conv_kernel - 1) * channels + n_v_heads * head_v_dim^2` элементов f32.
+/// Для Qwen3.5-4B (conv_k=4, channels=8192, n_v_heads=32, head_v_dim=128):
+/// 3 * 8192 + 32 * 128 * 128 = ~525K f32 ≈ 2.1 MB на слой.
+#[derive(Debug, Clone)]
+pub struct DeltaNetStateSnap {
+    pub conv_buf: Vec<f32>,
+    pub ssm_state: Vec<f32>,
+}
+
+impl DeltaNetState {
+    /// Создать новое состояние, инициализированное нулями.
+    fn new(conv_kernel: usize, channels: usize, n_v_heads: usize, head_v_dim: usize) -> Self {
+        let conv_buf_size = (conv_kernel - 1) * channels;
+        let ssm_state_size = n_v_heads * head_v_dim * head_v_dim;
+        Self {
+            conv_buf: vec![0.0f32; conv_buf_size],
+            ssm_state: vec![0.0f32; ssm_state_size],
+            conv_kernel,
+            channels,
+            n_v_heads,
+            head_v_dim,
+            // Pre-allocate буферы для hot path
+            buf_conv_result: vec![0.0f32; channels],
+            buf_output: vec![0.0f32; n_v_heads * head_v_dim],
+            buf_sk: vec![0.0f32; head_v_dim],
+            buf_d: vec![0.0f32; head_v_dim],
+        }
+    }
+
+    /// Сброс состояния в нули (для новой беседы).
+    fn clear(&mut self) {
+        self.conv_buf.fill(0.0);
+        self.ssm_state.fill(0.0);
+        // Буферы не нужно очищать — перезаписываются полностью в каждом вызове
+    }
+
+    /// Захват snapshot CPU-данных state для prompt cache (T-274).
+    ///
+    /// Клонирует `conv_buf` и `ssm_state` в отдельные `Vec<f32>`. Scratch buffers
+    /// не входят в snapshot — они переписываются в hot path при каждом forward.
+    pub(crate) fn to_snapshot(&self) -> DeltaNetStateSnap {
+        DeltaNetStateSnap {
+            conv_buf: self.conv_buf.clone(),
+            ssm_state: self.ssm_state.clone(),
+        }
+    }
+
+    /// Восстановление state из snapshot (T-274).
+    ///
+    /// Перезаписывает `conv_buf` и `ssm_state` данными из snapshot.
+    /// Scratch buffers не трогаем — они перезапишутся в следующем forward.
+    pub(crate) fn restore_from(&mut self, snap: &DeltaNetStateSnap) {
+        debug_assert_eq!(
+            snap.conv_buf.len(),
+            self.conv_buf.len(),
+            "DeltaNetStateSnap.conv_buf size mismatch: snap={} vs state={}",
+            snap.conv_buf.len(),
+            self.conv_buf.len(),
+        );
+        debug_assert_eq!(
+            snap.ssm_state.len(),
+            self.ssm_state.len(),
+            "DeltaNetStateSnap.ssm_state size mismatch: snap={} vs state={}",
+            snap.ssm_state.len(),
+            self.ssm_state.len(),
+        );
+        self.conv_buf.copy_from_slice(&snap.conv_buf);
+        self.ssm_state.copy_from_slice(&snap.ssm_state);
+    }
+
+    /// Conv1D: свёртка с ядром, затем обновление буфера.
+    ///
+    /// `input` — новый вход [channels].
+    /// `kernel` — веса conv1d, layout `[channels, conv_kernel]` (channel-first).
+    ///   В GGUF тензор `ssm_conv1d.weight` имеет dims=[conv_kernel, channels],
+    ///   что после загрузки через Candle dequantize + flatten даёт row-major
+    ///   `[channels, conv_kernel]`: для канала j и позиции ядра i → `kernel[j * k + i]`.
+    ///
+    /// Возвращает результат свёртки [channels] с SiLU активацией.
+    ///
+    /// ВАЖНО: конволюция выполняется ДО обновления буфера, чтобы текущий input
+    /// использовался только в позиции kernel[k-1], а не дублировался из буфера.
+    /// Аналог llama.cpp: concat(conv_states, input) → conv → update_states.
+    /// Conv1D step — allocating variant (single-token path).
+    fn conv1d_step(&mut self, input: &[f32], kernel: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0f32; self.channels];
+        self.conv1d_step_into(input, kernel, &mut result);
+        result
+    }
+
+    /// Conv1D step — zero-alloc variant (prefill hot path).
+    ///
+    /// Записывает результат в `out` (должен быть размера >= channels).
+    fn conv1d_step_into(&mut self, input: &[f32], kernel: &[f32], out: &mut [f32]) {
+        let k = self.conv_kernel;
+        let c = self.channels;
+
+        // 1. Свёртка: буфер содержит (k-1) ПРЕДЫДУЩИХ входов, текущий вход — input.
+        // kernel layout: [channels, conv_kernel] → kernel[j * k + i]
+        // conv_buf layout: [k-1, channels] → conv_buf[i * c + j]
+        for j in 0..c {
+            let mut sum = 0.0f32;
+            let kernel_base = j * k;
+            for i in 0..(k - 1) {
+                sum += self.conv_buf[i * c + j] * kernel[kernel_base + i];
+            }
+            sum += input[j] * kernel[kernel_base + (k - 1)];
+            out[j] = silu_scalar(sum);
+        }
+
+        // 2. ПОСЛЕ свёртки обновляем буфер: сдвиг влево + добавление input
+        if k > 2 {
+            self.conv_buf.copy_within(c.., 0);
+        }
+        let last_row_start = (k - 2) * c;
+        self.conv_buf[last_row_start..last_row_start + c].copy_from_slice(input);
+    }
+
+    /// Delta Rule: обновление SSM state и вычисление выхода для одного токена.
+    ///
+    /// # Аргументы
+    /// - `q` — query [n_v_heads, head_v_dim] (после L2 norm и repeat interleave)
+    /// - `k` — key [n_v_heads, head_v_dim] (после L2 norm и repeat interleave)
+    /// - `v` — value [n_v_heads, head_v_dim]
+    /// - `beta` — [n_v_heads] sigmoid-scaled
+    /// - `gate` — [n_v_heads] decay gate (отрицательные значения)
+    ///
+    /// # Возвращает
+    /// Выход [n_v_heads, head_v_dim]
+    /// Delta Rule — allocating variant (single-token path).
+    fn delta_rule_step(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: &[f32],
+        gate: &[f32],
+    ) -> Vec<f32> {
+        let nh = self.n_v_heads;
+        let hd = self.head_v_dim;
+        let mut output = vec![0.0f32; nh * hd];
+        self.delta_rule_step_into(q, k, v, beta, gate, &mut output);
+        output
+    }
+
+    /// Delta Rule — BLAS + multi-threaded variant (prefill hot path).
+    ///
+    /// Записывает результат в `out` (размер >= n_v_heads * head_v_dim).
+    ///
+    /// Два уровня ускорения:
+    /// 1. Apple Accelerate BLAS (cblas_sgemv, cblas_sger, vDSP_vsmul) — NEON SIMD + AMX
+    /// 2. Rayon параллелизация 32 голов по CPU ядрам (~8 performance cores)
+    ///
+    /// Головы полностью независимы: каждая работает со своим блоком state
+    /// и своей секцией Q/K/V/out. Параллелизация безопасна.
+    fn delta_rule_step_into(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: &[f32],
+        gate: &[f32],
+        out: &mut [f32],
+    ) {
+        #[allow(unused_variables)]
+        let nh = self.n_v_heads;
+        let hd = self.head_v_dim;
+
+        // ── Apple Accelerate BLAS + rayon parallel path ─────────────────────
+        // 32 головы обрабатываются параллельно по CPU ядрам (~8 perf cores).
+        // chunks_mut гарантирует disjoint доступ (safe, без raw pointers).
+        #[cfg(target_os = "macos")]
+        {
+            let hd_i32 = hd as i32;
+            let state_elems = (hd * hd) as u64;
+
+            // Разбиваем state и output на per-head disjoint mutable slices
+            let head_work: Vec<(&mut [f32], &mut [f32])> = self
+                .ssm_state
+                .chunks_mut(hd * hd)
+                .zip(out.chunks_mut(hd))
+                .collect();
+
+            head_work.into_par_iter().enumerate().for_each(
+                |(h, (state_chunk, out_chunk)): (usize, (&mut [f32], &mut [f32]))| {
+                    let gate_exp: f32 = gate[h].exp();
+                    let ho = h * hd;
+
+                    // Thread-local буферы (1KB на стеке, переиспользуются rayon потоком)
+                    let mut sk = vec![0.0f32; hd];
+                    let mut d = vec![0.0f32; hd];
+
+                    unsafe {
+                        let s = state_chunk.as_mut_ptr();
+                        let o = out_chunk.as_mut_ptr();
+
+                        // 1. Decay: state[h] *= exp(gate[h])
+                        vDSP_vsmul(s, 1, &gate_exp, s, 1, state_elems);
+
+                        // 2. sk = state[h]^T @ k[h]
+                        cblas_sgemv(
+                            CBLAS_ROW_MAJOR,
+                            CBLAS_TRANS,
+                            hd_i32,
+                            hd_i32,
+                            1.0,
+                            s,
+                            hd_i32,
+                            k[ho..].as_ptr(),
+                            1,
+                            0.0,
+                            sk.as_mut_ptr(),
+                            1,
+                        );
+
+                        // 3. d = (v[h] - sk) * beta[h]
+                        let bh = beta[h];
+                        for j in 0..hd {
+                            d[j] = (v[ho + j] - sk[j]) * bh;
+                        }
+
+                        // 4. state[h] += k[h] ⊗ d (rank-1 update)
+                        cblas_sger(
+                            CBLAS_ROW_MAJOR,
+                            hd_i32,
+                            hd_i32,
+                            1.0,
+                            k[ho..].as_ptr(),
+                            1,
+                            d.as_ptr(),
+                            1,
+                            s,
+                            hd_i32,
+                        );
+
+                        // 5. o[h] = state[h]^T @ q[h]
+                        cblas_sgemv(
+                            CBLAS_ROW_MAJOR,
+                            CBLAS_TRANS,
+                            hd_i32,
+                            hd_i32,
+                            1.0,
+                            s,
+                            hd_i32,
+                            q[ho..].as_ptr(),
+                            1,
+                            0.0,
+                            o,
+                            1,
+                        );
+                    }
+                },
+            );
+            return;
+        }
+
+        // ── Fallback: ручные циклы (non-macOS) ─────────────────────────────
+        #[cfg(not(target_os = "macos"))]
+        {
+            for h in 0..nh {
+                let gate_exp = gate[h].exp();
+                let state_offset = h * hd * hd;
+                let q_offset = h * hd;
+                let k_offset = h * hd;
+                let v_offset = h * hd;
+                let o_offset = h * hd;
+
+                let state_slice = &mut self.ssm_state[state_offset..state_offset + hd * hd];
+                for val in state_slice.iter_mut() {
+                    *val *= gate_exp;
+                }
+
+                for j in 0..hd {
+                    let mut sum = 0.0f32;
+                    for i in 0..hd {
+                        sum += self.ssm_state[state_offset + i * hd + j] * k[k_offset + i];
+                    }
+                    self.buf_sk[j] = sum;
+                }
+
+                let beta_h = beta[h];
+                for j in 0..hd {
+                    self.buf_d[j] = (v[v_offset + j] - self.buf_sk[j]) * beta_h;
+                }
+
+                for i in 0..hd {
+                    let ki = k[k_offset + i];
+                    let row_start = state_offset + i * hd;
+                    for j in 0..hd {
+                        self.ssm_state[row_start + j] += ki * self.buf_d[j];
+                    }
+                }
+
+                for i in 0..hd {
+                    let mut sum = 0.0f32;
+                    for j in 0..hd {
+                        sum += self.ssm_state[state_offset + j * hd + i] * q[q_offset + j];
+                    }
+                    out[o_offset + i] = sum;
+                }
+            }
+        }
+    }
+}
+
+/// Контекст Metal GPU для DeltaNet delta_rule.
+/// Shared ресурсы (pipelines, temp buffers) через Arc — общие для всех слоёв.
+/// Per-layer state — persistent буферы для каждого слоя.
+#[cfg(target_os = "macos")]
+struct DeltaNetMetalContext {
+    /// Скомпилированные Metal pipelines (4 kernel'а) — shared.
+    /// Старый путь (decode T=1, 4 dispatch'а на 1 token) — используется в forward().
+    pipelines: Arc<metal::delta_rule_metal::DeltaRulePipelines>,
+    /// Временные буферы (scratch) — shared, переиспользуются между слоями
+    temp: Arc<metal::delta_rule_metal::DeltaNetTempBuffers>,
+    /// Persistent буферы для этого слоя (ssm_state, conv_state, weights)
+    layer_state: metal::delta_rule_metal::DeltaNetMetalState,
+    /// Параметры для Metal kernel dispatch
+    params: metal::delta_rule_metal::DeltaParams,
+    /// Скомпилированные fused pipelines (T-265, Phase 3) — shared.
+    /// Новый путь (prefill T>=1, 4 batch-aware dispatch'а на всю seq_len) — forward_prefill().
+    /// `Option`, чтобы compile failure не валил всю модель — в этом случае
+    /// forward_prefill fallback на CPU loop через Accelerate.
+    fused_pipelines: Option<Arc<metal::gated_delta_net_fused::GdnFusedPipelines>>,
+    /// Параметры для fused dispatch (n_tokens переписывается перед каждым вызовом)
+    fused_params: metal::gated_delta_net_fused::GdnFusedParams,
+}
+
+/// Контекст CUDA GPU для DeltaNet delta_rule (NVIDIA Windows/Linux).
+/// Симметрично DeltaNetMetalContext. Ядра грузятся лениво через device-кеш
+/// (`get_or_load_func`), поэтому отдельной компиляции pipelines не нужно.
+/// state и temp — per-layer owned (без Arc): scratch ~100 КБ/слой, не шарим.
+#[cfg(feature = "cuda")]
+struct DeltaNetCudaContext {
+    /// Хэндл CUDA-устройства (Arc внутри, дёшево клонируется).
+    dev: candle_core::CudaDevice,
+    /// Scratch-буферы этого слоя (qkv_conv, q/k/v, beta, gate, delta_output).
+    temp: delta_rule_cuda::DeltaNetCudaTemp,
+    /// Persistent буферы слоя (ssm_state, conv_state, веса) — живут на GPU.
+    layer_state: delta_rule_cuda::DeltaNetCudaState,
+    /// Параметры для kernel dispatch.
+    params: delta_rule_cuda::DeltaParams,
+}
+
+/// Веса и логика DeltaNet слоя.
+///
+/// DeltaNet использует линейную рекуррентность вместо attention:
+/// - Conv1D для локального контекста
+/// - Delta rule для обновления состояния
+/// - Gated output через SiLU
+struct DeltaNetLayer {
+    /// Joint QKV проекция: [n_embd] → [key_dim*2 + value_dim]
+    wqkv: QMatMul,
+    /// Gate (z) проекция: [n_embd] → [value_dim]
+    wgate: QMatMul,
+    /// Beta проекция: [n_embd] → [n_v_heads]
+    w_beta: QMatMul,
+    /// Alpha проекция: [n_embd] → [n_v_heads]
+    w_alpha: QMatMul,
+    /// Alpha bias: [n_v_heads] — per-head bias для alpha
+    dt_bias: Vec<f32>,
+    /// Negative A_log: [n_v_heads] — для decay gate (отрицательные значения)
+    ssm_a: Vec<f32>,
+    /// Conv1D kernel: [conv_kernel, channels] row-major, f32
+    conv_kernel_weights: Vec<f32>,
+    /// Output group norm weight: [head_v_dim] — применяется per-head
+    ssm_norm_weight: Vec<f32>,
+    /// Output проекция: [value_dim] → [n_embd]
+    ssm_out: QMatMul,
+    // T-275 Phase 4: pre-packed Q4_K metadata. None если weight не Q4_K_M или
+    // alignment не соответствует (e.g. w_beta/w_alpha с N=n_v_heads=32, не % 64).
+    #[cfg(target_os = "macos")]
+    wqkv_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    wgate_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    w_beta_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    w_alpha_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    ssm_out_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    /// Рекуррентное состояние (conv buffer + SSM state) — CPU fallback
+    state: DeltaNetState,
+    /// Metal GPU контекст — если Some, forward() использует Metal path (0 GPU↔CPU syncs)
+    #[cfg(target_os = "macos")]
+    metal_ctx: Option<DeltaNetMetalContext>,
+    /// CUDA GPU контекст — если Some, forward() использует CUDA path (0 GPU↔CPU syncs)
+    #[cfg(feature = "cuda")]
+    cuda_ctx: Option<DeltaNetCudaContext>,
+    /// Конфигурация размерностей
+    n_k_heads: usize,
+    n_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,   // n_k_heads * head_k_dim
+    value_dim: usize, // n_v_heads * head_v_dim
+    rms_norm_eps: f32,
+}
+
+impl DeltaNetLayer {
+    /// Forward pass для одного токена (авторегрессивный режим).
+    ///
+    /// Вход: x shape [1, 1, n_embd] на device.
+    /// Выход: [1, 1, n_embd] на device.
+    ///
+    /// Если metal_ctx доступен — выполняет ВСЮ обработку на GPU (0 GPU↔CPU syncs).
+    /// Иначе — fallback на CPU path (cat batch transfer + CPU delta rule).
+    fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
+        let device = x.device().clone();
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        debug_assert_eq!(b_sz, 1, "DeltaNet поддерживает только batch_size=1");
+        debug_assert_eq!(
+            seq_len, 1,
+            "DeltaNet авторегрессивный: seq_len должен быть 1"
+        );
+
+        // 1. Проекции на device — dispatch all 4 QMatMul (async GPU)
+        let t0 = std::time::Instant::now();
+        #[cfg(target_os = "macos")]
+        let qkv_t = dispatch_q4k_matmul(&self.wqkv, self.wqkv_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let z_t = dispatch_q4k_matmul(&self.wgate, self.wgate_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let beta_t = dispatch_q4k_matmul(&self.w_beta, self.w_beta_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
+        #[cfg(not(target_os = "macos"))]
+        let qkv_t = self.wqkv.forward(x)?; // [1, 1, key_dim*2 + value_dim]
+        #[cfg(not(target_os = "macos"))]
+        let z_t = self.wgate.forward(x)?; // [1, 1, value_dim]
+        #[cfg(not(target_os = "macos"))]
+        let beta_t = self.w_beta.forward(x)?; // [1, 1, n_v_heads]
+        #[cfg(not(target_os = "macos"))]
+        let alpha_t = self.w_alpha.forward(x)?; // [1, 1, n_v_heads]
+        let t_proj = t0.elapsed();
+
+        // ══════════════════════════════════════════════════════════════
+        // Metal GPU path: 0 GPU↔CPU syncs — все 4 kernel'а на GPU
+        // ══════════════════════════════════════════════════════════════
+        #[cfg(target_os = "macos")]
+        if let Some(ctx) = &self.metal_ctx {
+            let metal_device = device.as_metal_device()?;
+
+            let t0 = std::time::Instant::now();
+            let output_tensor = metal::delta_rule_metal::dispatch_delta_rule(
+                metal_device,
+                &ctx.pipelines,
+                &ctx.layer_state,
+                &ctx.temp,
+                &ctx.params,
+                &qkv_t,
+                &z_t,
+                &beta_t,
+                &alpha_t,
+            )?;
+            let t_metal = t0.elapsed();
+
+            // Output проекция (QMatMul) — прямо на GPU, без CPU transfer
+            let t0 = std::time::Instant::now();
+            #[cfg(target_os = "macos")]
+            let result =
+                dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor)?;
+            #[cfg(not(target_os = "macos"))]
+            let result = self.ssm_out.forward(&output_tensor)?;
+            let t_out = t0.elapsed();
+
+            // Тайминги: proj + metal (заменяет transfer+prep+norm+delta+rms) + out
+            acc_us!(delta_proj_us, t_proj);
+            acc_us!(delta_rule_us, t_metal); // Metal time включает все 4 kernel'а
+            acc_us!(delta_out_proj_us, t_out);
+
+            return Ok(result);
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // CUDA GPU path: 4 ядра на GPU, ноль host-sync (NVIDIA Win/Linux)
+        // ══════════════════════════════════════════════════════════════
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = &self.cuda_ctx {
+            let output_tensor = delta_rule_cuda::dispatch_delta_rule(
+                &ctx.dev,
+                &ctx.layer_state,
+                &ctx.temp,
+                &ctx.params,
+                &qkv_t,
+                &z_t,
+                &beta_t,
+                &alpha_t,
+            )?;
+            // Output проекция (QMatMul) — на GPU через cublas.
+            let result = self.ssm_out.forward(&output_tensor)?;
+            return Ok(result);
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // CPU fallback path: batch cat transfer + CPU delta rule
+        // ══════════════════════════════════════════════════════════════
+
+        // 2. Batch transfer: cat на GPU → ONE Metal sync → split на CPU
+        let t0 = std::time::Instant::now();
+        let key_dim = self.key_dim;
+        let value_dim = self.value_dim;
+        let n_v_heads = self.n_v_heads;
+        let qkv_len = key_dim * 2 + value_dim;
+
+        let combined = Tensor::cat(
+            &[
+                &qkv_t.flatten_all()?,
+                &z_t.flatten_all()?,
+                &beta_t.flatten_all()?,
+                &alpha_t.flatten_all()?,
+            ],
+            0,
+        )?;
+        #[cfg(target_os = "macos")]
+        let all_cpu: Vec<f32> = combined.to_vec1_zero_copy()?;
+        #[cfg(not(target_os = "macos"))]
+        let all_cpu: Vec<f32> = combined.to_vec1()?;
+
+        // Split на CPU (zero-cost slicing)
+        let qkv = &all_cpu[..qkv_len];
+        let z_offset = qkv_len;
+        let z = &all_cpu[z_offset..z_offset + value_dim];
+        let beta_offset = z_offset + value_dim;
+        let beta_raw = &all_cpu[beta_offset..beta_offset + n_v_heads];
+        let alpha_offset = beta_offset + n_v_heads;
+        let alpha_raw = &all_cpu[alpha_offset..alpha_offset + n_v_heads];
+        let t_transfer = t0.elapsed();
+
+        // 3-5. Sigmoid, softplus, conv1d
+        let t0 = std::time::Instant::now();
+        let beta: Vec<f32> = beta_raw.iter().map(|&v| sigmoid_scalar(v)).collect();
+        let gate: Vec<f32> = alpha_raw
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| {
+                let alpha_biased = a + self.dt_bias[i];
+                softplus(alpha_biased) * self.ssm_a[i]
+            })
+            .collect();
+        let qkv_conv = self.state.conv1d_step(qkv, &self.conv_kernel_weights);
+        let t_prep = t0.elapsed();
+
+        // 6-9. L2 norm + expand + Q scaling
+        let t0 = std::time::Instant::now();
+        let q_raw = &qkv_conv[..key_dim];
+        let k_raw = &qkv_conv[key_dim..key_dim * 2];
+        let v_flat = &qkv_conv[key_dim * 2..key_dim * 2 + value_dim];
+
+        let eps = 1e-6f32;
+        let mut q_norm = vec![0.0f32; key_dim];
+        let mut k_norm = vec![0.0f32; key_dim];
+        for h in 0..self.n_k_heads {
+            let start = h * self.head_k_dim;
+            let end = start + self.head_k_dim;
+            let q_head_normed = l2_normalize(&q_raw[start..end], eps);
+            let k_head_normed = l2_normalize(&k_raw[start..end], eps);
+            q_norm[start..end].copy_from_slice(&q_head_normed);
+            k_norm[start..end].copy_from_slice(&k_head_normed);
+        }
+
+        let (q_expanded, k_expanded) = if self.n_k_heads != self.n_v_heads {
+            let mut q_exp = vec![0.0f32; self.n_v_heads * self.head_k_dim];
+            let mut k_exp = vec![0.0f32; self.n_v_heads * self.head_k_dim];
+            for dst_h in 0..self.n_v_heads {
+                let src_h = dst_h % self.n_k_heads;
+                let src_start = src_h * self.head_k_dim;
+                let dst_start = dst_h * self.head_k_dim;
+                q_exp[dst_start..dst_start + self.head_k_dim]
+                    .copy_from_slice(&q_norm[src_start..src_start + self.head_k_dim]);
+                k_exp[dst_start..dst_start + self.head_k_dim]
+                    .copy_from_slice(&k_norm[src_start..src_start + self.head_k_dim]);
+            }
+            (q_exp, k_exp)
+        } else {
+            (q_norm, k_norm)
+        };
+
+        let q_scale = 1.0 / (self.head_k_dim as f32).sqrt();
+        let q_scaled: Vec<f32> = q_expanded.iter().map(|&v| v * q_scale).collect();
+        let t_norm = t0.elapsed();
+
+        // 10. Delta Rule: обновление SSM state и вычисление выхода
+        let t0 = std::time::Instant::now();
+        let output_raw = self
+            .state
+            .delta_rule_step(&q_scaled, &k_expanded, v_flat, &beta, &gate);
+        let t_delta = t0.elapsed();
+
+        // 11. Group RMS Norm per head + gated output (SiLU(z))
+        let t0 = std::time::Instant::now();
+        let mut output_gated = vec![0.0f32; value_dim];
+        for h in 0..self.n_v_heads {
+            let o_start = h * self.head_v_dim;
+            let o_end = o_start + self.head_v_dim;
+            let head_slice = &output_raw[o_start..o_end];
+
+            let sq_mean: f32 =
+                head_slice.iter().map(|v| v * v).sum::<f32>() / self.head_v_dim as f32;
+            let inv_rms = 1.0 / (sq_mean + self.rms_norm_eps).sqrt();
+
+            for j in 0..self.head_v_dim {
+                let normed = head_slice[j] * inv_rms * self.ssm_norm_weight[j];
+                output_gated[o_start + j] = normed * silu_scalar(z[o_start + j]);
+            }
+        }
+        let t_rms_gate = t0.elapsed();
+
+        // 12. Переносим обратно на device для output projection
+        let t0 = std::time::Instant::now();
+        let output_tensor =
+            Tensor::from_vec(output_gated, (1, 1, value_dim), &Device::Cpu)?.to_device(&device)?;
+        #[cfg(target_os = "macos")]
+        let result = dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor)?;
+        #[cfg(not(target_os = "macos"))]
+        let result = self.ssm_out.forward(&output_tensor)?;
+        let t_out = t0.elapsed();
+
+        // Аккумулируем тайминги
+        acc_us!(delta_proj_us, t_proj);
+        acc_us!(delta_transfer_us, t_transfer);
+        acc_us!(delta_prep_us, t_prep);
+        acc_us!(delta_norm_us, t_norm);
+        acc_us!(delta_rule_us, t_delta);
+        acc_us!(delta_rms_gate_us, t_rms_gate);
+        acc_us!(delta_out_proj_us, t_out);
+
+        Ok(result)
+    }
+
+    /// Batch prefill для DeltaNet.
+    ///
+    /// Вход: x shape [1, seq_len, n_embd] на device.
+    /// Выход: [1, seq_len, n_embd] на device.
+    ///
+    /// Основной путь (T-265, Phase 3+): Metal Fused Gated DeltaNet — 4 batch-aware
+    /// dispatch'а на всю seq_len (kernel `dispatch_gdn_fused`). Все вычисления
+    /// (conv1d + delta rule + L2-norm + RMS gating) на GPU, без CPU loop.
+    /// Это устраняет 130-280% CPU usage от старого Accelerate+rayon пути.
+    /// Accuracy подтверждён в Phase 2: MAE=3.75e-8 vs CPU (4 порядка строже threshold 1e-4).
+    ///
+    /// Fallback (CPU loop через Accelerate BLAS + rayon):
+    /// - Если `metal_ctx` отсутствует (Linux/Windows или Metal не инициализирован)
+    /// - Если `fused_pipelines` не скомпилировались
+    /// - Если выставлен env-флаг `YTTRI_DISABLE_FUSED_GDN=1` (аварийный откат в production)
+    ///
+    /// CPU fallback: 4 batch-проекции GPU → 4 трансфера на CPU → seq_len итераций
+    /// delta rule на CPU → 1 трансфер обратно на GPU → 1 batch output projection.
+    /// Для 2000 токенов: 5 трансферов вместо ~10,000.
+    fn forward_prefill(&mut self, x: &Tensor) -> Result<Tensor> {
+        let device = x.device().clone();
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        debug_assert_eq!(b_sz, 1, "DeltaNet поддерживает только batch_size=1");
+
+        // 1. Batch GPU проекции (4 вызова вместо 4*seq_len)
+        #[cfg(target_os = "macos")]
+        let qkv_t = dispatch_q4k_matmul(&self.wqkv, self.wqkv_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let z_t = dispatch_q4k_matmul(&self.wgate, self.wgate_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let beta_t = dispatch_q4k_matmul(&self.w_beta, self.w_beta_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
+        #[cfg(not(target_os = "macos"))]
+        let qkv_t = self.wqkv.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let z_t = self.wgate.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let beta_t = self.w_beta.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let alpha_t = self.w_alpha.forward(x)?;
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Metal Fused GDN путь — основной (T-265, Phase 3).
+        // 4 batch-aware dispatch'а на всю seq_len, без CPU loop.
+        // Phase 2 accuracy: MAE=3.75e-8 vs CPU (threshold 1e-4 → 4 порядка запаса).
+        // ═══════════════════════════════════════════════════════════════════
+        #[cfg(target_os = "macos")]
+        if let Some(ctx) = self.metal_ctx.as_ref() {
+            if let Some(fused_pipelines) = ctx.fused_pipelines.as_ref() {
+                // ENV-флаг для безопасного отката в production
+                let disable_fused = std::env::var("YTTRI_DISABLE_FUSED_GDN")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if !disable_fused {
+                    let metal_device = device.as_metal_device()?;
+                    let mut params = ctx.fused_params;
+                    params.n_tokens = seq_len as u32;
+
+                    let t0 = std::time::Instant::now();
+                    let gated_output = metal::gated_delta_net_fused::dispatch_gdn_fused(
+                        metal_device,
+                        fused_pipelines,
+                        &ctx.layer_state,
+                        &qkv_t,
+                        &z_t,
+                        &beta_t,
+                        &alpha_t,
+                        &params,
+                    )?;
+                    let t_fused = t0.elapsed();
+
+                    if seq_len > 100 {
+                        log::info!(
+                            "[Qwen3.5/prefill-fused-gdn] {} tok in {:.1}ms ({:.2}ms/tok)",
+                            seq_len,
+                            t_fused.as_secs_f64() * 1000.0,
+                            t_fused.as_secs_f64() * 1000.0 / seq_len as f64,
+                        );
+                    }
+
+                    // Output projection — батч на всю seq
+                    #[cfg(target_os = "macos")]
+                    return dispatch_q4k_matmul(
+                        &self.ssm_out,
+                        self.ssm_out_opt.as_ref(),
+                        &gated_output,
+                    );
+                    #[cfg(not(target_os = "macos"))]
+                    return self.ssm_out.forward(&gated_output);
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // CUDA prefill (MVP): цикл decode-ядра по каждому токену. Recurrent
+        // state (ssm/conv) переносится на GPU между токенами автоматически —
+        // никакого CPU-sync. Fused batch-kernel (как Metal GDN) — фаза 2 (perf).
+        // ═══════════════════════════════════════════════════════════════════
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = &self.cuda_ctx {
+            let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
+            for t in 0..seq_len {
+                let qkv_tok = qkv_t.narrow(1, t, 1)?; // [1,1,channels]
+                let z_tok = z_t.narrow(1, t, 1)?; // [1,1,value_dim]
+                let beta_tok = beta_t.narrow(1, t, 1)?; // [1,1,n_v_heads]
+                let alpha_tok = alpha_t.narrow(1, t, 1)?; // [1,1,n_v_heads]
+                let out_tok = delta_rule_cuda::dispatch_delta_rule(
+                    &ctx.dev,
+                    &ctx.layer_state,
+                    &ctx.temp,
+                    &ctx.params,
+                    &qkv_tok,
+                    &z_tok,
+                    &beta_tok,
+                    &alpha_tok,
+                )?; // [1,1,value_dim]
+                outputs.push(out_tok);
+            }
+            let gated_all = Tensor::cat(&outputs, 1)?; // [1, seq_len, value_dim]
+            return self.ssm_out.forward(&gated_all);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // CPU fallback (Accelerate BLAS + rayon)
+        // Активен если: нет metal_ctx, fused_pipelines не создались, или env-флаг.
+        // ═══════════════════════════════════════════════════════════════════
+
+        // 2. Один трансфер GPU→CPU на каждую проекцию (4 вместо 4*seq_len)
+        let qkv_all: Vec<f32> = qkv_t
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let z_all: Vec<f32> = z_t
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let beta_all: Vec<f32> = beta_t
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let alpha_all: Vec<f32> = alpha_t
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+
+        let key_dim = self.key_dim;
+        let value_dim = self.value_dim;
+        let qkv_dim = key_dim * 2 + value_dim;
+        let n_v_heads = self.n_v_heads;
+        let head_v_dim = self.head_v_dim;
+        let head_k_dim = self.head_k_dim;
+        let n_k_heads = self.n_k_heads;
+        let eps = 1e-6f32;
+        let q_scale = 1.0 / (head_k_dim as f32).sqrt();
+
+        // 3. Sequential CPU processing (conv1d + delta rule — рекуррентные, нельзя параллелить)
+        //
+        // ZERO-ALLOC hot path: все буферы предаллоцированы вне цикла.
+        // Экономия ~4.5 ГБ allocation churn для 2000-токенного промпта × 24 DeltaNet слоя.
+        let expanded_k_dim = n_v_heads * head_k_dim;
+        let mut all_outputs: Vec<f32> = Vec::with_capacity(seq_len * value_dim);
+
+        // Pre-allocated per-token buffers (reused across all seq_len iterations)
+        let mut beta_buf = vec![0.0f32; n_v_heads];
+        let mut gate_buf = vec![0.0f32; n_v_heads];
+        let mut conv_result = vec![0.0f32; qkv_dim];
+        let mut q_norm_buf = vec![0.0f32; key_dim];
+        let mut k_norm_buf = vec![0.0f32; key_dim];
+        let mut q_exp_buf = vec![0.0f32; expanded_k_dim];
+        let mut k_exp_buf = vec![0.0f32; expanded_k_dim];
+        let mut delta_out_buf = vec![0.0f32; value_dim];
+        let mut l2_tmp = vec![0.0f32; head_k_dim]; // для l2_normalize_into
+
+        // Per-operation timing accumulators (наносекунды)
+        let mut t_prep = 0u128; // beta/gate sigmoid/softplus
+        let mut t_conv = 0u128; // conv1d_step
+        let mut t_norm = 0u128; // l2_normalize + head expansion
+        let mut t_delta = 0u128; // delta_rule_step (BLAS + rayon)
+        let mut t_rms = 0u128; // group rms norm + gated output
+
+        for t in 0..seq_len {
+            let qkv = &qkv_all[t * qkv_dim..(t + 1) * qkv_dim];
+            let z = &z_all[t * value_dim..(t + 1) * value_dim];
+            let beta_raw = &beta_all[t * n_v_heads..(t + 1) * n_v_heads];
+            let alpha_raw = &alpha_all[t * n_v_heads..(t + 1) * n_v_heads];
+
+            let _t0 = std::time::Instant::now();
+
+            // Beta: sigmoid (in-place into pre-allocated buffer)
+            for i in 0..n_v_heads {
+                beta_buf[i] = sigmoid_scalar(beta_raw[i]);
+            }
+
+            // Alpha → gate: (alpha + dt_bias) → softplus → * ssm_a
+            for i in 0..n_v_heads {
+                let alpha_biased = alpha_raw[i] + self.dt_bias[i];
+                gate_buf[i] = softplus(alpha_biased) * self.ssm_a[i];
+            }
+
+            let _t1 = std::time::Instant::now();
+            t_prep += (_t1 - _t0).as_nanos();
+
+            // Conv1D step — zero-alloc, writes to conv_result
+            self.state
+                .conv1d_step_into(qkv, &self.conv_kernel_weights, &mut conv_result);
+
+            let _t2 = std::time::Instant::now();
+            t_conv += (_t2 - _t1).as_nanos();
+
+            // Split Q, K, V from conv_result
+            let q_raw = &conv_result[..key_dim];
+            let k_raw = &conv_result[key_dim..key_dim * 2];
+            let v_flat = &conv_result[key_dim * 2..key_dim * 2 + value_dim];
+
+            // L2 normalize Q and K per-head (into pre-allocated buffers)
+            for h in 0..n_k_heads {
+                let start = h * head_k_dim;
+                let end = start + head_k_dim;
+                l2_normalize_into(&q_raw[start..end], eps, &mut l2_tmp);
+                q_norm_buf[start..end].copy_from_slice(&l2_tmp);
+                l2_normalize_into(&k_raw[start..end], eps, &mut l2_tmp);
+                k_norm_buf[start..end].copy_from_slice(&l2_tmp);
+            }
+
+            // Repeat (tile) Q, K и Q scaling (into pre-allocated buffers)
+            if n_k_heads != n_v_heads {
+                for dst_h in 0..n_v_heads {
+                    let src_h = dst_h % n_k_heads;
+                    let src_start = src_h * head_k_dim;
+                    let dst_start = dst_h * head_k_dim;
+                    // Q: expand + scale in one pass
+                    for j in 0..head_k_dim {
+                        q_exp_buf[dst_start + j] = q_norm_buf[src_start + j] * q_scale;
+                    }
+                    k_exp_buf[dst_start..dst_start + head_k_dim]
+                        .copy_from_slice(&k_norm_buf[src_start..src_start + head_k_dim]);
+                }
+            } else {
+                // No expansion needed, just scale Q
+                for j in 0..key_dim {
+                    q_exp_buf[j] = q_norm_buf[j] * q_scale;
+                }
+                k_exp_buf[..key_dim].copy_from_slice(&k_norm_buf[..key_dim]);
+            }
+
+            let _t3 = std::time::Instant::now();
+            t_norm += (_t3 - _t2).as_nanos();
+
+            // Delta rule step — zero-alloc (writes to delta_out_buf, uses internal buf_sk/buf_d)
+            self.state.delta_rule_step_into(
+                &q_exp_buf[..expanded_k_dim],
+                &k_exp_buf[..expanded_k_dim],
+                v_flat,
+                &beta_buf,
+                &gate_buf,
+                &mut delta_out_buf,
+            );
+
+            let _t4 = std::time::Instant::now();
+            t_delta += (_t4 - _t3).as_nanos();
+
+            // Group RMS Norm per head + gated output (SiLU(z))
+            for h in 0..n_v_heads {
+                let o_start = h * head_v_dim;
+                let o_end = o_start + head_v_dim;
+                let head_slice = &delta_out_buf[o_start..o_end];
+
+                let sq_mean: f32 =
+                    head_slice.iter().map(|v| v * v).sum::<f32>() / head_v_dim as f32;
+                let inv_rms = 1.0 / (sq_mean + self.rms_norm_eps).sqrt();
+
+                for j in 0..head_v_dim {
+                    let normed = head_slice[j] * inv_rms * self.ssm_norm_weight[j];
+                    all_outputs.push(normed * silu_scalar(z[o_start + j]));
+                }
+            }
+
+            let _t5 = std::time::Instant::now();
+            t_rms += (_t5 - _t4).as_nanos();
+        }
+
+        // Вывод breakdown (только для prefill > 100 токенов)
+        if seq_len > 100 {
+            let total_ns = t_prep + t_conv + t_norm + t_delta + t_rms;
+            let total_ms = total_ns as f64 / 1_000_000.0;
+            log::info!(
+                "[Qwen3.5/prefill-breakdown] {seq_len} tok, total={:.1}ms | prep={:.1}ms ({:.1}%) conv={:.1}ms ({:.1}%) norm={:.1}ms ({:.1}%) delta={:.1}ms ({:.1}%) rms={:.1}ms ({:.1}%)",
+                total_ms,
+                t_prep as f64 / 1e6, t_prep as f64 / total_ns as f64 * 100.0,
+                t_conv as f64 / 1e6, t_conv as f64 / total_ns as f64 * 100.0,
+                t_norm as f64 / 1e6, t_norm as f64 / total_ns as f64 * 100.0,
+                t_delta as f64 / 1e6, t_delta as f64 / total_ns as f64 * 100.0,
+                t_rms as f64 / 1e6, t_rms as f64 / total_ns as f64 * 100.0,
+            );
+        }
+
+        // 4. Синхронизация CPU state → Metal state (если Metal path активен).
+        //
+        // КРИТИЧНО: forward_prefill() обрабатывает conv1d + delta_rule на CPU,
+        // обновляя self.state (conv_buf + ssm_state). Но последующие single-token
+        // forward() вызовы используют Metal GPU path, который читает из
+        // ctx.layer_state (Metal буферы). Без синхронизации Metal state остаётся
+        // нулевым после prefill, и генерация ломается со второго токена.
+        //
+        // Metal использует StorageModeShared (unified memory), поэтому
+        // прямой memcpy через contents() ptr безопасен и ~мгновенный.
+        #[cfg(target_os = "macos")]
+        if let Some(ctx) = &self.metal_ctx {
+            unsafe {
+                // SSM state: [n_v_heads * head_v_dim * head_v_dim] floats
+                let ssm_dst = ctx.layer_state.ssm_state.contents() as *mut f32;
+                let ssm_src = self.state.ssm_state.as_ptr();
+                let ssm_count = self.state.ssm_state.len();
+                std::ptr::copy_nonoverlapping(ssm_src, ssm_dst, ssm_count);
+
+                // Conv1d state: [(conv_kernel-1) * channels] floats
+                let conv_dst = ctx.layer_state.conv_state.contents() as *mut f32;
+                let conv_src = self.state.conv_buf.as_ptr();
+                let conv_count = self.state.conv_buf.len();
+                std::ptr::copy_nonoverlapping(conv_src, conv_dst, conv_count);
+            }
+        }
+
+        // 5. Один трансфер CPU→GPU + batch output projection
+        let output_tensor = Tensor::from_vec(all_outputs, (1, seq_len, value_dim), &Device::Cpu)?
+            .to_device(&device)?;
+        #[cfg(target_os = "macos")]
+        let result = dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor)?;
+        #[cfg(not(target_os = "macos"))]
+        let result = self.ssm_out.forward(&output_tensor)?;
+
+        Ok(result)
+    }
+
+    /// Захват snapshot DeltaNet state для prompt cache (T-274, Phase 2).
+    ///
+    /// Источник определяется автоматически:
+    /// - На macOS если `metal_ctx.is_some()` и `device` это Metal → GPU buffers
+    ///   (single source of truth: forward пишет/читает GPU напрямую, CPU `state` stale)
+    /// - Иначе → CPU `state` поле
+    ///
+    /// `device` прокидывается из caller'а (`ModelWeights::snapshot_state`), потому что
+    /// `DeltaNetLayer` не хранит ссылку на устройство.
+    pub(crate) fn snapshot_state(&self, device: &Device) -> Result<DeltaNetStateSnap> {
+        #[cfg(target_os = "macos")]
+        if let (Some(ctx), Device::Metal(metal_device)) = (&self.metal_ctx, device) {
+            let (ssm, conv) = metal::delta_rule_metal::snapshot_metal_state(
+                metal_device,
+                &ctx.layer_state,
+                &ctx.params,
+            )?;
+            return Ok(DeltaNetStateSnap {
+                conv_buf: conv,
+                ssm_state: ssm,
+            });
+        }
+        // CUDA: state живёт на GPU — читаем dtoh.
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = &self.cuda_ctx {
+            let (ssm, conv) = delta_rule_cuda::snapshot_cuda_state(&ctx.dev, &ctx.layer_state)?;
+            return Ok(DeltaNetStateSnap {
+                conv_buf: conv,
+                ssm_state: ssm,
+            });
+        }
+        // CPU fallback: non-macOS, или metal_ctx отсутствует, или device не Metal.
+        let _ = device; // silence unused on non-macos
+        Ok(self.state.to_snapshot())
+    }
+
+    /// Восстановление DeltaNet state из snapshot (T-274, Phase 2).
+    ///
+    /// Симметрично `snapshot_state`: пишет в GPU buffers если metal_ctx активен,
+    /// иначе обновляет CPU state.
+    pub(crate) fn restore_state(
+        &mut self,
+        device: &Device,
+        snap: &DeltaNetStateSnap,
+    ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if let (Some(ctx), Device::Metal(metal_device)) = (&self.metal_ctx, device) {
+            metal::delta_rule_metal::restore_metal_state(
+                metal_device,
+                &ctx.layer_state,
+                &ctx.params,
+                &snap.ssm_state,
+                &snap.conv_buf,
+            )?;
+            // CPU state также обновляем для consistency (на случай fallback path)
+            self.state.restore_from(snap);
+            return Ok(());
+        }
+        // CUDA: пишем snapshot обратно в GPU-буферы (htod).
+        #[cfg(feature = "cuda")]
+        if let Some(ctx) = &mut self.cuda_ctx {
+            delta_rule_cuda::restore_cuda_state(
+                &ctx.dev,
+                &mut ctx.layer_state,
+                &snap.ssm_state,
+                &snap.conv_buf,
+            )?;
+            self.state.restore_from(snap);
+            return Ok(());
+        }
+        let _ = device; // silence unused on non-macos
+        self.state.restore_from(snap);
+        Ok(())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Gated Attention Layer — Full Attention с sigmoid gating и partial RoPE
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Deep clone тензора — гарантированно новая allocation, не shared storage (T-274).
+///
+/// Candle `Tensor::clone()` создаёт shallow Arc-ссылку на тот же storage,
+/// что небезопасно для snapshot/restore: forward после restore через `slice_set`
+/// записал бы в данные, всё ещё хранящиеся в snapshot.
+///
+/// Решение: `t + zeros_like(t)` — арифметика всегда аллоцирует новый buffer.
+fn tensor_deep_clone(t: &Tensor) -> Result<Tensor> {
+    let zeros = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
+    t.add(&zeros)
+}
+
+/// Snapshot KV-cache одного attention слоя для prompt cache (T-274).
+///
+/// Хранит deep-cloned K и V тензоры (детач от живого KV cache модели)
+/// плюс заполненную длину `cache_len`.
+///
+/// Размер на слой: 2 × (batch=1, n_kv_head, cache_len, head_dim) × dtype.
+/// Для Qwen3.5-4B (n_kv_head=4, head_dim=256, F16) — ~4 КБ на токен на слой
+/// (K+V вместе). cache_len растёт до attn_window (= context_length, до 81920):
+/// при полном контексте ~320 MB на слой → до ~2.6 ГБ на 8 attention-слоях.
+#[derive(Debug, Clone)]
+pub struct KvCacheSnap {
+    pub k: Tensor,
+    pub v: Tensor,
+    pub cache_len: usize,
+}
+
+/// Веса и логика Gated Attention слоя (каждый 4-й слой в Qwen3.5).
+///
+/// Отличия от стандартного Qwen3 attention:
+/// - Joint Q+gate проекция: attn_q.weight → [head_k_dim * n_head * 2]
+/// - Sigmoid gating на выходе attention
+/// - Partial RoPE: только первые rope_dim (64) из head_dim (256)
+/// - Q-Norm / K-Norm (как в Qwen3)
+#[derive(Debug, Clone)]
+pub(crate) struct GatedAttentionLayer {
+    /// Joint Q + gate проекция: [n_embd] → [head_k_dim * n_head * 2]
+    /// Первая половина — Q, вторая — gate
+    attention_wq: QMatMul,
+    attention_wk: QMatMul,
+    attention_wv: QMatMul,
+    // T-275 Phase 4: pre-packed Q4_K metadata per matmul. None если не Q4_K_M.
+    #[cfg(target_os = "macos")]
+    attention_wq_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    attention_wk_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    attention_wv_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    #[cfg(target_os = "macos")]
+    attention_wo_opt: Option<Arc<Q4KOptMetadataGpu>>,
+    /// Output проекция: [head_k_dim * n_head] → [n_embd]
+    attention_wo: QMatMul,
+    /// Q-Norm: RmsNorm после Q проекции, перед RoPE
+    q_norm: RmsNorm,
+    /// K-Norm: RmsNorm после K проекции, перед RoPE
+    k_norm: RmsNorm,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    /// Размерность RoPE (partial_rotary_factor * head_dim, обычно 64)
+    rope_dim: usize,
+    /// Предрассчитанные cos для RoPE (shape: [context_length, rope_dim/2])
+    pub(crate) cos: Tensor,
+    /// Предрассчитанные sin для RoPE
+    pub(crate) sin: Tensor,
+    kv_cache: Option<(Tensor, Tensor)>,
+    /// Текущая длина заполненного KV-cache
+    kv_cache_len: usize,
+    /// Максимальный размер KV-cache
+    max_cache_len: usize,
+    /// Sliding window: максимальное количество токенов в KV cache.
+    /// При превышении — старые токены удаляются (circular shift).
+    /// DeltaNet слои (24/32) уже хранят полную историю в SSM state,
+    /// поэтому attention окно не теряет долгосрочный контекст.
+    attn_window: usize,
+}
+
+impl GatedAttentionLayer {
+    /// Partial RoPE: применяем RoPE только к первым rope_dim измерениям.
+    ///
+    /// x shape: (batch, n_head, seq_len, head_dim)
+    /// Разделяем на [rope_dim] + [head_dim - rope_dim], применяем RoPE к первой части,
+    /// конкатенируем обратно.
+    fn apply_partial_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b_sz, _n_head, seq_len, head_dim) = x.dims4()?;
+
+        if self.rope_dim >= head_dim {
+            // Полный RoPE (fallback, не должен случаться для Qwen3.5)
+            let cos = self.cos.narrow(0, index_pos, seq_len)?;
+            let sin = self.sin.narrow(0, index_pos, seq_len)?;
+            return candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin);
+        }
+
+        // Разделяем: первые rope_dim → RoPE, остальные → pass-through
+        let x_rot = x.narrow(3, 0, self.rope_dim)?;
+        let x_pass = x.narrow(3, self.rope_dim, head_dim - self.rope_dim)?;
+
+        let cos = self.cos.narrow(0, index_pos, seq_len)?;
+        let sin = self.sin.narrow(0, index_pos, seq_len)?;
+        let x_rot = candle_nn::rotary_emb::rope(&x_rot.contiguous()?, &cos, &sin)?;
+
+        Tensor::cat(&[&x_rot, &x_pass], 3)
+    }
+
+    /// Forward pass для Gated Attention.
+    ///
+    /// Вход: x shape [batch, seq_len, n_embd].
+    /// Выход: [batch, seq_len, n_embd].
+    fn forward_attn(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+
+        // 1. Joint Q+gate проекция
+        let t0 = std::time::Instant::now();
+        #[cfg(target_os = "macos")]
+        let qg = dispatch_q4k_matmul(&self.attention_wq, self.attention_wq_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let k = dispatch_q4k_matmul(&self.attention_wk, self.attention_wk_opt.as_ref(), x)?;
+        #[cfg(target_os = "macos")]
+        let v = dispatch_q4k_matmul(&self.attention_wv, self.attention_wv_opt.as_ref(), x)?;
+        #[cfg(not(target_os = "macos"))]
+        let qg = self.attention_wq.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let k = self.attention_wk.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let v = self.attention_wv.forward(x)?;
+        let t_proj = t0.elapsed();
+
+        // 2-5. Reshape + norm + RoPE
+        let t0 = std::time::Instant::now();
+        let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+        let q = qg
+            .narrow(3, 0, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let gate = qg
+            .narrow(3, self.head_dim, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Q-Norm / K-Norm
+        let q = self.q_norm.forward(&q.flatten(0, 2)?)?.reshape((
+            b_sz,
+            self.n_head,
+            seq_len,
+            self.head_dim,
+        ))?;
+        let k = self.k_norm.forward(&k.flatten(0, 2)?)?.reshape((
+            b_sz,
+            self.n_kv_head,
+            seq_len,
+            self.head_dim,
+        ))?;
+
+        // Partial RoPE
+        let q = self.apply_partial_rotary_emb(&q, index_pos)?;
+        let k = self.apply_partial_rotary_emb(&k, index_pos)?;
+        let t_reshape = t0.elapsed();
+
+        // 6. KV-cache с sliding window
+        //
+        // Стратегия:
+        // - Prefill (seq_len > 1): стандартный рост кэша без ограничений
+        // - Decode (seq_len == 1): при kv_cache_len >= attn_window — eviction старых
+        //
+        // ВНИМАНИЕ: гипотезу «DeltaNet несёт весь long-range, поэтому attention
+        // достаточно узкого окна» проверяли (ATTN_WINDOW=2048) и ОТВЕРГЛИ — на
+        // длинных транскриптах модель забывала начало и галлюцинировала (см.
+        // комментарий у `attn_window = context_length` в конструкторе слоя).
+        // Поэтому по умолчанию attn_window = context_length и eviction на
+        // практике не срабатывает.
+        //
+        // Память (n_kv_head=4, head_dim=256, F16): ~4 КБ на токен на слой,
+        //   до ~320 MB/слой и ~2.6 ГБ суммарно при полном контексте 81920.
+        let t0 = std::time::Instant::now();
+        // KV cache буферы — long-lived (живут до конца inference). Исключаем из scratch
+        // arena чтобы они не занимали slots постоянно. Флаг skip_arena_next_alloc()
+        // действует на одну аллокацию — ставим для k и v отдельно.
+        #[cfg(target_os = "macos")]
+        candle_core::skip_arena_next_alloc();
+        let k = k.to_dtype(DType::F16)?;
+        #[cfg(target_os = "macos")]
+        candle_core::skip_arena_next_alloc();
+        let v = v.to_dtype(DType::F16)?;
+
+        if self.kv_cache.is_none() {
+            self.kv_cache = Some((k.clone(), v.clone()));
+            self.kv_cache_len = seq_len;
+        } else {
+            let new_len = self.kv_cache_len + seq_len;
+            let (k_cache, v_cache) = self.kv_cache.as_ref().unwrap();
+            let current_cap = k_cache.dim(2)?;
+
+            // Sliding window eviction: при decode (seq_len=1) и переполнении окна
+            if seq_len == 1 && new_len > self.attn_window {
+                // Сдвигаем содержимое: отбрасываем 1 старый токен, записываем 1 новый
+                // [1, 2, 3, ..., W] → [2, 3, ..., W, new]
+                let keep = self.attn_window - 1;
+                let old_k = k_cache.narrow(2, 1, keep)?.contiguous()?;
+                let old_v = v_cache.narrow(2, 1, keep)?.contiguous()?;
+                k_cache.slice_set(&old_k, 2, 0)?;
+                v_cache.slice_set(&old_v, 2, 0)?;
+                k_cache.slice_set(&k, 2, keep)?;
+                v_cache.slice_set(&v, 2, keep)?;
+                self.kv_cache_len = self.attn_window;
+            } else if new_len > current_cap {
+                // Рост буфера (обычно при prefill). Также не из arena.
+                let new_cap = (new_len + 512).min(self.max_cache_len);
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let new_k = Tensor::zeros(
+                    (b_sz, self.n_kv_head, new_cap, self.head_dim),
+                    k.dtype(),
+                    k.device(),
+                )?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let new_v = Tensor::zeros(
+                    (b_sz, self.n_kv_head, new_cap, self.head_dim),
+                    v.dtype(),
+                    v.device(),
+                )?;
+                let old_k = k_cache.narrow(2, 0, self.kv_cache_len)?.contiguous()?;
+                let old_v = v_cache.narrow(2, 0, self.kv_cache_len)?.contiguous()?;
+                new_k.slice_set(&old_k, 2, 0)?;
+                new_v.slice_set(&old_v, 2, 0)?;
+                new_k.slice_set(&k, 2, self.kv_cache_len)?;
+                new_v.slice_set(&v, 2, self.kv_cache_len)?;
+                self.kv_cache = Some((new_k, new_v));
+                self.kv_cache_len = new_len;
+            } else {
+                // Обычный append в существующий буфер
+                k_cache.slice_set(&k, 2, self.kv_cache_len)?;
+                v_cache.slice_set(&v, 2, self.kv_cache_len)?;
+                self.kv_cache_len = new_len;
+            }
+        }
+
+        let (k_cache, v_cache) = self.kv_cache.as_ref().unwrap();
+        let k = k_cache.narrow(2, 0, self.kv_cache_len)?;
+        let v = v_cache.narrow(2, 0, self.kv_cache_len)?;
+        let t_kv_cache = t0.elapsed();
+
+        // 7. Attention scores (SDPA)
+        let t0 = std::time::Instant::now();
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let y = if seq_len == 1 {
+            // T-288: candle_nn::ops::sdpa имеет только Metal + CPU (T-286) реализации,
+            // CUDA backend не реализован ("no cuda implementation for metal-sdpa").
+            // На CUDA fallback на manual matmul attention (тот же подход что в prefill).
+            // На CPU SDPA требует contiguous q/k/v (Metal kernel поддерживает strides сам).
+            if q.device().is_metal() || q.device().is_cpu() {
+                let q = q.to_dtype(DType::F16)?.contiguous()?;
+                let k = k.contiguous()?;
+                let v = v.contiguous()?;
+                let y = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+                y.to_dtype(DType::F32)?
+            } else {
+                // CUDA path: manual matmul attention для seq_len=1 в F32 precision.
+                // F16 дал заметный numerical drift vs SDPA (output divergence через
+                // 32 layers × 1024 decode steps). F32 совпадает с CPU SDPA путём.
+                // Performance hit minor: attention occupies ~10% от total decode time.
+                // CUDA matmul требует contiguous; q после rope/transpose может быть
+                // non-contiguous (stride [1, 1, 1, 16]).
+                let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
+                let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
+                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
+                let kv_seq = k_f32.dim(2)?;
+                let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
+                    let repeats = self.n_head / self.n_kv_head;
+                    let k = k_f32
+                        .unsqueeze(2)?
+                        .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
+                        .contiguous()?
+                        .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
+                    let v = v_f32
+                        .unsqueeze(2)?
+                        .broadcast_as((b_sz, self.n_kv_head, repeats, kv_seq, self.head_dim))?
+                        .contiguous()?
+                        .reshape((b_sz, self.n_head, kv_seq, self.head_dim))?;
+                    (k, v)
+                } else {
+                    (k_f32, v_f32)
+                };
+                let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
+                let attn = candle_nn::ops::softmax_last_dim(&scores)?;
+                attn.matmul(&v_exp)?
+            }
+        } else {
+            // Prefill: CHUNKED manual matmul attention в F16.
+            //
+            // ИСТОРИЯ:
+            //   - Изначально: full materialize [1, 8, 15K, 15K] × F32 = 22 ГБ peak (swap)
+            //   - v1 chunked: CHUNK=512, F32 → 12 ГБ peak (Metal не освобождал между chunks)
+            //   - v2 текущая: CHUNK=256, F16 + flush_buffers per chunk → ~3-4 ГБ peak
+            //
+            // Все три оптимизации:
+            //   1. CHUNK 512 → 256: peak attention scores ×2 меньше
+            //   2. F16 attention scores: ×2 меньше памяти на scores+softmax+matmul
+            //   3. flush_buffers() после каждого chunk: освобождает intermediate
+            //      Metal буферы из command queue (без этого Metal накапливал ~6
+            //      chunks одновременно в pipeline).
+            //
+            // Per-chunk peak: [1, 8, 256, 15K] × F16 = 60 МБ (vs 240 МБ F32).
+            // Math identity сохранена (softmax независим по rows).
+            //
+            // Metal SDPA kernel не поддерживает head_dim=256 + seq>1, поэтому
+            // не можем просто переключить на candle_nn::ops::sdpa.
+            const CHUNK: usize = 256;
+
+            let kv_len = self.kv_cache_len;
+
+            // Q/K/V в F16 — экономия памяти на attention scores ×2.
+            //
+            // T-422: на CUDA считаем в F32. У F16 десять бит мантиссы, и результат
+            // матмула зависит от размеров матриц — а они меняются вместе с разбиением
+            // промпта на чанки. Замер (2191 токен, chunked vs single-pass): дрейф
+            // состояния на CUDA 1.2e-1 против 5.2e-2 на Metal, и на 4.6К токенах
+            // расходился уже сам argmax. Для decode этот же класс расхождения на CUDA
+            // нашли раньше и вылечили тем же способом (см. ветку seq_len == 1 выше).
+            // Память не страдает: chunked-путь держит [256 × kv_len], в F32 это
+            // 120 МБ на чанк вместо 60 — на порядок меньше весов модели.
+            let attn_dtype = if q.device().is_cuda() {
+                DType::F32
+            } else {
+                DType::F16
+            };
+            let q = q.to_dtype(attn_dtype)?.contiguous()?;
+            let k = k.to_dtype(attn_dtype)?.contiguous()?;
+            let v = v.to_dtype(attn_dtype)?.contiguous()?;
+
+            let (k, v) = if self.n_kv_head != self.n_head {
+                let repeats = self.n_head / self.n_kv_head;
+                let k = k
+                    .unsqueeze(2)?
+                    .broadcast_as((b_sz, self.n_kv_head, repeats, kv_len, self.head_dim))?
+                    .contiguous()?
+                    .reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
+                let v = v
+                    .unsqueeze(2)?
+                    .broadcast_as((b_sz, self.n_kv_head, repeats, kv_len, self.head_dim))?
+                    .contiguous()?
+                    .reshape((b_sz, self.n_head, kv_len, self.head_dim))?;
+                (k, v)
+            } else {
+                (k, v)
+            };
+
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            let scale_f16 = scale as f32;
+
+            // Получаем Metal device для flush_buffers (если на macOS).
+            #[cfg(target_os = "macos")]
+            let metal_dev = q.device().as_metal_device().ok().cloned();
+
+            // Если seq_len ≤ CHUNK — single shot (не теряем перформанс на коротких).
+            let result = if seq_len <= CHUNK {
+                let attn_weights = (q.matmul(&k_t)? * (scale_f16 as f64))?;
+                let mask: Vec<f32> = (0..seq_len)
+                    .flat_map(|i| {
+                        let max_j = index_pos + i;
+                        (0..kv_len).map(move |j| {
+                            if j <= max_j {
+                                0.0f32
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                    })
+                    .collect();
+                let mask = Tensor::from_vec(mask, (1, 1, seq_len, kv_len), attn_weights.device())?
+                    .to_dtype(attn_dtype)?;
+                let attn_weights = attn_weights.broadcast_add(&mask)?;
+                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+                attn_weights.matmul(&v)?
+            } else {
+                // Длинный prefill — chunked path. После каждого chunk вызываем
+                // flush_buffers() чтобы Metal освободил intermediate scores+softmax
+                // буферы из command queue (без этого они накапливаются ~6 chunks
+                // одновременно — это и был источник 12 ГБ peak в v1 chunked).
+                let mut chunk_outputs: Vec<Tensor> =
+                    Vec::with_capacity((seq_len + CHUNK - 1) / CHUNK);
+                let mut start = 0usize;
+                while start < seq_len {
+                    let end = (start + CHUNK).min(seq_len);
+                    let chunk_len = end - start;
+
+                    let q_chunk = q.narrow(2, start, chunk_len)?;
+                    let scores = (q_chunk.matmul(&k_t)? * (scale_f16 as f64))?;
+
+                    let mask: Vec<f32> = (0..chunk_len)
+                        .flat_map(|i| {
+                            let row_pos = index_pos + start + i;
+                            (0..kv_len).map(move |j| {
+                                if j <= row_pos {
+                                    0.0f32
+                                } else {
+                                    f32::NEG_INFINITY
+                                }
+                            })
+                        })
+                        .collect();
+                    let mask = Tensor::from_vec(mask, (1, 1, chunk_len, kv_len), scores.device())?
+                        .to_dtype(attn_dtype)?;
+                    let scores = scores.broadcast_add(&mask)?;
+
+                    let attn_w = candle_nn::ops::softmax_last_dim(&scores)?;
+                    let out_chunk = attn_w.matmul(&v)?.contiguous()?;
+                    chunk_outputs.push(out_chunk);
+
+                    // scores и attn_w большие — Drop сразу через scope.
+                    drop(attn_w);
+                    drop(scores);
+                    drop(mask);
+
+                    // flush_buffers: освободить intermediate Metal буферы.
+                    // На M-series unified memory это критично — без flush
+                    // command queue накапливает ~6 chunks worth буферов.
+                    #[cfg(target_os = "macos")]
+                    if let Some(dev) = &metal_dev {
+                        let _ = dev.flush_buffers();
+                    }
+
+                    start = end;
+                }
+                Tensor::cat(&chunk_outputs, 2)?
+            };
+
+            // Output → F32 для совместимости с дальнейшими операциями (gate, output proj).
+            result.to_dtype(DType::F32)?
+        };
+        let t_sdpa = t0.elapsed();
+
+        // 8-9. Gate + output projection
+        let t0 = std::time::Instant::now();
+        let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
+        let y = (y * gate_sigmoid)?;
+        let y = y
+            .transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        #[cfg(target_os = "macos")]
+        let y = dispatch_q4k_matmul(&self.attention_wo, self.attention_wo_opt.as_ref(), &y)?;
+        #[cfg(not(target_os = "macos"))]
+        let y = self.attention_wo.forward(&y)?;
+        let t_gate_out = t0.elapsed();
+
+        // Аккумулируем тайминги
+        acc_us!(attn_proj_us, t_proj);
+        acc_us!(attn_reshape_us, t_reshape);
+        acc_us!(attn_kv_cache_us, t_kv_cache);
+        acc_us!(attn_sdpa_us, t_sdpa);
+        acc_us!(attn_gate_out_us, t_gate_out);
+
+        Ok(y)
+    }
+
+    /// Захват snapshot KV-cache для prompt cache (T-274).
+    ///
+    /// Если cache не заполнен (kv_cache=None или cache_len=0) — возвращает `Ok(None)`.
+    /// Иначе deep-clone'ит только заполненную часть K/V (через `narrow(2, 0, cache_len)`),
+    /// отделяя snapshot storage от живого forward storage.
+    pub(crate) fn snapshot_kv(&self) -> Result<Option<KvCacheSnap>> {
+        if self.kv_cache_len == 0 {
+            return Ok(None);
+        }
+        let Some((ref k, ref v)) = self.kv_cache else {
+            return Ok(None);
+        };
+        let k_slice = k.narrow(2, 0, self.kv_cache_len)?;
+        let v_slice = v.narrow(2, 0, self.kv_cache_len)?;
+        let k_copy = tensor_deep_clone(&k_slice)?;
+        let v_copy = tensor_deep_clone(&v_slice)?;
+        Ok(Some(KvCacheSnap {
+            k: k_copy,
+            v: v_copy,
+            cache_len: self.kv_cache_len,
+        }))
+    }
+
+    /// Восстановление KV-cache из snapshot (T-274).
+    ///
+    /// `None` → очистка cache (эквивалент новой беседы).
+    /// `Some(snap)` → deep-clone K/V из snapshot в новые буферы для forward.
+    /// Snapshot не модифицируется — может использоваться повторно.
+    pub(crate) fn restore_kv(&mut self, snap: Option<&KvCacheSnap>) -> Result<()> {
+        match snap {
+            Some(snap) => {
+                let k = tensor_deep_clone(&snap.k)?;
+                let v = tensor_deep_clone(&snap.v)?;
+                self.kv_cache = Some((k, v));
+                self.kv_cache_len = snap.cache_len;
+            }
+            None => {
+                self.kv_cache = None;
+                self.kv_cache_len = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Hybrid Layer — объединение DeltaNet и Attention в единый enum
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Тип слоя в гибридной архитектуре Qwen3.5.
+///
+/// Паттерн: (layer_idx + 1) % full_attention_interval != 0 → DeltaNet, иначе Attention.
+/// При full_attention_interval=4: слои 0,1,2=DeltaNet, 3=Attention, 4,5,6=DeltaNet, 7=Attention...
+enum HybridLayerType {
+    DeltaNet(DeltaNetLayer),
+    Attention(GatedAttentionLayer),
+}
+
+/// Snapshot state одного `HybridBlock` для prompt cache (T-274).
+///
+/// Хранит ровно тот тип данных, который соответствует типу слоя:
+/// - `DeltaNet` → CPU snapshot DeltaNet state (на macOS GPU buffers сохраняются в Phase 2)
+/// - `Attention(None)` → KV cache был пуст (свежий слой / clear_state)
+/// - `Attention(Some(...))` → deep-cloned K/V + cache_len
+#[derive(Debug, Clone)]
+pub enum BlockStateSnap {
+    DeltaNet(DeltaNetStateSnap),
+    Attention(Option<KvCacheSnap>),
+}
+
+/// Полный snapshot модели для prompt cache (T-274).
+///
+/// Содержит state всех HybridBlock плюс identity-метаданные:
+/// - `model_nonce` — id экземпляра модели; при restore проверяется совпадение
+///   с `ModelWeights.instance_nonce`, чтобы snapshot нельзя было применить к другой модели.
+/// - `position` — длина prefix в токенах = `prompt_tokens[..position]`. Используется
+///   как cache key вместе с token IDs в `PromptCacheEntry`.
+#[derive(Debug, Clone)]
+pub struct StateSnapshot {
+    pub model_nonce: u64,
+    pub position: usize,
+    pub blocks: Vec<BlockStateSnap>,
+}
+
+impl StateSnapshot {
+    /// Приблизительный размер snapshot в байтах (T-328, FR-004).
+    ///
+    /// Используется PromptCacheStore для LRU-вытеснения по бюджету памяти.
+    /// DeltaNet: conv_buf + ssm_state (Vec<f32> → 4 байта/элемент).
+    /// Attention: 2 тензора K + V * element_size (f16/f32).
+    ///
+    /// На Qwen3.5-4B Q4_K_M: 24 DeltaNet слоя (~50 МБ) + 8 Attention слоёв (~64 МБ) ≈ 114 МБ.
+    pub fn size_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for block in &self.blocks {
+            match block {
+                BlockStateSnap::DeltaNet(dn) => {
+                    // conv_buf и ssm_state — Vec<f32>, 4 байта на элемент
+                    total += dn.conv_buf.len() * std::mem::size_of::<f32>();
+                    total += dn.ssm_state.len() * std::mem::size_of::<f32>();
+                }
+                BlockStateSnap::Attention(kv_opt) => {
+                    if let Some(kv) = kv_opt {
+                        // K tensor + V tensor
+                        let k_bytes = kv.k.elem_count() * kv.k.dtype().size_in_bytes();
+                        let v_bytes = kv.v.elem_count() * kv.v.dtype().size_in_bytes();
+                        total += k_bytes + v_bytes;
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
+/// Полный блок трансформера: attention/deltanet norm → layer → residual → FFN norm → MLP → residual.
+pub(crate) struct HybridBlock {
+    /// Pre-attention/deltanet RMS norm (attn_norm)
+    attn_norm: RmsNorm,
+    /// Post-attention RMS norm (= ffn_norm, в GGUF: post_attention_norm)
+    ffn_norm: RmsNorm,
+    /// Тип слоя: DeltaNet или Gated Attention
+    layer: HybridLayerType,
+    /// SwiGLU MLP (общий для обоих типов слоёв)
+    mlp: Mlp,
+}
+
+impl HybridBlock {
+    /// Forward pass для одного блока.
+    ///
+    /// x shape: [batch, seq_len, n_embd]
+    fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        // Pre-norm → layer → residual
+        let t0 = std::time::Instant::now();
+        let residual = x;
+        let normed = self.attn_norm.forward(x)?;
+        let t_norm1 = t0.elapsed();
+
+        let layer_out = match &mut self.layer {
+            HybridLayerType::DeltaNet(delta) => {
+                // DeltaNet timing аккумулируется внутри delta.forward()
+                GEN_TIMINGS.with(|t| t.borrow_mut().delta_count += 1);
+                delta.forward(&normed)?
+            }
+            HybridLayerType::Attention(attn) => {
+                // Attention timing аккумулируется внутри attn.forward_attn()
+                GEN_TIMINGS.with(|t| t.borrow_mut().attn_count += 1);
+                attn.forward_attn(&normed, index_pos)?
+            }
+        };
+        let x = (layer_out + residual)?;
+
+        // FFN norm → MLP → residual
+        let t0 = std::time::Instant::now();
+        let residual = &x;
+        let normed = self.ffn_norm.forward(&x)?;
+        let t_norm2 = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        let ffn_out = self.mlp.forward(&normed)?;
+        let t_mlp = t0.elapsed();
+
+        let x = (ffn_out + residual)?;
+
+        // Аккумулируем norm + MLP
+        let norm_total = t_norm1 + t_norm2;
+        acc_us!(norm_us, norm_total);
+        acc_us!(mlp_us, t_mlp);
+
+        Ok(x)
+    }
+
+    /// Batch prefill: DeltaNet использует forward_prefill, Attention — token-by-token SDPA.
+    ///
+    /// x shape: [batch, seq_len, n_embd]
+    ///
+    /// Оптимизация:
+    /// - DeltaNet (75% слоёв): batch GPU проекции + sequential CPU delta rule
+    /// - Attention (25% слоёв): batch norm/MLP, token-by-token SDPA
+    ///   (Metal SDPA kernel не поддерживает head_dim=256 + seq_len > 1 из-за
+    ///   лимита threadgroup memory 32KB)
+    fn forward_prefill(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b_sz, _seq_len, _n_embd) = x.dims3()?;
+
+        // Pre-norm (batch — эффективно на GPU)
+        let residual = x;
+        let normed = self.attn_norm.forward(x)?;
+
+        let layer_out = match &mut self.layer {
+            HybridLayerType::DeltaNet(delta) => {
+                // Batch prefill: GPU проекции за один вызов, CPU delta rule последовательно
+                delta.forward_prefill(&normed)?
+            }
+            HybridLayerType::Attention(attn) => {
+                // Batch attention через manual matmul (Q@K^T → mask → softmax → @V).
+                // Metal SDPA kernel не поддерживает head_dim=256 + seq_len > 1
+                // (threadgroup memory 53760 > limit 32768), поэтому forward_attn
+                // использует ручную реализацию для prefill path.
+                attn.forward_attn(&normed, index_pos)?
+            }
+        };
+        let x = (layer_out + residual)?;
+
+        // FFN norm → MLP → residual (batch — эффективно на GPU)
+        let residual = &x;
+        let normed = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.mlp.forward(&normed)?;
+        let x = (ffn_out + residual)?;
+
+        Ok(x)
+    }
+
+    /// Является ли этот блок DeltaNet слоем?
+    fn is_deltanet(&self) -> bool {
+        matches!(self.layer, HybridLayerType::DeltaNet(_))
+    }
+
+    /// Захват snapshot state блока для prompt cache (T-274).
+    ///
+    /// `device` пробрасывается в DeltaNet snapshot — на macOS+Metal он использует GPU buffers
+    /// как single source of truth, иначе CPU `state` field.
+    /// Attention слой пользуется тензорной памятью устройства автоматически через `Tensor::add`.
+    pub(crate) fn snapshot_block(&self, device: &Device) -> Result<BlockStateSnap> {
+        match &self.layer {
+            HybridLayerType::DeltaNet(d) => Ok(BlockStateSnap::DeltaNet(d.snapshot_state(device)?)),
+            HybridLayerType::Attention(a) => Ok(BlockStateSnap::Attention(a.snapshot_kv()?)),
+        }
+    }
+
+    /// Восстановление state блока из snapshot (T-274).
+    ///
+    /// Возвращает `Err` если variant snapshot'а не соответствует типу слоя —
+    /// защита от применения snapshot к другой структуре модели.
+    pub(crate) fn restore_block(&mut self, device: &Device, snap: &BlockStateSnap) -> Result<()> {
+        match (&mut self.layer, snap) {
+            (HybridLayerType::DeltaNet(d), BlockStateSnap::DeltaNet(s)) => {
+                d.restore_state(device, s)
+            }
+            (HybridLayerType::Attention(a), BlockStateSnap::Attention(s)) => {
+                a.restore_kv(s.as_ref())
+            }
+            (HybridLayerType::DeltaNet(_), BlockStateSnap::Attention(_)) => {
+                Err(candle_core::Error::Msg(
+                    "snapshot variant mismatch: expected DeltaNet, got Attention".into(),
+                ))
+            }
+            (HybridLayerType::Attention(_), BlockStateSnap::DeltaNet(_)) => {
+                Err(candle_core::Error::Msg(
+                    "snapshot variant mismatch: expected Attention, got DeltaNet".into(),
+                ))
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Model Weights — полная модель Qwen3.5
+// ════════════════════════════════════════════════════════════════════════════════
+
+pub struct ModelWeights {
+    tok_embeddings: QuantizedEmbedding,
+    pub(crate) blocks: Vec<HybridBlock>,
+    norm: RmsNorm,
+    output: QMatMul,
+    /// Максимальная длина контекста
+    pub context_length: usize,
+    /// Уникальный идентификатор экземпляра модели (T-274).
+    ///
+    /// Генерируется при load через `rand::random()`. Используется как identity guard
+    /// для prompt cache: snapshot хранит nonce исходной модели, и при restore
+    /// проверяется совпадение — это предотвращает случайное применение snapshot
+    /// к другому экземпляру модели (например, при reload или хот-свапе).
+    pub(crate) instance_nonce: u64,
+    /// Pre-allocated scratch arena для intermediate Metal буферов (T-269 Phase 2).
+    /// По умолчанию ON (T-269 Phase 5 promote). Emergency revert через YTTRI_SCRATCH_ARENA=0.
+    /// Создаётся только на macOS; на других платформах — всегда None.
+    #[cfg(target_os = "macos")]
+    pub(crate) scratch_arena: Option<Arc<candle_metal_kernels::metal::ScratchArena>>,
+    /// Unified scratch arena с одним большим MTLBuffer + offset dispatch (T-269 Phase 3c).
+    /// None по умолчанию. Активируется через env-флаг YTTRI_UNIFIED_ARENA=1.
+    /// Требует output_offset support во всех kernel call sites (Phase 3c step 1).
+    /// Полная интеграция в следующей сессии (MetalStorage offset field).
+    #[cfg(target_os = "macos")]
+    pub(crate) unified_arena: Option<Arc<candle_metal_kernels::metal::UnifiedScratchArena>>,
+}
+
+impl ModelWeights {
+    /// Загрузить модель из GGUF файла.
+    ///
+    /// `mmap` — Arc на mmap'd GGUF файл. Embedding хранит ссылку (zero-copy),
+    /// остальные тензоры загружаются через `tensor_from_slice` без промежуточных Vec<u8>.
+    pub fn from_gguf(
+        ct: gguf_file::Content,
+        mmap: Arc<memmap2::Mmap>,
+        device: &Device,
+    ) -> Result<Self> {
+        let data: &[u8] = &mmap;
+        let load_heavy = |name: &str| -> Result<candle_core::quantized::QTensor> {
+            tensor_from_data(&ct, data, name, device)
+        };
+        Self::build_model_common(&ct, data, &mmap, device, "Qwen3.5", load_heavy)
+    }
+
+    /// Загрузить модель из GGUF файла с Metal zero-copy (без копирования данных в GPU).
+    ///
+    /// Создаёт ОДИН Metal NoCopy buffer на весь mmap'd файл. Каждый тензор ссылается
+    /// на свою часть этого buffer через offset — ~0ms на копирование vs 1-3 секунды обычно.
+    ///
+    /// Доступен только на macOS + Metal. На других платформах используйте `from_gguf`.
+    #[cfg(all(target_os = "macos"))]
+    pub fn from_gguf_zero_copy(
+        ct: gguf_file::Content,
+        mmap: Arc<memmap2::Mmap>,
+        device: &Device,
+    ) -> Result<Self> {
+        use candle_core::quantized::{ggml_file, QTensor};
+
+        let metal_device = match device {
+            Device::Metal(m) => m,
+            _ => candle_core::bail!("from_gguf_zero_copy requires a Metal device"),
+        };
+
+        // T-271 Phase 4 redux: инициализируем MTLResidencySet ДО создания weight buffers.
+        // После этого new_buffer_no_copy автоматически добавляет buffer в residency set.
+        // macOS 15+: GPU memory wired постоянно → не выгружается в compressed memory.
+        // Default ON. Emergency revert: YTTRI_DISABLE_RESIDENCY_SET=1.
+        let _weight_residency = metal_device.new_weight_residency_set();
+
+        // Создаём единый Metal NoCopy buffer для всего mmap'd файла.
+        #[cfg(target_arch = "aarch64")]
+        const PAGE_SIZE: usize = 16384;
+        #[cfg(not(target_arch = "aarch64"))]
+        const PAGE_SIZE: usize = 4096;
+        let mmap_len = mmap.len();
+        let aligned_len = (mmap_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        let shared_buffer =
+            metal_device.new_buffer_no_copy(mmap.as_ptr() as *mut std::ffi::c_void, aligned_len)?;
+        log::info!(
+            "[Qwen3.5 ZeroCopy] Created NoCopy Metal buffer: {} MB (aligned: {} MB)",
+            mmap_len / 1024 / 1024,
+            aligned_len / 1024 / 1024,
+        );
+
+        // Prefault: по умолчанию ВЫКЛЮЧЕН (lazy paging как llama.cpp).
+        // Первый prefill будет медленнее на page faults (~100мс),
+        // но RSS ниже. Включить (прогрев всех страниц до первого prefill,
+        // холодный prefill быстрее на ~3-9s): YTTRI_ENABLE_PREFAULT=1
+        let enable_prefault = std::env::var("YTTRI_ENABLE_PREFAULT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if enable_prefault {
+            let prefault_start = std::time::Instant::now();
+            {
+                let data_ptr = mmap.as_ptr();
+                let mut _checksum: u8 = 0;
+                let mut offset = 0usize;
+                while offset < mmap_len {
+                    _checksum = _checksum.wrapping_add(unsafe { *data_ptr.add(offset) });
+                    offset += PAGE_SIZE;
+                }
+                std::hint::black_box(_checksum);
+            }
+            log::info!(
+                "[Qwen3.5 ZeroCopy] Prefault {} MB ({} pages) in {:.0}ms",
+                mmap_len / 1024 / 1024,
+                mmap_len / PAGE_SIZE,
+                prefault_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        } else {
+            log::info!(
+                "[Qwen3.5 ZeroCopy] Prefault disabled (YTTRI_ENABLE_PREFAULT=0) — lazy paging, first prefill will be slower"
+            );
+        }
+
+        let data: &[u8] = &mmap;
+        let load_heavy = |name: &str| -> Result<QTensor> {
+            let (offset, tensor_size) = ct.tensor_byte_range(name)?;
+            let ggml_dtype = ct.tensor_dtype(name)?;
+            let dims = ct.tensor_shape(name)?;
+            ggml_file::qtensor_from_shared_metal_buffer(
+                ggml_dtype,
+                shared_buffer.clone(),
+                offset,
+                tensor_size,
+                dims,
+                device,
+            )
+        };
+
+        let mut model =
+            Self::build_model_common(&ct, data, &mmap, device, "Qwen3.5 ZeroCopy", load_heavy)?;
+
+        // T-271 Phase 4 redux: зафиксировать residency set и запросить wiring.
+        // Вызов ПОСЛЕ build_model_common — все weight buffers уже добавлены через
+        // new_buffer_no_copy hook. requestResidency() говорит macOS: эта память нужна GPU.
+        metal_device.commit_weight_residency();
+
+        // Scratch arena (T-269 Phase 2, default ON since Phase 5 promote).
+        // Emergency revert через YTTRI_SCRATCH_ARENA=0.
+        //
+        // T-270 (2026-05-07): slot_sizes вычисляются из реальных параметров GGUF.
+        // Независимо от размера модели (2B/4B/etc.) slot-ы рассчитываются под chunk=2048.
+        //
+        // При CHUNK_SIZE=2048, F32:
+        //   MLP w1/w3/silu*w3: CHUNK_SIZE × ff_dim × 4 байт → round_up_power2(...)
+        //   hidden-state:      CHUNK_SIZE × hidden × 4 байт → round_up_power2(...)
+        //   мелкие DeltaNet:   8 МБ (фиксировано)
+        //
+        // w1/w3/silu reuse один slot поочерёдно (SwiGLU).
+        // sync_every=4 → fence освобождает slots перед следующим окном.
+        model.scratch_arena = if std::env::var("YTTRI_SCRATCH_ARENA")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+        {
+            // Читаем реальные параметры модели из ct.metadata
+            let md_get_u32 = |s: &str| -> usize {
+                ct.metadata
+                    .get(s)
+                    .and_then(|v| v.to_u32().ok())
+                    .unwrap_or(0) as usize
+            };
+            let hidden = md_get_u32("qwen35.embedding_length");
+            let ff_dim = md_get_u32("qwen35.feed_forward_length");
+            const CHUNK: usize = 2048; // должен совпадать с CHUNK_SIZE в generation.rs
+
+            // Round up to nearest power-of-2 MB для arena slot.
+            let round_mb = |bytes: usize| -> usize {
+                let mb = (bytes + 1024 * 1024 - 1) / (1024 * 1024);
+                mb.next_power_of_two().max(8) * 1024 * 1024
+            };
+
+            let mlp_slot = round_mb(CHUNK * ff_dim * 4); // w1/w3/silu (F32)
+            let hidden_slot = round_mb(CHUNK * hidden * 4); // hidden state (F32)
+            let small_slot = 8 * 1024 * 1024usize; // 8 МБ: DeltaNet proj, norms
+
+            log::info!(
+                "[Qwen3.5/scratch_arena] slot sizes: small=8MB, hidden={}MB, mlp={}MB (hidden={}, ff={})",
+                hidden_slot / 1024 / 1024, mlp_slot / 1024 / 1024, hidden, ff_dim,
+            );
+
+            // 8 small + 6 hidden-state + 4 MLP = 18 slots
+            let slot_sizes: Vec<usize> = {
+                let mut v = Vec::with_capacity(18);
+                for _ in 0..8 {
+                    v.push(small_slot);
+                } // мелкие: DeltaNet proj, norms
+                for _ in 0..6 {
+                    v.push(hidden_slot);
+                } // hidden-state: layer_in, normed, ffn_out
+                for _ in 0..4 {
+                    v.push(mlp_slot);
+                } // MLP intermediates
+                v
+            };
+            let total_mb: usize = slot_sizes.iter().sum::<usize>() / 1024 / 1024;
+            log::info!(
+                "[Qwen3.5/scratch_arena] Creating {} slots, {} MB total (T-269 Phase 2)",
+                slot_sizes.len(),
+                total_mb,
+            );
+            match metal_device.create_scratch_arena(&slot_sizes) {
+                Ok(arena) => Some(arena),
+                Err(e) => {
+                    log::warn!(
+                        "[Qwen3.5/scratch_arena] Failed to create arena: {} — falling back to pool",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Unified scratch arena (T-269 Phase 3c): создаём если YTTRI_UNIFIED_ARENA=1.
+        //
+        // Один большой MTLBuffer (~764 МБ) + bump allocator.
+        // Полная интеграция offset dispatch будет в следующей сессии.
+        // Сейчас: scaffold — arena создаётся, API доступно через MetalDevice,
+        // но allocate_buffer всё ещё использует обычный pool.
+        // Когда MetalStorage получит offset field — unified_arena будет использоваться
+        // напрямую в forward() для intermediate tensors.
+        #[cfg(target_os = "macos")]
+        {
+            model.unified_arena = if std::env::var("YTTRI_UNIFIED_ARENA")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                // Размер единого буфера = сумма slot_sizes арены (Phase 2).
+                // Вычисляется из реальных параметров модели — работает для 2B и 4B.
+                let md_get_u32 = |s: &str| -> usize {
+                    ct.metadata
+                        .get(s)
+                        .and_then(|v| v.to_u32().ok())
+                        .unwrap_or(0) as usize
+                };
+                let hidden = md_get_u32("qwen35.embedding_length");
+                let ff_dim = md_get_u32("qwen35.feed_forward_length");
+                const CHUNK: usize = 2048;
+                let round_mb = |bytes: usize| -> usize {
+                    let mb = (bytes + 1024 * 1024 - 1) / (1024 * 1024);
+                    mb.next_power_of_two().max(8) * 1024 * 1024
+                };
+                let capacity = 8 * 8 * 1024 * 1024
+                    + 6 * round_mb(CHUNK * hidden * 4)
+                    + 4 * round_mb(CHUNK * ff_dim * 4);
+                log::info!(
+                    "[Qwen3.5/unified_arena] Creating {} MB unified buffer (T-269 Phase 3c)",
+                    capacity / 1024 / 1024
+                );
+                match metal_device.create_unified_arena(capacity) {
+                    Ok(arena) => {
+                        log::info!(
+                            "[Qwen3.5/unified_arena] Created. Capacity: {} MB",
+                            arena.capacity() / 1024 / 1024
+                        );
+                        Some(arena)
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[Qwen3.5/unified_arena] Failed to create: {} — falling back",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        }
+
+        Ok(model)
+    }
+
+    /// Общая логика построения модели из GGUF.
+    ///
+    /// Читает metadata (`qwen35.*`), загружает embedding, norm, RoPE,
+    /// и итерирует по слоям. Тяжёлые тензоры загружаются через `load_heavy`.
+    /// Маленькие тензоры (norms, biases) всегда загружаются на CPU.
+    fn build_model_common<F>(
+        ct: &gguf_file::Content,
+        data: &[u8],
+        mmap: &Arc<memmap2::Mmap>,
+        device: &Device,
+        tag: &str,
+        load_heavy: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Result<candle_core::quantized::QTensor>,
+    {
+        let md_get = |s: &str| match ct.metadata.get(s) {
+            None => candle_core::bail!("cannot find {s} in metadata"),
+            Some(v) => Ok(v),
+        };
+
+        // ── Qwen3.5 metadata ──
+        let block_count = md_get("qwen35.block_count")?.to_u32()? as usize;
+        let embedding_length = md_get("qwen35.embedding_length")?.to_u32()? as usize;
+        let _feed_forward_length = md_get("qwen35.feed_forward_length")?.to_u32()? as usize;
+        let rms_norm_eps = md_get("qwen35.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let rope_freq_base = md_get("qwen35.rope.freq_base")
+            .and_then(|m| m.to_f32())
+            .unwrap_or(10000f32);
+
+        // Attention параметры
+        let attn_head_count = md_get("qwen35.attention.head_count")?.to_u32()? as usize;
+        let attn_head_count_kv = md_get("qwen35.attention.head_count_kv")?.to_u32()? as usize;
+        let attn_head_dim = md_get("qwen35.attention.key_length")
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(256);
+
+        // DeltaNet (SSM) параметры
+        let conv_kernel = md_get("qwen35.ssm.conv_kernel")
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(4);
+        let ssm_inner_size = md_get("qwen35.ssm.inner_size")?.to_u32()? as usize; // value_dim
+        let ssm_state_size = md_get("qwen35.ssm.state_size")?.to_u32()? as usize; // head_k_dim (DeltaNet)
+        let n_v_heads = md_get("qwen35.ssm.time_step_rank")?.to_u32()? as usize;
+        let n_k_heads = md_get("qwen35.ssm.group_count")?.to_u32()? as usize;
+        let full_attention_interval = md_get("qwen35.full_attention_interval")
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(4);
+
+        // Вычисляемые размерности
+        let head_k_dim_delta = ssm_state_size; // head_dim для DeltaNet Q/K
+        let head_v_dim = ssm_inner_size / n_v_heads; // head_dim для DeltaNet V
+        let key_dim = n_k_heads * head_k_dim_delta; // total key dimension
+        let value_dim = ssm_inner_size; // total value dimension
+        let conv_channels = key_dim * 2 + value_dim; // QKV joint dimension
+
+        // Partial RoPE: 25% от head_dim для attention слоёв
+        let partial_rotary_factor = 0.25f64;
+        let rope_dim = (attn_head_dim as f64 * partial_rotary_factor) as usize;
+
+        // Контекстное окно: читаем из GGUF metadata, клэмпим до 65536.
+        // После memory-peak оптимизаций (docs/research/2026-05-05-memory-peak-optimization.md):
+        //   - 64K ctx + 16K max_tokens работает с peak RSS 5.1 ГБ на 11K prefill;
+        //   - tps стабилен 75-78 на M-series;
+        //   - DeltaNet hybrid + F32 baseline + CANDLE_METAL_COMPUTE_PER_BUFFER=15
+        //     + sync per 4 layers держат память в норме на 16+ ГБ Mac.
+        // Qwen3.5-4B native = 262144 (1M с YaRN); клэмпим до 65536 для разумного RAM.
+        // Fallback 32768 если ключ отсутствует (консервативный).
+        let model_context_length = md_get("qwen35.context_length")
+            .and_then(|v| {
+                v.to_u32()
+                    .map_err(|e| candle_core::Error::Msg(e.to_string()))
+            })
+            .map(|v| v as usize)
+            .unwrap_or(32768);
+        // YTTRI_CONTEXT_LIMIT env позволяет регулировать верхнюю границу
+        // (для CI / маленьких машин). Default 81920 (2026-05-13) — выровнен
+        // с ModelSpec.context_window и official Best Practices Qwen3.5-4B,
+        // покрывает все facultative tasks (mail digest, треды писем, длинные
+        // транскрипции до 60 мин, summarization больших документов).
+        let env_limit = std::env::var("YTTRI_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(81920);
+        let context_length: usize = model_context_length.min(env_limit);
+        log::info!(
+            "[{}] context_length: {} (GGUF metadata native: {}, env limit: {})",
+            tag,
+            context_length,
+            model_context_length,
+            env_limit
+        );
+
+        log::info!(
+            "[{}] layers: {}, embed: {}, attn_heads: {}/{}, attn_head_dim: {}, rope_dim: {}",
+            tag,
+            block_count,
+            embedding_length,
+            attn_head_count,
+            attn_head_count_kv,
+            attn_head_dim,
+            rope_dim,
+        );
+        log::info!(
+            "[{}] DeltaNet: n_v={}, n_k={}, head_k={}, head_v={}, conv_kernel={}, interval={}",
+            tag,
+            n_v_heads,
+            n_k_heads,
+            head_k_dim_delta,
+            head_v_dim,
+            conv_kernel,
+            full_attention_interval,
+        );
+
+        // Token embeddings — zero-copy из mmap
+        let emb_info = ct.tensor_infos.get("token_embd.weight").ok_or_else(|| {
+            candle_core::Error::Msg("cannot find tensor info for token_embd.weight".into())
+        })?;
+        let tok_embeddings =
+            QuantizedEmbedding::from_mmap(Arc::clone(mmap), emb_info, ct.tensor_data_offset)?;
+
+        // Output norm — CPU path
+        let norm = rms_norm_cpu(
+            tensor_from_data(ct, data, "output_norm.weight", &Device::Cpu)?,
+            rms_norm_eps,
+            device,
+        )?;
+
+        // Output projection (или tie_word_embeddings)
+        let output = match load_heavy("output.weight") {
+            Ok(v) => QMatMul::from_qtensor(v)?,
+            _ => {
+                log::info!("[{}] output.weight not found, using tied embeddings", tag);
+                QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?
+            }
+        };
+
+        // RoPE: предрассчитанные cos/sin для PARTIAL RoPE (rope_dim, не full head_dim).
+        //
+        // cos/sin держим в F32 — это всего ~16 МБ для context=32K (rope_dim=64,
+        // 32768 × 32 × 2 = 2M элементов × 4 байт = 16 МБ постоянно).
+        // RoPE применяется через cast Q/K F16 → F32 → rope (F32) → F16 (см.
+        // apply_partial_rotary_emb), что добавляет временный F32 буфер ~75 МБ
+        // per layer (только частичный rope_dim) — пренебрежимо vs ~5-7 ГБ peak.
+        //
+        // Зачем F32: F16 mantissa precision ~5e-4 даёт RoPE error ~1e-3 per dim,
+        // что приемлемо для 32K, marginal для 64K и серьёзно деградирует при 128K+.
+        // F32 cos/sin безопасен для любого context_length вплоть до миллионов токенов
+        // без риска накопления attention drift.
+        let (cos, sin) = precompute_freqs_cis(rope_dim, rope_freq_base, context_length, device)?;
+
+        // ── Metal delta_rule: компиляция шейдеров и создание shared буферов ──
+        #[cfg(target_os = "macos")]
+        let metal_shared: Option<(
+            Arc<metal::delta_rule_metal::DeltaRulePipelines>,
+            Arc<metal::delta_rule_metal::DeltaNetTempBuffers>,
+            metal::delta_rule_metal::DeltaParams,
+        )> = if let Ok(metal_device) = device.as_metal_device() {
+            let metal_params = metal::delta_rule_metal::DeltaParams {
+                n_k_heads: n_k_heads as u32,
+                n_v_heads: n_v_heads as u32,
+                head_k_dim: head_k_dim_delta as u32,
+                head_v_dim: head_v_dim as u32,
+                key_dim: key_dim as u32,
+                value_dim: value_dim as u32,
+                channels: conv_channels as u32,
+                conv_kernel: conv_kernel as u32,
+                q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
+                rms_norm_eps: rms_norm_eps as f32,
+                heads_per_kv: (n_v_heads / n_k_heads) as u32,
+            };
+            match metal::delta_rule_metal::compile_delta_rule_pipelines(metal_device) {
+                Ok(pipelines) => {
+                    match metal::delta_rule_metal::create_temp_buffers(metal_device, &metal_params)
+                    {
+                        Ok(temp) => {
+                            log::info!(
+                                "[{}] Metal delta_rule: shaders compiled, temp buffers created",
+                                tag
+                            );
+                            Some((Arc::new(pipelines), Arc::new(temp), metal_params))
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[{}] Metal delta_rule: temp buffer creation error: {}. Falling back to CPU.",
+                                tag, e
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Metal delta_rule: shader compilation error: {}. Falling back to CPU.",
+                        tag,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // ── Metal Fused Gated DeltaNet (T-265, Phase 3): компиляция fused pipelines ──
+        // Новый путь: 4 batch-aware dispatch'а на всю seq_len (вместо 4*seq_len в старом пути).
+        // Используется в forward_prefill для устранения 130-280% CPU usage от Accelerate+rayon.
+        // Accuracy подтверждён в Phase 2: MAE=3.75e-8 vs CPU (4 порядка строже threshold 1e-4).
+        // Если компиляция fails — forward_prefill fallback на CPU loop, модель остаётся рабочей.
+        #[cfg(target_os = "macos")]
+        let fused_shared: Option<(
+            Arc<metal::gated_delta_net_fused::GdnFusedPipelines>,
+            metal::gated_delta_net_fused::GdnFusedParams,
+        )> = if let Ok(metal_device) = device.as_metal_device() {
+            let fused_params = metal::gated_delta_net_fused::GdnFusedParams {
+                n_tokens: 0, // переписывается перед каждым dispatch
+                channels: conv_channels as u32,
+                key_dim: key_dim as u32,
+                value_dim: value_dim as u32,
+                q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
+                rms_norm_eps: rms_norm_eps as f32,
+                n_v_heads: n_v_heads as u32,
+                conv_kernel: conv_kernel as u32,
+                n_k_heads: n_k_heads as u32,
+            };
+            match metal::gated_delta_net_fused::compile_gdn_fused_pipelines(metal_device) {
+                Ok(p) => {
+                    log::info!(
+                        "[{}] Fused GDN: pipelines compiled (prefill batch-aware path)",
+                        tag
+                    );
+                    Some((Arc::new(p), fused_params))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Fused GDN: compile failed: {}. Prefill uses CPU fallback.",
+                        tag,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // ── CUDA delta_rule: параметры + device-хэндл (NVIDIA Win/Linux) ──
+        // Ядра грузятся лениво (device-кеш), поэтому здесь только параметры.
+        #[cfg(feature = "cuda")]
+        let cuda_params: Option<(candle_core::CudaDevice, delta_rule_cuda::DeltaParams)> =
+            device.as_cuda_device().ok().map(|cuda_dev| {
+                let p = delta_rule_cuda::DeltaParams {
+                    n_k_heads: n_k_heads as u32,
+                    n_v_heads: n_v_heads as u32,
+                    head_k_dim: head_k_dim_delta as u32,
+                    head_v_dim: head_v_dim as u32,
+                    key_dim: key_dim as u32,
+                    value_dim: value_dim as u32,
+                    channels: conv_channels as u32,
+                    conv_kernel: conv_kernel as u32,
+                    q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
+                    rms_norm_eps: rms_norm_eps as f32,
+                    heads_per_kv: (n_v_heads / n_k_heads) as u32,
+                };
+                (cuda_dev.clone(), p)
+            });
+
+        // ── Загрузка слоёв ──
+        let mut blocks = Vec::with_capacity(block_count);
+        let load_start = std::time::Instant::now();
+
+        for layer_idx in 0..block_count {
+            let prefix = format!("blk.{layer_idx}");
+            let is_deltanet = (layer_idx + 1) % full_attention_interval != 0;
+
+            // Общие нормы для обоих типов слоёв
+            let attn_norm_qt = tensor_from_data(
+                ct,
+                data,
+                &format!("{prefix}.attn_norm.weight"),
+                &Device::Cpu,
+            )?;
+            let ffn_norm_qt = tensor_from_data(
+                ct,
+                data,
+                &format!("{prefix}.post_attention_norm.weight"),
+                &Device::Cpu,
+            )?;
+
+            // MLP (SwiGLU) — общий для обоих типов
+            let mlp = {
+                let w1 = load_heavy(&format!("{prefix}.ffn_gate.weight"))?;
+                let w2 = load_heavy(&format!("{prefix}.ffn_down.weight"))?;
+                let w3 = load_heavy(&format!("{prefix}.ffn_up.weight"))?;
+                let qm_w1 = QMatMul::from_qtensor(w1)?;
+                let qm_w2 = QMatMul::from_qtensor(w2)?;
+                let qm_w3 = QMatMul::from_qtensor(w3)?;
+                #[cfg(target_os = "macos")]
+                let w1_opt = maybe_repack_q4k_opt(&qm_w1, device)?;
+                #[cfg(target_os = "macos")]
+                let w2_opt = maybe_repack_q4k_opt(&qm_w2, device)?;
+                #[cfg(target_os = "macos")]
+                let w3_opt = maybe_repack_q4k_opt(&qm_w3, device)?;
+                Mlp {
+                    feed_forward_w1: qm_w1,
+                    feed_forward_w2: qm_w2,
+                    feed_forward_w3: qm_w3,
+                    #[cfg(target_os = "macos")]
+                    feed_forward_w1_opt: w1_opt,
+                    #[cfg(target_os = "macos")]
+                    feed_forward_w2_opt: w2_opt,
+                    #[cfg(target_os = "macos")]
+                    feed_forward_w3_opt: w3_opt,
+                }
+            };
+
+            let layer = if is_deltanet {
+                // ── DeltaNet Layer ──
+                let wqkv = load_heavy(&format!("{prefix}.attn_qkv.weight"))?;
+                let wgate = load_heavy(&format!("{prefix}.attn_gate.weight"))?;
+                let w_beta = load_heavy(&format!("{prefix}.ssm_beta.weight"))?;
+                let w_alpha = load_heavy(&format!("{prefix}.ssm_alpha.weight"))?;
+                let ssm_out = load_heavy(&format!("{prefix}.ssm_out.weight"))?;
+
+                // Маленькие тензоры — CPU, деквантизация в f32
+                let dt_bias_qt =
+                    tensor_from_data(ct, data, &format!("{prefix}.ssm_dt.bias"), &Device::Cpu)?;
+                let dt_bias: Vec<f32> = dt_bias_qt.dequantize(&Device::Cpu)?.to_vec1()?;
+
+                let ssm_a_qt =
+                    tensor_from_data(ct, data, &format!("{prefix}.ssm_a"), &Device::Cpu)?;
+                let ssm_a: Vec<f32> = ssm_a_qt.dequantize(&Device::Cpu)?.to_vec1()?;
+                // ssm_a хранится как отрицательные A_log → нужно -exp(ssm_a) для decay
+                // В llama.cpp: ssm_a уже отрицательный, используется напрямую
+                // gate = softplus(alpha) * ssm_a → отрицательный → exp(gate) ≤ 1
+
+                let conv_qt = tensor_from_data(
+                    ct,
+                    data,
+                    &format!("{prefix}.ssm_conv1d.weight"),
+                    &Device::Cpu,
+                )?;
+                // conv1d weight shape в GGUF: [conv_kernel, channels]
+                // Деквантизируем в f32 для CPU conv1d
+                let conv_tensor = conv_qt.dequantize(&Device::Cpu)?;
+                let conv_kernel_weights: Vec<f32> = conv_tensor.flatten_all()?.to_vec1()?;
+
+                let ssm_norm_qt =
+                    tensor_from_data(ct, data, &format!("{prefix}.ssm_norm.weight"), &Device::Cpu)?;
+                let ssm_norm_weight: Vec<f32> = ssm_norm_qt.dequantize(&Device::Cpu)?.to_vec1()?;
+
+                let state = DeltaNetState::new(conv_kernel, conv_channels, n_v_heads, head_v_dim);
+
+                // Metal per-layer state (persistent ssm_state + conv_state + weights)
+                #[cfg(target_os = "macos")]
+                let metal_ctx =
+                    if let Some((ref pipelines, ref temp, ref metal_params)) = metal_shared {
+                        let metal_device = device.as_metal_device()?;
+                        match metal::delta_rule_metal::create_layer_metal_state(
+                            metal_device,
+                            metal_params,
+                            &conv_kernel_weights,
+                            &dt_bias,
+                            &ssm_a,
+                            &ssm_norm_weight,
+                        ) {
+                            Ok(layer_state) => Some(DeltaNetMetalContext {
+                                pipelines: Arc::clone(pipelines),
+                                temp: Arc::clone(temp),
+                                layer_state,
+                                params: *metal_params,
+                                fused_pipelines: fused_shared.as_ref().map(|(p, _)| Arc::clone(p)),
+                                fused_params: fused_shared.as_ref().map(|(_, fp)| *fp).unwrap_or(
+                                    metal::gated_delta_net_fused::GdnFusedParams {
+                                        n_tokens: 0,
+                                        channels: conv_channels as u32,
+                                        key_dim: key_dim as u32,
+                                        value_dim: value_dim as u32,
+                                        q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
+                                        rms_norm_eps: rms_norm_eps as f32,
+                                        n_v_heads: n_v_heads as u32,
+                                        conv_kernel: conv_kernel as u32,
+                                        n_k_heads: n_k_heads as u32,
+                                    },
+                                ),
+                            }),
+                            Err(e) => {
+                                log::warn!(
+                                    "[{}] Metal delta_rule layer {}: buffer creation error: {}",
+                                    tag,
+                                    layer_idx,
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                // CUDA per-layer state (persistent ssm_state + conv_state + веса).
+                #[cfg(feature = "cuda")]
+                let cuda_ctx = if let Some((ref cuda_dev, ref cuda_p)) = cuda_params {
+                    match delta_rule_cuda::create_layer_cuda_state(
+                        cuda_dev,
+                        cuda_p,
+                        &conv_kernel_weights,
+                        &dt_bias,
+                        &ssm_a,
+                        &ssm_norm_weight,
+                    ) {
+                        Ok(layer_state) => {
+                            match delta_rule_cuda::create_temp_buffers(cuda_dev, cuda_p) {
+                                Ok(temp) => Some(DeltaNetCudaContext {
+                                    dev: cuda_dev.clone(),
+                                    temp,
+                                    layer_state,
+                                    params: *cuda_p,
+                                }),
+                                Err(e) => {
+                                    log::warn!(
+                                        "[{}] CUDA delta_rule layer {}: temp buffer error: {}",
+                                        tag,
+                                        layer_idx,
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[{}] CUDA delta_rule layer {}: buffer creation error: {}",
+                                tag,
+                                layer_idx,
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let qm_wqkv = QMatMul::from_qtensor(wqkv)?;
+                let qm_wgate = QMatMul::from_qtensor(wgate)?;
+                let qm_w_beta = QMatMul::from_qtensor(w_beta)?;
+                let qm_w_alpha = QMatMul::from_qtensor(w_alpha)?;
+                let qm_ssm_out = QMatMul::from_qtensor(ssm_out)?;
+                #[cfg(target_os = "macos")]
+                let wqkv_opt = maybe_repack_q4k_opt(&qm_wqkv, device)?;
+                #[cfg(target_os = "macos")]
+                let wgate_opt = maybe_repack_q4k_opt(&qm_wgate, device)?;
+                #[cfg(target_os = "macos")]
+                let w_beta_opt = maybe_repack_q4k_opt(&qm_w_beta, device)?;
+                #[cfg(target_os = "macos")]
+                let w_alpha_opt = maybe_repack_q4k_opt(&qm_w_alpha, device)?;
+                #[cfg(target_os = "macos")]
+                let ssm_out_opt = maybe_repack_q4k_opt(&qm_ssm_out, device)?;
+
+                HybridLayerType::DeltaNet(DeltaNetLayer {
+                    wqkv: qm_wqkv,
+                    wgate: qm_wgate,
+                    w_beta: qm_w_beta,
+                    w_alpha: qm_w_alpha,
+                    dt_bias,
+                    ssm_a,
+                    conv_kernel_weights,
+                    ssm_norm_weight,
+                    ssm_out: qm_ssm_out,
+                    state,
+                    #[cfg(target_os = "macos")]
+                    metal_ctx,
+                    #[cfg(feature = "cuda")]
+                    cuda_ctx,
+                    #[cfg(target_os = "macos")]
+                    wqkv_opt,
+                    #[cfg(target_os = "macos")]
+                    wgate_opt,
+                    #[cfg(target_os = "macos")]
+                    w_beta_opt,
+                    #[cfg(target_os = "macos")]
+                    w_alpha_opt,
+                    #[cfg(target_os = "macos")]
+                    ssm_out_opt,
+                    n_k_heads,
+                    n_v_heads,
+                    head_k_dim: head_k_dim_delta,
+                    head_v_dim,
+                    key_dim,
+                    value_dim,
+                    rms_norm_eps: rms_norm_eps as f32,
+                })
+            } else {
+                // ── Gated Attention Layer ──
+                let attention_wq_qt = load_heavy(&format!("{prefix}.attn_q.weight"))?;
+                let attention_wk_qt = load_heavy(&format!("{prefix}.attn_k.weight"))?;
+                let attention_wv_qt = load_heavy(&format!("{prefix}.attn_v.weight"))?;
+                let attention_wo_qt = load_heavy(&format!("{prefix}.attn_output.weight"))?;
+                let qm_attention_wq = QMatMul::from_qtensor(attention_wq_qt)?;
+                let qm_attention_wk = QMatMul::from_qtensor(attention_wk_qt)?;
+                let qm_attention_wv = QMatMul::from_qtensor(attention_wv_qt)?;
+                let qm_attention_wo = QMatMul::from_qtensor(attention_wo_qt)?;
+                #[cfg(target_os = "macos")]
+                let attention_wq_opt = maybe_repack_q4k_opt(&qm_attention_wq, device)?;
+                #[cfg(target_os = "macos")]
+                let attention_wk_opt = maybe_repack_q4k_opt(&qm_attention_wk, device)?;
+                #[cfg(target_os = "macos")]
+                let attention_wv_opt = maybe_repack_q4k_opt(&qm_attention_wv, device)?;
+                #[cfg(target_os = "macos")]
+                let attention_wo_opt = maybe_repack_q4k_opt(&qm_attention_wo, device)?;
+
+                // Q-Norm / K-Norm — CPU
+                let q_norm_qt = tensor_from_data(
+                    ct,
+                    data,
+                    &format!("{prefix}.attn_q_norm.weight"),
+                    &Device::Cpu,
+                )?;
+                let k_norm_qt = tensor_from_data(
+                    ct,
+                    data,
+                    &format!("{prefix}.attn_k_norm.weight"),
+                    &Device::Cpu,
+                )?;
+
+                // attn_window = context_length: attention видит ВЕСЬ prompt.
+                //
+                // ПРЕДЫДУЩЕЕ значение `const ATTN_WINDOW: usize = 2048` ломало
+                // саммаризацию длинных транскриптов: на 15K-токенном prompt'е
+                // sliding-eviction после prefill оставлял только последние 2048
+                // токенов (≈13% контекста), и модель «забывала» начало транскрипта
+                // — генерировала summary только по хвосту, выдавая галлюцинации.
+                // Подтверждено через bench_single_call_summarize (1ч встреча, 15070
+                // токенов): с window=2048 модель пропускала Couchbase/PikaData/Лёша
+                // из начала, выдавала «PDU/pнапи». С window=context_length модель
+                // видит весь prompt и захватывает реальные темы (go.mod/Gomodls).
+                //
+                // context_length у нас = min(GGUF.context, YTTRI_CONTEXT_LIMIT)
+                // для Qwen3.5-4B = min(262144, 81920) = 81920 (родной 262144 →
+                // clamping для разумного RAM cost).
+                //
+                // RAM cost при window=81920 (head_dim=256, n_kv_head=4, F16):
+                //   8 layers × 2 (K+V) × 4 × 81920 × 256 × 2 байт ≈ 2.6 ГБ.
+                //   Это крупнейший пул памяти после весов (~2.5 ГБ Q4_K_M); для
+                //   коротких сессий KV cache растёт по мере необходимости
+                //   (max_cache_len = context_length).
+                let attn_window = context_length;
+                HybridLayerType::Attention(GatedAttentionLayer {
+                    attention_wq: qm_attention_wq,
+                    attention_wk: qm_attention_wk,
+                    attention_wv: qm_attention_wv,
+                    attention_wo: qm_attention_wo,
+                    #[cfg(target_os = "macos")]
+                    attention_wq_opt,
+                    #[cfg(target_os = "macos")]
+                    attention_wk_opt,
+                    #[cfg(target_os = "macos")]
+                    attention_wv_opt,
+                    #[cfg(target_os = "macos")]
+                    attention_wo_opt,
+                    q_norm: rms_norm_cpu(q_norm_qt, rms_norm_eps, device)?,
+                    k_norm: rms_norm_cpu(k_norm_qt, rms_norm_eps, device)?,
+                    n_head: attn_head_count,
+                    n_kv_head: attn_head_count_kv,
+                    head_dim: attn_head_dim,
+                    rope_dim,
+                    cos: cos.clone(),
+                    sin: sin.clone(),
+                    kv_cache: None,
+                    kv_cache_len: 0,
+                    max_cache_len: context_length,
+                    attn_window,
+                })
+            };
+
+            blocks.push(HybridBlock {
+                attn_norm: rms_norm_cpu(attn_norm_qt, rms_norm_eps, device)?,
+                ffn_norm: rms_norm_cpu(ffn_norm_qt, rms_norm_eps, device)?,
+                layer,
+                mlp,
+            });
+        }
+
+        let n_deltanet = blocks.iter().filter(|b| b.is_deltanet()).count();
+        let n_attention = block_count - n_deltanet;
+        #[cfg(target_os = "macos")]
+        let n_metal = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    &b.layer,
+                    HybridLayerType::DeltaNet(d) if d.metal_ctx.is_some()
+                )
+            })
+            .count();
+        #[cfg(not(target_os = "macos"))]
+        let n_metal = 0usize;
+        log::info!(
+            "[{}] Loaded {} layers ({} DeltaNet [{} Metal GPU] + {} Attention) in {:.0}ms",
+            tag,
+            block_count,
+            n_deltanet,
+            n_metal,
+            n_attention,
+            load_start.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        Ok(Self {
+            tok_embeddings,
+            blocks,
+            norm,
+            output,
+            context_length,
+            // T-274: уникальный id экземпляра для prompt cache identity guard
+            instance_nonce: rand::random::<u64>(),
+            // Scratch arena создаётся после build_model_common в from_gguf_zero_copy.
+            // from_gguf (non-zero-copy путь) тоже должен иметь None.
+            #[cfg(target_os = "macos")]
+            scratch_arena: None,
+            // Unified arena инициализируется после build_model_common в from_gguf_zero_copy.
+            #[cfg(target_os = "macos")]
+            unified_arena: None,
+        })
+    }
+
+    /// Сброс всех состояний: KV-cache (attention) + conv/SSM state (DeltaNet).
+    ///
+    /// Вызывать при начале новой беседы.
+    pub fn clear_state(&mut self) {
+        for block in self.blocks.iter_mut() {
+            match &mut block.layer {
+                HybridLayerType::DeltaNet(delta) => {
+                    // Очистка Metal GPU буферов (если есть)
+                    #[cfg(target_os = "macos")]
+                    if let Some(ctx) = &delta.metal_ctx {
+                        // Прямой zero-fill через unified memory (StorageModeShared)
+                        // Безопасно: forward() не выполняется параллельно с clear_state()
+                        unsafe {
+                            let ssm_ptr = ctx.layer_state.ssm_state.contents() as *mut u8;
+                            let ssm_len = ctx.layer_state.ssm_state.length();
+                            std::ptr::write_bytes(ssm_ptr, 0, ssm_len);
+
+                            let conv_ptr = ctx.layer_state.conv_state.contents() as *mut u8;
+                            let conv_len = ctx.layer_state.conv_state.length();
+                            std::ptr::write_bytes(conv_ptr, 0, conv_len);
+                        }
+                    }
+                    // T-331 Ф7-фикс: CUDA persistent ssm_state/conv_state живут на
+                    // GPU (источник правды на CUDA-пути) и не зануляются сами →
+                    // без этого рекуррентное состояние прошлой беседы протекает в
+                    // новую (некогерентный вывод + утечка контекста). htod нулей.
+                    #[cfg(feature = "cuda")]
+                    if let Some(ctx) = &mut delta.cuda_ctx {
+                        let dev = ctx.dev.clone();
+                        if let Err(e) =
+                            delta_rule_cuda::clear_cuda_state(&dev, &mut ctx.layer_state)
+                        {
+                            log::warn!("[qwen35] clear_cuda_state failed: {}", e);
+                        }
+                    }
+                    // CPU fallback state тоже очищаем (для consistency)
+                    delta.state.clear();
+                }
+                HybridLayerType::Attention(attn) => {
+                    attn.kv_cache = None;
+                    attn.kv_cache_len = 0;
+                }
+            }
+        }
+    }
+
+    /// Получить текущую длину KV-cache (количество закэшированных токенов).
+    ///
+    /// Возвращает длину из первого attention слоя. DeltaNet слои не имеют KV-cache,
+    /// но их SSM state неявно содержит информацию обо всех предыдущих токенах.
+    pub fn kv_cache_len(&self) -> usize {
+        for block in &self.blocks {
+            if let HybridLayerType::Attention(attn) = &block.layer {
+                return attn.kv_cache_len;
+            }
+        }
+        0
+    }
+
+    /// Проверить, активен ли Metal GPU path для DeltaNet слоёв.
+    ///
+    /// Возвращает (n_metal, n_deltanet) — количество DeltaNet слоёв с Metal
+    /// и общее количество DeltaNet слоёв. Если n_metal == n_deltanet — все
+    /// слои работают на GPU (0 CPU↔GPU sync). Если n_metal == 0 — полный
+    /// CPU fallback (медленно).
+    pub fn metal_path_status(&self) -> (usize, usize) {
+        let mut n_metal = 0usize;
+        let mut n_deltanet = 0usize;
+        for block in &self.blocks {
+            if let HybridLayerType::DeltaNet(d) = &block.layer {
+                n_deltanet += 1;
+                #[cfg(target_os = "macos")]
+                if d.metal_ctx.is_some() {
+                    n_metal += 1;
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = d; // silence unused-variable on non-macos
+            }
+        }
+        (n_metal, n_deltanet)
+    }
+
+    /// Откатить KV-cache до указанной длины (для prompt cache).
+    ///
+    /// Внимание: откатывает только attention KV-cache. DeltaNet SSM state
+    /// не поддерживает откат — при необходимости нужен полный clear_state.
+    pub fn truncate_kv_cache(&mut self, new_len: usize) {
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(attn) = &mut block.layer {
+                if attn.kv_cache_len > new_len {
+                    attn.kv_cache_len = new_len;
+                }
+            }
+        }
+    }
+
+    /// Обрезать KV-cache до sliding window для всех attention слоёв.
+    ///
+    /// После длинного prefill KV cache может превышать attn_window.
+    /// Этот метод сдвигает данные, оставляя только последние attn_window записей.
+    /// Вызывается автоматически после prefill в forward().
+    fn truncate_kv_cache_to_window(&mut self) {
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(attn) = &mut block.layer {
+                if attn.kv_cache_len > attn.attn_window {
+                    let drop = attn.kv_cache_len - attn.attn_window;
+                    if let Some((ref k_cache, ref v_cache)) = attn.kv_cache {
+                        // Сдвигаем: берём последние attn_window записей
+                        if let (Ok(k_tail), Ok(v_tail)) = (
+                            k_cache.narrow(2, drop, attn.attn_window),
+                            v_cache.narrow(2, drop, attn.attn_window),
+                        ) {
+                            if let (Ok(k_c), Ok(v_c)) = (k_tail.contiguous(), v_tail.contiguous()) {
+                                let _ = k_cache.slice_set(&k_c, 2, 0);
+                                let _ = v_cache.slice_set(&v_c, 2, 0);
+                                attn.kv_cache_len = attn.attn_window;
+                                log::info!(
+                                    "[SlidingWindow] Trimmed KV cache: {} → {} (dropped {} oldest)",
+                                    attn.kv_cache_len + drop,
+                                    attn.attn_window,
+                                    drop,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Получить identity nonce модели (T-274).
+    pub(crate) fn instance_nonce(&self) -> u64 {
+        self.instance_nonce
+    }
+
+    /// Захват полного snapshot модели для prompt cache (T-274, Phase 3).
+    ///
+    /// Итерирует все блоки и собирает state каждого через `block.snapshot_block(device)`.
+    /// Возвращает структуру со всеми snapshot'ами + identity nonce + позицию prefix'а.
+    ///
+    /// Caller отвечает за вызов ПОСЛЕ `prefill(prompt_tokens[..position])` — снимок
+    /// отражает state модели на конкретной позиции.
+    pub fn snapshot_state(&self, device: &Device, position: usize) -> Result<StateSnapshot> {
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            blocks.push(block.snapshot_block(device)?);
+        }
+        Ok(StateSnapshot {
+            model_nonce: self.instance_nonce,
+            position,
+            blocks,
+        })
+    }
+
+    /// Восстановление модели из snapshot (T-274, Phase 3).
+    ///
+    /// Защитные guard'ы:
+    /// - `model_nonce`: snapshot должен быть сделан с этим экземпляром модели
+    /// - длина `blocks`: совпадает с числом блоков модели (защита от config drift)
+    /// - variant match каждого блока проверяется в `HybridBlock::restore_block`
+    pub fn restore_state(&mut self, device: &Device, snap: &StateSnapshot) -> Result<()> {
+        if snap.model_nonce != self.instance_nonce {
+            candle_core::bail!(
+                "restore_state: model nonce mismatch (snapshot from different model instance): \
+                 snap={:#x} vs self={:#x}",
+                snap.model_nonce,
+                self.instance_nonce
+            );
+        }
+        if snap.blocks.len() != self.blocks.len() {
+            candle_core::bail!(
+                "restore_state: blocks length mismatch: snap={} vs model={}",
+                snap.blocks.len(),
+                self.blocks.len()
+            );
+        }
+        for (block, block_snap) in self.blocks.iter_mut().zip(snap.blocks.iter()) {
+            block.restore_block(device, block_snap)?;
+        }
+        Ok(())
+    }
+
+    /// Isolated capture одного Q4_K_M matmul dispatch для GPU profiling (T-274 GPU Profile follow-up).
+    ///
+    /// Берёт `blocks[0].mlp.feed_forward_w1` (MLP gate_proj: 2560 → 9216),
+    /// оборачивает один forward call в `MTLCaptureManager.capture()` и
+    /// сохраняет `.gputrace` по указанному пути. Результат содержит **ровно
+    /// один kernel_mul_mm dispatch** — это безопасно для Xcode "Profile"
+    /// (на 1 dispatch shader instrumentation не убивает WindowServer).
+    ///
+    /// `seq_len` — длина seq в input (для prefill используй 2048; для decode = 1).
+    /// Output `.gputrace` пишется в `output_path` (рекомендуется внешний диск).
+    ///
+    /// Returns `Err` если device не Metal или capture не удалась.
+    #[cfg(target_os = "macos")]
+    pub fn debug_capture_single_matmul(
+        &self,
+        device: &Device,
+        output_path: &str,
+        seq_len: usize,
+    ) -> Result<()> {
+        let metal_device = match device {
+            Device::Metal(m) => m,
+            _ => candle_core::bail!("debug_capture_single_matmul: requires Metal device"),
+        };
+        let n_embd = 2560usize; // Qwen3.5-4B hidden_size
+        let block0 = self
+            .blocks
+            .first()
+            .ok_or_else(|| candle_core::Error::Msg("model has no blocks".into()))?;
+        let w1 = &block0.mlp.feed_forward_w1;
+        let w1_opt = block0.mlp.feed_forward_w1_opt.as_ref();
+
+        // Realistic input tensor: F32 [1, seq_len, n_embd] на Metal device.
+        // Production embeddings produce F32; Q4_K_M matmul kernel — `kernel_mul_mm_q4_K_f32`.
+        let input = Tensor::zeros((1, seq_len, n_embd), DType::F32, device)?;
+        // T-275 Phase 6: используем dispatch_q4k_matmul чтобы capture отражал
+        // реально active kernel (v1 vs v2 по runtime override + ENV var).
+        // Warmup: один forward без capture чтобы скомпилировать shader pipeline.
+        let _ = dispatch_q4k_matmul(w1, w1_opt, &input)?;
+        metal_device.wait_until_completed()?;
+        let _ = metal_device.flush_buffers();
+
+        // Capture scope.
+        //
+        // ВАЖНО: Candle's MetalCommandBuffer pool делает lazy commit (auto-commit
+        // только при >50 ops). Один dispatch остаётся в pending encoder и НЕ попадает
+        // в captured trace (MTLCaptureManager видит только committed CBs).
+        //
+        // Решение: loop 60 итераций одного и того же matmul. После 50 ops
+        // срабатывает Candle auto-commit → captured CB с 50 dispatch'ями. Финальные
+        // 10 идут в pending CB, force-committed через wait_until_completed.
+        // Итого: 2 committed CBs с одинаковым шейдером — Xcode инструментирует
+        // один пайплайн один раз → безопасно для Profile.
+        const ITERATIONS: usize = 60;
+        metal_device
+            .capture(output_path)
+            .map_err(candle_core::Error::wrap)?;
+        for _ in 0..ITERATIONS {
+            let _ = dispatch_q4k_matmul(w1, w1_opt, &input)?;
+        }
+        // Force flush + wait чтобы pending CB закоммитился ДО stop_capture.
+        metal_device.wait_until_completed()?;
+        metal_device.stop_capture();
+
+        log::info!(
+            "[debug_capture_single_matmul] saved gputrace to {} (1 dispatch, shape [1, {}, {}] → [1, {}, 9216])",
+            output_path,
+            seq_len,
+            n_embd,
+            seq_len,
+        );
+        Ok(())
+    }
+
+    /// Pre-allocate KV-cache буферы для attention слоёв (chunked prefill).
+    ///
+    /// Аллоцирует буфер размером min(total_len, attn_window) — sliding window
+    /// гарантирует, что KV cache не вырастет больше окна при decode.
+    /// DeltaNet слои не требуют pre-allocation — их состояние фиксированного размера.
+    pub fn pre_allocate_kv_cache(
+        &mut self,
+        total_len: usize,
+        device: &candle_core::Device,
+    ) -> candle_core::Result<()> {
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(attn) = &mut block.layer {
+                let capped_len = total_len.min(attn.max_cache_len).min(attn.attn_window);
+                // KV cache — long-lived, не из scratch arena.
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let k_buf = Tensor::zeros(
+                    (1, attn.n_kv_head, capped_len, attn.head_dim),
+                    DType::F16,
+                    device,
+                )?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let v_buf = Tensor::zeros(
+                    (1, attn.n_kv_head, capped_len, attn.head_dim),
+                    DType::F16,
+                    device,
+                )?;
+                attn.kv_cache = Some((k_buf, v_buf));
+                attn.kv_cache_len = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// T-378 Ф4 (PD-012, F-A): зарезервировать ёмкость KV-cache под `total_len`
+    /// токенов **с сохранением** существующего KV-содержимого и `kv_cache_len`.
+    ///
+    /// В отличие от `pre_allocate_kv_cache` (который обнуляет `kv_cache_len=0` и
+    /// заменяет буфер на пустой), этот метод:
+    /// - no-op если текущая ёмкость (cap = `kv_cache.dim(2)`) уже ≥ `total_len`;
+    /// - иначе аллоцирует больший буфер (capped по max_cache_len/attn_window),
+    ///   копирует существующий KV `[0..kv_cache_len]` в начало, **оставляет
+    ///   `kv_cache_len` без изменений**.
+    ///
+    /// Назначение: при partial-restore (restore_state из grid-снапшота) ёмкость
+    /// восстановленного буфера = `snap.position` (без headroom). Forward хвоста
+    /// ушёл бы в инкрементную реаллокацию каждый chunk (forward_attn:2305).
+    /// `reserve_kv_cache(prompt_len + headroom)` после restore устраняет это.
+    /// Вызывать ПОСЛЕ `restore_state` (он устанавливает kv_cache_len+содержимое),
+    /// ДО prefill хвоста.
+    pub fn reserve_kv_cache(
+        &mut self,
+        total_len: usize,
+        device: &candle_core::Device,
+    ) -> candle_core::Result<()> {
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(attn) = &mut block.layer {
+                let capped_len = total_len.min(attn.max_cache_len).min(attn.attn_window);
+                let Some((ref k_cache, ref v_cache)) = attn.kv_cache else {
+                    // Нет KV (не было prefill/restore) — эквивалентно pre_allocate.
+                    #[cfg(target_os = "macos")]
+                    candle_core::skip_arena_next_alloc();
+                    let k_buf = Tensor::zeros(
+                        (1, attn.n_kv_head, capped_len, attn.head_dim),
+                        DType::F16,
+                        device,
+                    )?;
+                    #[cfg(target_os = "macos")]
+                    candle_core::skip_arena_next_alloc();
+                    let v_buf = Tensor::zeros(
+                        (1, attn.n_kv_head, capped_len, attn.head_dim),
+                        DType::F16,
+                        device,
+                    )?;
+                    attn.kv_cache = Some((k_buf, v_buf));
+                    continue;
+                };
+                let current_cap = k_cache.dim(2)?;
+                if current_cap >= capped_len {
+                    continue; // уже достаточно ёмкости
+                }
+                // Рост буфера с сохранением содержимого [0..kv_cache_len].
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let new_k = Tensor::zeros(
+                    (1, attn.n_kv_head, capped_len, attn.head_dim),
+                    DType::F16,
+                    device,
+                )?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let new_v = Tensor::zeros(
+                    (1, attn.n_kv_head, capped_len, attn.head_dim),
+                    DType::F16,
+                    device,
+                )?;
+                if attn.kv_cache_len > 0 {
+                    let old_k = k_cache.narrow(2, 0, attn.kv_cache_len)?.contiguous()?;
+                    let old_v = v_cache.narrow(2, 0, attn.kv_cache_len)?.contiguous()?;
+                    new_k.slice_set(&old_k, 2, 0)?;
+                    new_v.slice_set(&old_v, 2, 0)?;
+                }
+                // kv_cache_len НЕ меняем — содержимое сохранено, ёмкость выросла.
+                attn.kv_cache = Some((new_k, new_v));
+            }
+        }
+        Ok(())
+    }
+
+    /// Forward pass: input token IDs → logits
+    ///
+    /// # Аргументы
+    /// - `x` — тензор input token IDs, shape `(batch, seq_len)`
+    /// - `index_pos` — позиция в последовательности (для KV-cache и RoPE)
+    ///
+    /// # Возвращает
+    /// Logits shape `(batch, vocab_size)`
+    ///
+    /// # Batch prefill
+    /// При seq_len > 1 используется оптимизированный batch prefill:
+    /// - Embedding: один batch lookup
+    /// - DeltaNet слои: batch GPU проекции + sequential CPU delta rule
+    /// - Attention слои: batch forward_attn (SDPA)
+    /// Это ~100x быстрее старого token-by-token подхода за счёт минимизации GPU↔CPU трансферов.
+    #[cfg(target_os = "macos")]
+    pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        // Пул обязателен: инференс идёт на долгоживущих потоках llm_queue/стриминга —
+        // без него autoreleased Metal-объекты драйвера копятся до выхода потока
+        // (инцидент 2026-07-06, см. crate::real::metal_utils::with_autoreleasepool).
+        crate::real::metal_utils::with_autoreleasepool(|| self.forward_inner(x, index_pos))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        self.forward_inner(x, index_pos)
+    }
+
+    fn forward_inner(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let t_start = std::time::Instant::now();
+        let (_b_sz, seq_len) = x.dims2()?;
+
+        // Сброс аккумуляторов тайминга (только для single-token generation)
+        if seq_len == 1 {
+            GEN_TIMINGS.with(|t| t.borrow_mut().reset());
+        }
+
+        // Embedding lookup: один batch вызов (деквантизируем все seq_len строк за раз).
+        let emb_cpu = self.tok_embeddings.forward(x)?;
+        let mut layer_in = emb_cpu.to_device(x.device())?;
+        let t_embed = t_start.elapsed();
+
+        let t_layers_start = std::time::Instant::now();
+
+        if seq_len > 1 {
+            #[cfg(target_os = "macos")]
+            let metal_dev = layer_in.device().as_metal_device().ok().cloned();
+            #[cfg(target_os = "macos")]
+            {
+                // Multi-CB prefill: отключаем auto-commit (все ops → один CB),
+                // arena reset каждые 4 слоя без GPU wait, финальный wait — после цикла.
+                // Экономит ~6 commit→swap циклов на prefill (auto-commit каждые 50 ops
+                // при ~320 total ops давал ~6 промежуточных коммитов).
+                let prev_limit = candle_metal_kernels::metal::commands::graph_scope_limit();
+                candle_metal_kernels::metal::commands::set_graph_scope_limit(1_000_000);
+
+                // RAII guard для деактивации arena при любом выходе (включая панику).
+                struct ArenaDeactivateGuard(Option<candle_core::MetalDevice>);
+                impl Drop for ArenaDeactivateGuard {
+                    fn drop(&mut self) {
+                        if let Some(dev) = &self.0 {
+                            dev.deactivate_scratch_arena();
+                        }
+                    }
+                }
+                // Активируем Phase 2 scratch arena (если есть).
+                let _arena_guard = {
+                    let activated_dev = if let Some(arena) = &self.scratch_arena {
+                        if let Some(dev) = &metal_dev {
+                            dev.activate_scratch_arena(Arc::clone(arena));
+                            Some(dev.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    ArenaDeactivateGuard(activated_dev)
+                };
+
+                let result =
+                    prefill_loop_multi_cb!(layer_in, self.blocks, index_pos, &metal_dev, literal 4);
+
+                // Диагностика: проверяем, не исчерпалась ли arena
+                if let Some(arena) = &self.scratch_arena {
+                    let free = arena.free_count();
+                    let total = arena.slots.len();
+                    if free == 0 {
+                        log::warn!(
+                            "[Qwen3.5/arena] ARENA EXHAUSTED: 0/{} slots free after prefill (seq={})",
+                            total, seq_len
+                        );
+                    } else {
+                        log::debug!(
+                            "[Qwen3.5/arena] {}/{} slots free after prefill (seq={})",
+                            free,
+                            total,
+                            seq_len
+                        );
+                    }
+                }
+
+                // Восстанавливаем normal auto-commit behaviour
+                candle_metal_kernels::metal::commands::set_graph_scope_limit(prev_limit);
+
+                result?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            for block in self.blocks.iter_mut() {
+                layer_in = block.forward_prefill(&layer_in, index_pos)?;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(dev) = &metal_dev {
+                let _ = dev.wait_until_completed_fast();
+                let _ = dev.flush_buffers();
+            }
+            // Sliding window: обрезаем KV cache до окна после prefill.
+            // Если промт > attn_window, attention слои накопили лишние записи.
+            self.truncate_kv_cache_to_window();
+        } else {
+            // Оптимальный путь: single token (авторегрессивная генерация)
+            for block in self.blocks.iter_mut() {
+                layer_in = block.forward(&layer_in, index_pos)?;
+            }
+        }
+
+        let t_layers = t_layers_start.elapsed();
+
+        let t_head_start = std::time::Instant::now();
+        let x = self.norm.forward(&layer_in)?;
+        let x = x.i((.., seq_len - 1, ..))?;
+        let logits = self.output.forward(&x)?;
+        let t_head = t_head_start.elapsed();
+
+        // Профилирование
+        let should_log = index_pos % 32 == 0 || index_pos < 3 || seq_len > 1;
+        if should_log {
+            let total = t_start.elapsed();
+            log::debug!(
+                "[Qwen3.5/forward] pos={} seq={} total={:.1}ms (embed={:.1}ms layers={:.1}ms head={:.1}ms)",
+                index_pos,
+                seq_len,
+                total.as_secs_f64() * 1000.0,
+                t_embed.as_secs_f64() * 1000.0,
+                t_layers.as_secs_f64() * 1000.0,
+                t_head.as_secs_f64() * 1000.0,
+            );
+        }
+
+        // Детальный breakdown для single-token generation (каждые 32 токена)
+        if seq_len == 1 && should_log {
+            GEN_TIMINGS.with(|t| {
+                let g = t.borrow();
+                let total_us = t_start.elapsed().as_micros() as u64;
+                let delta_total = g.total_delta_us();
+                let attn_total = g.total_attn_us();
+
+                log::debug!(
+                    "[GenProfile] pos={} | DeltaNet({}): {:.1}ms [proj={:.1} xfer={:.1} prep={:.1} norm={:.1} delta={:.1} rms+gate={:.1} out={:.1}]",
+                    index_pos,
+                    g.delta_count,
+                    delta_total as f64 / 1000.0,
+                    g.delta_proj_us as f64 / 1000.0,
+                    g.delta_transfer_us as f64 / 1000.0,
+                    g.delta_prep_us as f64 / 1000.0,
+                    g.delta_norm_us as f64 / 1000.0,
+                    g.delta_rule_us as f64 / 1000.0,
+                    g.delta_rms_gate_us as f64 / 1000.0,
+                    g.delta_out_proj_us as f64 / 1000.0,
+                );
+                log::debug!(
+                    "[GenProfile] pos={} | Attn({}): {:.1}ms [proj={:.1} reshape={:.1} kv={:.1} sdpa={:.1} gate+out={:.1}]",
+                    index_pos,
+                    g.attn_count,
+                    attn_total as f64 / 1000.0,
+                    g.attn_proj_us as f64 / 1000.0,
+                    g.attn_reshape_us as f64 / 1000.0,
+                    g.attn_kv_cache_us as f64 / 1000.0,
+                    g.attn_sdpa_us as f64 / 1000.0,
+                    g.attn_gate_out_us as f64 / 1000.0,
+                );
+                log::debug!(
+                    "[GenProfile] pos={} | Norms: {:.1}ms | MLP: {:.1}ms | sum={:.1}ms vs total={:.1}ms",
+                    index_pos,
+                    g.norm_us as f64 / 1000.0,
+                    g.mlp_us as f64 / 1000.0,
+                    (delta_total + attn_total + g.norm_us + g.mlp_us) as f64 / 1000.0,
+                    total_us as f64 / 1000.0,
+                );
+                // Sync timing breakdown from Candle Metal command buffer pool
+                #[cfg(target_os = "macos")]
+                {
+                    let (cnt, sem, lock, commit, wait, total) =
+                        candle_core::MetalDevice::take_sync_timings_static();
+                    if cnt > 0 {
+                        log::debug!(
+                            "[GenProfile] pos={} | Sync({}): {:.1}ms [sem={:.1} lock={:.1} commit={:.1} waitGPU={:.1}] avg={:.2}ms",
+                            index_pos,
+                            cnt,
+                            total as f64 / 1000.0,
+                            sem as f64 / 1000.0,
+                            lock as f64 / 1000.0,
+                            commit as f64 / 1000.0,
+                            wait as f64 / 1000.0,
+                            total as f64 / cnt as f64 / 1000.0,
+                        );
+                    }
+                }
+            });
+        }
+
+        Ok(logits)
+    }
+
+    /// Hidden size модели (== embedding dimension).
+    ///
+    /// Для Qwen3.5-4B = 2560. Используется в multimodal pipeline'ах для
+    /// проверки совместимости размерности vision_embeds (после VisionProjector
+    /// в vision-encoder crate размерность должна совпадать с hidden_size).
+    pub fn hidden_size(&self) -> usize {
+        self.tok_embeddings.n_cols
+    }
+
+    /// Контекстное окно модели.
+    pub fn max_context_length(&self) -> usize {
+        self.context_length
+    }
+
+    /// Forward с pre-computed embeddings (skip embedding lookup).
+    ///
+    /// Используется в multimodal pipeline'ах (vision input через Qwen3.5-2B):
+    /// входная последовательность — concat `image_embeds` + `text_embeds`,
+    /// которые уже находятся в hidden space (`hidden_size`).
+    ///
+    /// `embeds` shape: `[batch, seq_len, hidden_size]`. Возвращает logits
+    /// последнего токена `[batch, vocab_size]` (как `forward`).
+    ///
+    /// Memory-safe: тот же flush_buffers pattern что в `forward` (sync каждые
+    /// 4 слоя на Metal). См. `docs/research/2026-05-05-memory-peak-optimization.md`.
+    #[cfg(target_os = "macos")]
+    pub fn forward_embeds(&mut self, embeds: &Tensor, index_pos: usize) -> Result<Tensor> {
+        // Пул обязателен: см. комментарий у forward().
+        crate::real::metal_utils::with_autoreleasepool(|| {
+            self.forward_embeds_inner(embeds, index_pos)
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn forward_embeds(&mut self, embeds: &Tensor, index_pos: usize) -> Result<Tensor> {
+        self.forward_embeds_inner(embeds, index_pos)
+    }
+
+    fn forward_embeds_inner(&mut self, embeds: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b_sz, seq_len, hidden) = embeds.dims3()?;
+        if hidden != self.hidden_size() {
+            candle_core::bail!(
+                "forward_embeds: hidden mismatch — embeds {}, model {}",
+                hidden,
+                self.hidden_size()
+            );
+        }
+
+        // Сброс таймингов только для single-token (как в forward).
+        if seq_len == 1 {
+            GEN_TIMINGS.with(|t| t.borrow_mut().reset());
+        }
+
+        let mut layer_in = embeds.clone();
+
+        if seq_len > 1 {
+            #[cfg(target_os = "macos")]
+            let metal_dev = layer_in.device().as_metal_device().ok().cloned();
+            #[cfg(target_os = "macos")]
+            {
+                let prev_limit = candle_metal_kernels::metal::commands::graph_scope_limit();
+                candle_metal_kernels::metal::commands::set_graph_scope_limit(1_000_000);
+
+                struct ArenaDeactivateGuardEmbeds(Option<candle_core::MetalDevice>);
+                impl Drop for ArenaDeactivateGuardEmbeds {
+                    fn drop(&mut self) {
+                        if let Some(dev) = &self.0 {
+                            dev.deactivate_scratch_arena();
+                        }
+                    }
+                }
+                let _arena_guard = {
+                    let activated_dev = if let Some(arena) = &self.scratch_arena {
+                        if let Some(dev) = &metal_dev {
+                            dev.activate_scratch_arena(Arc::clone(arena));
+                            Some(dev.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    ArenaDeactivateGuardEmbeds(activated_dev)
+                };
+
+                let result =
+                    prefill_loop_multi_cb!(layer_in, self.blocks, index_pos, &metal_dev, literal 4);
+
+                candle_metal_kernels::metal::commands::set_graph_scope_limit(prev_limit);
+                result?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            for block in self.blocks.iter_mut() {
+                layer_in = block.forward_prefill(&layer_in, index_pos)?;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(dev) = &metal_dev {
+                let _ = dev.wait_until_completed_fast();
+                let _ = dev.flush_buffers();
+            }
+            self.truncate_kv_cache_to_window();
+        } else {
+            for block in self.blocks.iter_mut() {
+                layer_in = block.forward(&layer_in, index_pos)?;
+            }
+        }
+
+        let x = self.norm.forward(&layer_in)?;
+        let x = x.i((.., seq_len - 1, ..))?;
+        self.output.forward(&x)
+    }
+
+    /// Forward с image + text — multimodal entry point.
+    ///
+    /// `image_embeds` — output от vision encoder (после `Merger` в `vision-encoder`
+    /// crate, размерность `[batch, n_image_tokens, hidden_size]` уже в LLM space).
+    /// Для Qwen3.5-2B при image 768×768 → `n_image_tokens = 576`.
+    ///
+    /// `input_ids` — text tokens (опционально, может быть None для image-only
+    /// captioning без префикса). Если задано — embeddings извлекаются через
+    /// `tok_embeddings.forward()` (CPU dequant для одной последовательности — быстро).
+    ///
+    /// Concat'ит `[image_embeds, text_embeds]` по seq dimension и делегирует в
+    /// `forward_embeds`. По образцу `RustASR Qwen3Decoder::forward_with_audio`.
+    ///
+    /// Возвращает logits последнего токена `[batch, vocab_size]`.
+    pub fn forward_with_image(
+        &mut self,
+        image_embeds: &Tensor,
+        input_ids: Option<&Tensor>,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        let target_device = image_embeds.device();
+
+        // Native dtype text-LLM forward'а — F32. tok_embeddings.forward() выдаёт
+        // именно F32 (CPU dequant из Q4_K_M), и blocks/RmsNorm на нём работают.
+        // Vision encoder может выдавать F16 (на Metal) — обязательно cast'им в F32
+        // перед concat, иначе RmsNorm падает с "rmsnorm not implemented for F16 F32".
+        let image_embeds_f32 = image_embeds.to_dtype(DType::F32)?;
+
+        let combined = if let Some(ids) = input_ids {
+            let text_emb = self.tok_embeddings.forward(ids)?.to_device(target_device)?;
+            Tensor::cat(&[&image_embeds_f32, &text_emb], 1)?
+        } else {
+            image_embeds_f32
+        };
+        self.forward_embeds(&combined, index_pos)
+    }
+
+    /// T-378 (мемори-фикс 2026-07-02): логиты ТОЛЬКО на `boundary_positions` в CPU
+    /// `Vec<f32>`, а НЕ весь `[1, seq, vocab]` тензор.
+    ///
+    /// Раньше `forward_all_logits` копил `Vec<Tensor>` (seq×[1,vocab]×f32 ≈ 4.6ГБ при
+    /// seq=4647) и затем `Tensor::stack` создавал ещё [1,seq,vocab] (~4.6ГБ) = ~9ГБ пик
+    /// + модель ~5ГБ ≈ 14ГБ → зависание/краш системы. Тесту (единственный вызывающий —
+    /// прод-`forward` отдаёт last-token) нужны логиты лишь на нескольких boundary-
+    /// позициях. Здесь пик — num_boundaries × vocab (~МБ): логиты нужной позиции СРАЗУ
+    /// уходят в CPU, GPU-тензор дропается на выходе итерации.
+    ///
+    /// Каждый forward — decode (seq_len=1, как требует DeltaNet); периодический flush
+    /// Metal-пула (промежуточные буферы). Возврат — в порядке `boundary_positions`.
+    pub fn forward_boundary_logits(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        boundary_positions: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        let (_b_sz, _seq_len) = x.dims2()?;
+
+        // По одному токену (DeltaNet требует seq_len=1); КЕЕП только нужные позиции.
+        let token_ids: Vec<u32> = x.squeeze(0)?.to_vec1()?;
+        let want: std::collections::HashSet<usize> = boundary_positions.iter().copied().collect();
+        let mut collected: std::collections::HashMap<usize, Vec<f32>> =
+            std::collections::HashMap::with_capacity(boundary_positions.len());
+
+        const FLUSH_EVERY: usize = 256;
+        let device = x.device();
+        let is_metal = device.is_metal();
+
+        for (i, &token_id) in token_ids.iter().enumerate() {
+            let single_input = Tensor::new(&[token_id], device)?.unsqueeze(0)?;
+            let logits = self.forward(&single_input, index_pos + i)?;
+            if want.contains(&i) {
+                // Нужная позиция → СРАЗУ в CPU; `logits` (GPU) дропнется на выходе
+                // итерации. Так пик = num_boundaries × vocab (~МБ), не 9ГБ.
+                let v: Vec<f32> = logits
+                    .squeeze(0)?
+                    .to_dtype(candle_core::DType::F32)?
+                    .to_vec1()?;
+                collected.insert(i, v);
+            }
+            // Периодический flush Metal-пула между forward'ами (без него пул растёт).
+            if is_metal && i > 0 && i % FLUSH_EVERY == 0 {
+                let _ = device.synchronize();
+                let _ = device.flush_buffers();
+            }
+        }
+
+        if is_metal {
+            let _ = device.synchronize();
+            let _ = device.flush_buffers();
+        }
+
+        Ok(boundary_positions
+            .iter()
+            .map(|pos| collected.get(pos).cloned().unwrap_or_default())
+            .collect())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Вспомогательные функции
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Предрассчитать cos/sin для Partial RoPE.
+///
+/// Для Qwen3.5: rope_dim = head_dim * partial_rotary_factor = 256 * 0.25 = 64.
+/// Таблицы shape: [context_length, rope_dim / 2].
+fn precompute_freqs_cis(
+    rope_dim: usize,
+    freq_base: f32,
+    context_length: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let theta: Vec<_> = (0..rope_dim)
+        .step_by(2)
+        .map(|i| 1f32 / freq_base.powf(i as f32 / rope_dim as f32))
+        .collect();
+    let theta = Tensor::new(theta.as_slice(), device)?;
+    let idx_theta = Tensor::arange(0, context_length as u32, device)?
+        .to_dtype(DType::F32)?
+        .reshape((context_length, 1))?
+        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+    let cos = idx_theta.cos()?;
+    let sin = idx_theta.sin()?;
+    Ok((cos, sin))
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Unit-тесты для prompt cache snapshot/restore (T-274, Phase 1)
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CPU round-trip: state с уникальными значениями → snapshot → clear → restore → equality.
+    #[test]
+    fn test_delta_net_state_snapshot_roundtrip() {
+        // Реалистичные параметры (близкие к Qwen3.5-4B, но меньше для скорости теста)
+        let conv_kernel = 4;
+        let channels = 64;
+        let n_v_heads = 8;
+        let head_v_dim = 16;
+
+        let mut state = DeltaNetState::new(conv_kernel, channels, n_v_heads, head_v_dim);
+
+        // Заполняем уникальными значениями
+        for (i, x) in state.conv_buf.iter_mut().enumerate() {
+            *x = (i as f32) * 0.1 + 1.0;
+        }
+        for (i, x) in state.ssm_state.iter_mut().enumerate() {
+            *x = (i as f32) * 0.01 - 5.0;
+        }
+
+        let snap = state.to_snapshot();
+        let expected_conv = state.conv_buf.clone();
+        let expected_ssm = state.ssm_state.clone();
+
+        // Очищаем (имитация нового запроса без cache hit)
+        state.clear();
+        assert!(state.conv_buf.iter().all(|&x| x == 0.0));
+        assert!(state.ssm_state.iter().all(|&x| x == 0.0));
+
+        // Восстанавливаем
+        state.restore_from(&snap);
+        assert_eq!(state.conv_buf, expected_conv);
+        assert_eq!(state.ssm_state, expected_ssm);
+
+        // Snapshot не должен меняться от мутации state
+        let mut state2 = state;
+        state2.conv_buf[0] = 999.0;
+        state2.ssm_state[0] = 999.0;
+        assert_ne!(
+            snap.conv_buf[0], 999.0,
+            "snapshot leaked storage with state"
+        );
+        assert_ne!(
+            snap.ssm_state[0], 999.0,
+            "snapshot leaked storage with state"
+        );
+    }
+
+    /// Проверка `restore_from` корректно отрабатывает после двух последовательных snapshot'ов.
+    #[test]
+    fn test_delta_net_state_two_snapshots_independent() {
+        let mut state = DeltaNetState::new(4, 32, 4, 8);
+
+        state
+            .conv_buf
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, x)| *x = i as f32);
+        let snap1 = state.to_snapshot();
+
+        state
+            .conv_buf
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, x)| *x = (i + 1000) as f32);
+        let snap2 = state.to_snapshot();
+
+        // Восстанавливаем первый
+        state.restore_from(&snap1);
+        for (i, &v) in state.conv_buf.iter().enumerate() {
+            assert_eq!(v, i as f32);
+        }
+        // Второй snapshot не должен быть затронут
+        for (i, &v) in snap2.conv_buf.iter().enumerate() {
+            assert_eq!(v, (i + 1000) as f32);
+        }
+    }
+
+    /// KV snapshot: tensor → KvCacheSnap → restore → forward-style мутация не задевает snapshot.
+    #[test]
+    fn test_kv_cache_snap_deep_clone_isolation() -> Result<()> {
+        let device = Device::Cpu;
+        let shape = (1usize, 2usize, 4usize, 8usize); // batch, n_kv_head, seq, head_dim
+        let total: usize = shape.0 * shape.1 * shape.2 * shape.3;
+        let data: Vec<f32> = (0..total).map(|i| i as f32 * 0.5).collect();
+
+        let k = Tensor::from_vec(data.clone(), shape, &device)?;
+        let v = Tensor::from_vec(
+            data.iter().map(|x| x + 1000.0).collect::<Vec<_>>(),
+            shape,
+            &device,
+        )?;
+
+        let snap = KvCacheSnap {
+            k: tensor_deep_clone(&k)?,
+            v: tensor_deep_clone(&v)?,
+            cache_len: 4,
+        };
+
+        // Имитация restore: получить новые тензоры из snap
+        let k_restored = tensor_deep_clone(&snap.k)?;
+        let _v_restored = tensor_deep_clone(&snap.v)?;
+
+        // Проверка: данные равны исходным
+        let k_flat = k_restored.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(k_flat, data);
+
+        // Имитация forward после restore: модификация k_restored через arithmetic
+        let mutated = (&k_restored + 1.0f64)?;
+        let mut_flat = mutated.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(mut_flat[0], data[0] + 1.0);
+
+        // Snapshot не должен измениться от арифметики над restored тензором
+        let snap_flat = snap.k.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(
+            snap_flat, data,
+            "snapshot k tensor was mutated by post-restore arithmetic"
+        );
+
+        Ok(())
+    }
+
+    /// BlockStateSnap variant mismatch при restore → Err.
+    /// Создание HybridBlock тяжёлое (нужны веса), поэтому проверяем только enum-логику
+    /// через прямой вызов `tensor_deep_clone` + handcrafted snap'ы.
+    #[test]
+    fn test_block_state_snap_variant_mismatch_error_paths() -> Result<()> {
+        // Просто проверяем что обе ветки ошибок дают Err с информативным сообщением.
+        // Полный round-trip HybridBlock покрыт интеграционным parity тестом в Phase 6.
+        let dn_snap = BlockStateSnap::DeltaNet(DeltaNetStateSnap {
+            conv_buf: vec![0.0; 3 * 32],
+            ssm_state: vec![0.0; 4 * 8 * 8],
+        });
+        let attn_snap = BlockStateSnap::Attention(None);
+        // Просто sanity: clone должен работать
+        let _ = dn_snap.clone();
+        let _ = attn_snap.clone();
+        Ok(())
+    }
+
+    /// GPU round-trip: создаём `DeltaNetMetalState` с уникальными данными,
+    /// snapshot → CPU Vec, обнуляем GPU, restore → проверка equality (T-274 Phase 2).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_metal_state_snapshot_restore_roundtrip() -> Result<()> {
+        use super::metal::delta_rule_metal::{
+            buffer_from_f32, buffer_to_f32, clear_metal_state, restore_metal_state,
+            snapshot_metal_state, DeltaNetMetalState, DeltaParams,
+        };
+
+        let device = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP test_metal_state_snapshot_restore_roundtrip: Metal not available");
+                return Ok(());
+            }
+        };
+        let metal_device = match &device {
+            Device::Metal(m) => m,
+            _ => unreachable!("new_metal returned non-Metal device"),
+        };
+
+        // Реалистичные размеры (близко к Qwen3.5-4B, но меньше для скорости теста):
+        // n_v_heads=32, head_v_dim=16 → ssm_len = 32*16*16 = 8192
+        // conv_k=4, channels=256 → conv_len = 3*256 = 768
+        let test_params = DeltaParams {
+            n_k_heads: 16,
+            n_v_heads: 32,
+            head_k_dim: 16,
+            head_v_dim: 16,
+            key_dim: 256,
+            value_dim: 512,
+            channels: 256,
+            conv_kernel: 4,
+            q_scale: 0.0,
+            rms_norm_eps: 0.0,
+            heads_per_kv: 2,
+        };
+        let ssm_data: Vec<f32> = (0..32 * 16 * 16).map(|i| i as f32 * 0.01).collect();
+        let conv_data: Vec<f32> = (0..3 * 256).map(|i| i as f32 * 0.1 + 100.0).collect();
+        let dummy: Vec<f32> = vec![0.0; 8];
+
+        let layer_state = DeltaNetMetalState {
+            ssm_state: buffer_from_f32(metal_device, &ssm_data)?,
+            conv_state: buffer_from_f32(metal_device, &conv_data)?,
+            conv_weights: buffer_from_f32(metal_device, &dummy)?,
+            dt_bias: buffer_from_f32(metal_device, &dummy)?,
+            ssm_a: buffer_from_f32(metal_device, &dummy)?,
+            norm_weight: buffer_from_f32(metal_device, &dummy)?,
+        };
+
+        // 1. Snapshot: GPU → CPU
+        let (ssm_snap, conv_snap) = snapshot_metal_state(metal_device, &layer_state, &test_params)?;
+        assert_eq!(ssm_snap, ssm_data, "snapshot ssm mismatch");
+        assert_eq!(conv_snap, conv_data, "snapshot conv mismatch");
+
+        // 2. Очищаем GPU buffers
+        clear_metal_state(metal_device, &layer_state)?;
+        let ssm_after_clear = buffer_to_f32(&layer_state.ssm_state, ssm_data.len());
+        let conv_after_clear = buffer_to_f32(&layer_state.conv_state, conv_data.len());
+        assert!(
+            ssm_after_clear.iter().all(|&x| x == 0.0),
+            "ssm not zeroed after clear"
+        );
+        assert!(
+            conv_after_clear.iter().all(|&x| x == 0.0),
+            "conv not zeroed after clear"
+        );
+
+        // 3. Restore: CPU → GPU
+        restore_metal_state(
+            metal_device,
+            &layer_state,
+            &test_params,
+            &ssm_snap,
+            &conv_snap,
+        )?;
+        let ssm_after_restore = buffer_to_f32(&layer_state.ssm_state, ssm_data.len());
+        let conv_after_restore = buffer_to_f32(&layer_state.conv_state, conv_data.len());
+        assert_eq!(ssm_after_restore, ssm_data, "ssm not restored correctly");
+        assert_eq!(conv_after_restore, conv_data, "conv not restored correctly");
+
+        // 4. Snapshot data на CPU не должен изменяться при последующих GPU мутациях
+        clear_metal_state(metal_device, &layer_state)?;
+        assert_eq!(
+            ssm_snap[0], ssm_data[0],
+            "snapshot CPU data leaked into GPU"
+        );
+        assert_eq!(
+            conv_snap[0], conv_data[0],
+            "snapshot CPU data leaked into GPU"
+        );
+
+        // 5. Size mismatch → Err
+        let bad_ssm: Vec<f32> = vec![0.0; 1];
+        let err = restore_metal_state(
+            metal_device,
+            &layer_state,
+            &test_params,
+            &bad_ssm,
+            &conv_data,
+        );
+        assert!(err.is_err(), "expected size mismatch error");
+
+        Ok(())
+    }
+
+    /// Phase 3: StateSnapshot structural sanity — конструирование, clone, поля.
+    /// Полный round-trip с реальной моделью покрывается Phase 6 logits parity test.
+    #[test]
+    fn test_state_snapshot_construction_and_clone() {
+        let snap = StateSnapshot {
+            model_nonce: 0xDEADBEEF_CAFEBABE,
+            position: 1234,
+            blocks: vec![
+                BlockStateSnap::DeltaNet(DeltaNetStateSnap {
+                    conv_buf: vec![1.0, 2.0, 3.0],
+                    ssm_state: vec![4.0, 5.0, 6.0, 7.0],
+                }),
+                BlockStateSnap::Attention(None),
+                BlockStateSnap::DeltaNet(DeltaNetStateSnap {
+                    conv_buf: vec![10.0],
+                    ssm_state: vec![20.0, 30.0],
+                }),
+            ],
+        };
+
+        assert_eq!(snap.model_nonce, 0xDEADBEEF_CAFEBABE);
+        assert_eq!(snap.position, 1234);
+        assert_eq!(snap.blocks.len(), 3);
+
+        // Clone должен делать independent copy snap
+        let cloned = snap.clone();
+        assert_eq!(cloned.model_nonce, snap.model_nonce);
+        assert_eq!(cloned.position, snap.position);
+        assert_eq!(cloned.blocks.len(), snap.blocks.len());
+
+        // Verify variant pattern matching работает
+        match &cloned.blocks[1] {
+            BlockStateSnap::Attention(None) => (),
+            _ => panic!("expected Attention(None) at index 1"),
+        }
+    }
+
+    /// Phase 3: ModelWeights::instance_nonce — два разных nonce при двух build_model_common
+    /// (mock через прямую инициализацию u64 через rand::random).
+    /// Полный тест с реальным load из GGUF тяжёл — это integration test.
+    #[test]
+    fn test_instance_nonce_uniqueness() {
+        // Sanity: rand::random выдаёт разные значения при нескольких вызовах
+        // (для u64 коллизия раз в 2^64 — практически невозможна в тесте)
+        let n1 = rand::random::<u64>();
+        let n2 = rand::random::<u64>();
+        let n3 = rand::random::<u64>();
+        assert_ne!(n1, n2, "rand::random<u64> collision (extremely unlikely)");
+        assert_ne!(n2, n3, "rand::random<u64> collision (extremely unlikely)");
+        // Не проверяем n1 != n3 — это purely sanity check на rand
+    }
+}

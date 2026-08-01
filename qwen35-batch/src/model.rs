@@ -1,0 +1,264 @@
+//! Абстракция модели над batched decode loop.
+//!
+//! Scheduler не знает про Candle/Metal — он работает через [`BatchModel`].
+//! Это позволяет (а) тестировать scheduler на детерминированном mock'е,
+//! (б) подключить реальный адаптер Qwen3.5 (feature `real-model`) без правок
+//! scheduler'а.
+//!
+//! ## Контракт batched decode
+//! На каждом decode-шаге scheduler передаёт список активных слотов и их
+//! текущие токены ([`DecodeBatch`]). Реализация:
+//! 1. собирает input-эмбеддинги всех активных слотов в один тензор [B, hidden];
+//! 2. выполняет QMatMul-проекции **одним батчем** (амортизирует чтение Q4-весов —
+//!    доминирующая cost на bandwidth-bound Apple Silicon; для Q4K fast-path
+//!    m%32==0 — паддинг B до 32 см. в реальном адаптере);
+//! 3. для recurrent delta_rule + attention — per-slot step по per-slot state
+//!    (state не имеет batch-оси в Candle-пути; это потолок без переписывания
+//!    Metal-ядер, см. research doc);
+//! 4. возвращает logits per slot для сэмплинга.
+//!
+//! ## Per-slot state
+//! Scheduler передаёт stable `slot.idx`. Реализация держит N наборов
+//! GDN-state (conv+ssm fp32) + KV-cache, адресуемых по `idx`. Сброс state
+//! делается при admit (реализация получает [`PrefillChunk::reset_first`]=true
+//! для первого чанка каждого запроса).
+
+use anyhow::Result;
+
+/// Один активный decode-слот на шаге.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeItem {
+    /// Stable индекс слота (адрес per-slot state в модели).
+    pub slot_idx: usize,
+    /// Текущий input-token (последний сгенерированный / последний токен prompt).
+    pub token: u32,
+    /// Абсолютная позиция для RoPE + KV-cache offset.
+    pub pos: usize,
+}
+
+/// Пакет активных decode-слотов на одном шаге.
+#[derive(Debug, Clone)]
+pub struct DecodeBatch {
+    pub items: Vec<DecodeItem>,
+}
+
+impl DecodeBatch {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+/// Один чанк prefill для одного слота.
+#[derive(Debug, Clone)]
+pub struct PrefillChunk {
+    /// Stable индекс слота.
+    pub slot_idx: usize,
+    /// Сбросить per-slot state перед этим чанком (true для первого чанка запроса).
+    pub reset_first: bool,
+    /// Токены чанка.
+    pub tokens: Vec<u32>,
+    /// Стартовая абсолютная позиция чанка (для RoPE/KV).
+    pub start_pos: usize,
+}
+
+/// Сэмплер: логиты → токен.
+pub trait Sampler {
+    fn sample(&mut self, logits: &[f32]) -> u32;
+}
+
+/// Greedy argmax. Достаточен для parity (batched vs single-stream):
+/// одинаковые логиты → одинаковый argmax → одинаковые токены.
+#[derive(Default, Clone)]
+pub struct GreedySampler;
+
+impl Sampler for GreedySampler {
+    fn sample(&mut self, logits: &[f32]) -> u32 {
+        let mut best = 0u32;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i as u32;
+            }
+        }
+        best
+    }
+}
+
+/// Абстракция модели над batched prefill + batched decode.
+pub trait BatchModel {
+    /// Размер словаря.
+    fn vocab_size(&self) -> usize;
+
+    /// Prefill одного чанка для одного слота. Обновляет per-slot state.
+    /// Возвращает logits **последнего** токена чанка → scheduler сэмплирует
+    /// первый сгенерированный токен (избегаем повторной обработки последнего
+    /// токена prompt'а в рекуррентном state).
+    fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>>;
+
+    /// Batched decode step: один токен на каждый активный слот, одним батчем.
+    /// Возвращает логиты per-item (в порядке `batch.items`).
+    fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>>;
+
+    /// Сбросить per-slot state слота `idx` (новый запрос).
+    fn reset_slot(&mut self, idx: usize) -> Result<()>;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Mock-модель для unit-тестов scheduler'а.
+//
+// Критично для parity: per-slot state сбрасывается в 0 при admit и эволюционирует
+// ТОЛЬКО от токенов самого слота (как реальная GDN state: reset → нулевой conv/ssm,
+// далее детерминированно от входных токенов). Благодаря этому output слота —
+// чистая функция его prompt'а, не зависящая от индекса слота и присутствия других
+// слотов. Это и проверяет parity batched-vs-sequential: 4 конкурентных prompt'а
+// дают те же последовательности, что и поодиночке, значит state не протекает
+// между слотами.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Детерминированная pseudo-recurrent mock-модель для тестов scheduler'а.
+pub struct MockRecurrentModel {
+    vocab: usize,
+    /// per-slot running state (имитация GDN ssm-state): u64, reset→0.
+    states: Vec<u64>,
+}
+
+impl MockRecurrentModel {
+    pub fn new(num_slots: usize, vocab: usize) -> Self {
+        Self {
+            vocab,
+            states: vec![0u64; num_slots],
+        }
+    }
+
+    fn logits_for(&self, token: u32, state: u64) -> Vec<f32> {
+        let next = next_token(token, state, self.vocab as u64);
+        let mut logits = vec![f32::NEG_INFINITY; self.vocab];
+        logits[next as usize] = 1.0;
+        logits
+    }
+}
+
+/// Обновление рекуррентного state новым токеном (детерминированное).
+#[inline]
+pub fn mix(state: u64, token: u32) -> u64 {
+    state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(token as u64)
+        .wrapping_add(1442695040888963407)
+}
+
+/// Предсказание следующего токена из (текущий токен, state). Детерминированное.
+#[inline]
+pub fn next_token(token: u32, state: u64, vocab: u64) -> u32 {
+    let x = (token as u64)
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(state)
+        .wrapping_add(3037000493);
+    (x % vocab.max(1)) as u32
+}
+
+impl BatchModel for MockRecurrentModel {
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>> {
+        if chunk.reset_first {
+            self.reset_slot(chunk.slot_idx)?;
+        }
+        let mut last = 0u32;
+        for &tk in &chunk.tokens {
+            self.states[chunk.slot_idx] = mix(self.states[chunk.slot_idx], tk);
+            last = tk;
+        }
+        let state = self.states[chunk.slot_idx];
+        Ok(self.logits_for(last, state))
+    }
+
+    fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
+        // Имитация batched decode: каждый слот — независимый stateful шаг.
+        // Реальная модель сделала бы batched matmul здесь; mock итерирует.
+        let mut out = Vec::with_capacity(batch.items.len());
+        for it in &batch.items {
+            // consume token → update state → predict.
+            self.states[it.slot_idx] = mix(self.states[it.slot_idx], it.token);
+            let state = self.states[it.slot_idx];
+            out.push(self.logits_for(it.token, state));
+        }
+        Ok(out)
+    }
+
+    fn reset_slot(&mut self, idx: usize) -> Result<()> {
+        self.states[idx] = 0;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mock_output_is_pure_function_of_prompt() {
+        // Один и тот же prompt через два РАЗНЫХ слота → одинаковая последовательность.
+        let prompt = vec![10u32, 20, 30];
+        let run = |slot: usize| -> Vec<u32> {
+            let mut m = MockRecurrentModel::new(4, 500);
+            let chunk = PrefillChunk {
+                slot_idx: slot,
+                reset_first: true,
+                tokens: prompt.clone(),
+                start_pos: 0,
+            };
+            let l0 = m.prefill_chunk(&chunk).unwrap();
+            let mut seq = vec![GreedySampler.sample(&l0)];
+            for _ in 0..3 {
+                let cur = *seq.last().unwrap();
+                let l = m
+                    .decode_batch(&DecodeBatch {
+                        items: vec![DecodeItem {
+                            slot_idx: slot,
+                            token: cur,
+                            pos: 0,
+                        }],
+                    })
+                    .unwrap();
+                seq.push(GreedySampler.sample(&l[0]));
+            }
+            seq
+        };
+        assert_eq!(
+            run(0),
+            run(3),
+            "output зависит от индекса слота — state протекает"
+        );
+    }
+
+    #[test]
+    fn mock_concurrent_slots_isolated() {
+        // Два слота с разными prompt'ами одновременно: state не протекает.
+        let mut m = MockRecurrentModel::new(2, 700);
+        let c0 = PrefillChunk {
+            slot_idx: 0,
+            reset_first: true,
+            tokens: vec![5, 6, 7],
+            start_pos: 0,
+        };
+        let c1 = PrefillChunk {
+            slot_idx: 1,
+            reset_first: true,
+            tokens: vec![50, 60],
+            start_pos: 0,
+        };
+        let l0 = m.prefill_chunk(&c0).unwrap();
+        let l1 = m.prefill_chunk(&c1).unwrap();
+        // Разные prompt'ы → почти наверняка разные state → разные next.
+        assert_ne!(GreedySampler.sample(&l0), GreedySampler.sample(&l1));
+        // Состояния независимы: state[0] != state[1].
+        assert_ne!(m.states[0], m.states[1]);
+    }
+}
