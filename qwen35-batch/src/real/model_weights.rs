@@ -1742,7 +1742,11 @@ impl DeltaNetLayer {
     /// - ssm_out: batched QMatMul `[B,1,value_dim] @ W` → `[B,1,n_embd]`.
     ///
     /// Требует `metal_ctx_batched` или `cuda_ctx_batched` (batched persistent state).
-    fn forward_decode_batch(&mut self, x: &Tensor) -> Result<Tensor> {
+    ///
+    /// `slots`: отображение batch_idx → slot_idx (persistent state index). Persistent
+    /// state (ssm_state, conv_state) индексируется по `slots[batch_idx]`, а не по
+    /// batch_idx напрямую — это корректно после сжатия батча (ранний EOS).
+    fn forward_decode_batch(&mut self, x: &Tensor, slots: &[u32]) -> Result<Tensor> {
         let device = x.device().clone();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if seq_len != 1 {
@@ -1787,6 +1791,7 @@ impl DeltaNetLayer {
                 &z_t,
                 &beta_t,
                 &alpha_t,
+                slots,
             )?);
         }
         #[cfg(target_os = "macos")]
@@ -1809,6 +1814,7 @@ impl DeltaNetLayer {
                 &z_t,
                 &beta_t,
                 &alpha_t,
+                slots,
             )?);
         }
         #[cfg(feature = "cuda")]
@@ -2739,10 +2745,12 @@ impl GatedAttentionLayer {
         &mut self,
         x: &Tensor,
         positions: &[usize],
+        slots: &[u32],
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         debug_assert_eq!(seq_len, 1, "forward_attn_decode_batch: decode only (seq=1)");
         debug_assert_eq!(positions.len(), b_sz, "positions.len must == batch");
+        debug_assert_eq!(slots.len(), b_sz, "slots.len must == batch");
         let device = x.device().clone();
 
         // 1. Batched projections (веса один раз на B слотов).
@@ -2778,12 +2786,18 @@ impl GatedAttentionLayer {
         let mut slot_outs: Vec<Tensor> = Vec::with_capacity(b_sz);
 
         // 3-7. Per-slot RoPE + KV-cache + SDPA (math идентичен forward_attn decode).
-        for slot in 0..b_sz {
-            let pos = positions[slot];
-            // Per-slot narrow: [1, n_head, 1, hd]
-            let q = q_all.narrow(0, slot, 1)?.contiguous()?;
-            let k = k_all.narrow(0, slot, 1)?.contiguous()?;
-            let v = v_all.narrow(0, slot, 1)?.contiguous()?;
+        //
+        // `bidx` = batch position (индексирует входные тензоры q/k/v и positions);
+        // `slot` = реальный slot_idx из `slots[bidx]` (индексирует persistent KV cache).
+        // После сжатия батча (ранний EOS) persistent KV должен адресоваться по
+        // slot_idx, иначе слот 0 прочитал бы чужой cache.
+        for bidx in 0..b_sz {
+            let slot = slots[bidx] as usize;
+            let pos = positions[bidx];
+            // Per-batch narrow: [1, n_head, 1, hd]
+            let q = q_all.narrow(0, bidx, 1)?.contiguous()?;
+            let k = k_all.narrow(0, bidx, 1)?.contiguous()?;
+            let v = v_all.narrow(0, bidx, 1)?.contiguous()?;
 
             // Partial RoPE per slot (index_pos = pos).
             let q = self.apply_partial_rotary_emb(&q, pos)?;
@@ -3137,15 +3151,20 @@ impl HybridBlock {
     /// Вход: x [B, 1, n_embd], `positions` (len B) — per-slot позиция для attention
     /// (DeltaNet decode position-независим — нет RoPE).
     /// Выход: [B, 1, n_embd]. Norms/MLP batched (RmsNorm/Mlp handle [B,1,...]).
-    fn forward_decode_batch(&mut self, x: &Tensor, positions: &[usize]) -> Result<Tensor> {
+    fn forward_decode_batch(
+        &mut self,
+        x: &Tensor,
+        positions: &[usize],
+        slots: &[u32],
+    ) -> Result<Tensor> {
         // Pre-norm → layer → residual (batched norm).
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
 
         let layer_out = match &mut self.layer {
-            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed)?,
+            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed, slots)?,
             HybridLayerType::Attention(attn) => {
-                attn.forward_attn_decode_batch(&normed, positions)?
+                attn.forward_attn_decode_batch(&normed, positions, slots)?
             }
         };
         let x = (layer_out + residual)?;
@@ -5031,9 +5050,10 @@ impl ModelWeights {
         &mut self,
         tokens: &Tensor,
         positions: &[usize],
+        slots: &[u32],
     ) -> Result<Tensor> {
         crate::real::metal_utils::with_autoreleasepool(|| {
-            self.forward_decode_batch_inner(tokens, positions)
+            self.forward_decode_batch_inner(tokens, positions, slots)
         })
     }
 
@@ -5042,18 +5062,21 @@ impl ModelWeights {
         &mut self,
         tokens: &Tensor,
         positions: &[usize],
+        slots: &[u32],
     ) -> Result<Tensor> {
-        self.forward_decode_batch_inner(tokens, positions)
+        self.forward_decode_batch_inner(tokens, positions, slots)
     }
 
     fn forward_decode_batch_inner(
         &mut self,
         tokens: &Tensor,
         positions: &[usize],
+        slots: &[u32],
     ) -> Result<Tensor> {
         let (b_sz, seq_len) = tokens.dims2()?;
         debug_assert_eq!(seq_len, 1, "forward_decode_batch: decode only (seq=1)");
         debug_assert_eq!(positions.len(), b_sz, "positions.len must == batch");
+        debug_assert_eq!(slots.len(), b_sz, "slots.len must == batch");
 
         // Embedding: QuantizedEmbedding.forward возвращает [1, b_sz, n_embd] (hardcoded
         // leading 1). Reshape в [b_sz, 1, n_embd] для batched layers.
@@ -5063,7 +5086,7 @@ impl ModelWeights {
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
         for block in self.blocks.iter_mut() {
-            layer_in = block.forward_decode_batch(&layer_in, positions)?;
+            layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
         }
 
         // Head: norm -> take last token -> output projection -> [b_sz, vocab].

@@ -83,30 +83,35 @@ __device__ __forceinline__ float softplus_f(float x) {
 // ═══════════════════════════════════════════════════════════════
 
 extern "C" __global__ void delta_conv1d_prep_batched(
-    const float* __restrict__ qkv_raw,      // [B * channels] — from batched QMatMul
-    const float* __restrict__ beta_raw,     // [B * n_v_heads]
-    const float* __restrict__ alpha_raw,    // [B * n_v_heads]
+    const float* __restrict__ qkv_raw,      // [B * channels] — from batched QMatMul (batch_idx)
+    const float* __restrict__ beta_raw,     // [B * n_v_heads] (batch_idx)
+    const float* __restrict__ alpha_raw,    // [B * n_v_heads] (batch_idx)
     const float* __restrict__ conv_weights, // [channels * conv_k] — shared
     const float* __restrict__ dt_bias,      // [n_v_heads] — shared
     const float* __restrict__ ssm_a,        // [n_v_heads] — shared
-    float* __restrict__ conv_state,         // [B * (conv_k-1) * channels] — persistent
-    float* __restrict__ qkv_conv_out,       // [B * channels] — output
-    float* __restrict__ beta_out,           // [B * n_v_heads]
-    float* __restrict__ gate_out,           // [B * n_v_heads]
-    const DeltaParams params
+    float* __restrict__ conv_state,         // [CAP * (conv_k-1) * channels] — persistent (real slot_idx)
+    float* __restrict__ qkv_conv_out,       // [B * channels] — output (batch_idx)
+    float* __restrict__ beta_out,           // [B * n_v_heads] (batch_idx, temp)
+    float* __restrict__ gate_out,           // [B * n_v_heads] (batch_idx, temp)
+    const DeltaParams params,
+    const unsigned int* __restrict__ slot_ids  // [B] — batch_idx → real slot_idx (indirection)
 ) {
     const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int slot = blockIdx.y;
+    const unsigned int bidx = blockIdx.y;       // позиция в активном batch'е (0..B-1)
     const unsigned int channels = params.channels;
     const unsigned int conv_k = params.conv_kernel;
     const unsigned int n_v = params.n_v_heads;
 
-    if (slot >= params.batch_size) return;
+    if (bidx >= params.batch_size) return;
 
-    // ── Часть A: Conv1d step (per (ch, slot)) ──
+    // Persistent conv_state индексируется по реальному slot_idx (indirection);
+    // входы/выходы (qkv_raw, qkv_conv_out, beta_raw, beta_out, gate_out) — по batch_idx.
+    const unsigned int real_slot = slot_ids[bidx];
+
+    // ── Часть A: Conv1d step (per (ch, batch_idx)) ──
     if (ch < channels) {
-        const unsigned int slot_conv_base = slot * (conv_k - 1) * channels;
-        const unsigned int slot_qkv_base = slot * channels;
+        const unsigned int slot_conv_base = real_slot * (conv_k - 1) * channels;  // persistent
+        const unsigned int slot_qkv_base = bidx * channels;                         // input/temp (batch_idx)
 
         float sum = 0.0f;
         const unsigned int weight_base = ch * conv_k;
@@ -131,12 +136,10 @@ extern "C" __global__ void delta_conv1d_prep_batched(
         conv_state[slot_conv_base + (conv_k - 2) * channels + ch] = qkv_raw[slot_qkv_base + ch];
     }
 
-    // ── Часть B: sigmoid(beta) и softplus(alpha)*A (per (slot, head)) ──
-    // Первые n_v_heads потоков в каждом блоке делают beta/gate для этого slot'а.
-    // blockDim.x = 256 >= n_v (32 в Qwen3.5-4B), поэтому в каждом блоке потоки
-    // с threadIdx.x (== ch в части A) < n_v покрывают beta/gate для своего slot.
+    // ── Часть B: sigmoid(beta) и softplus(alpha)*A (per (batch_idx, head)) ──
+    // beta_out/gate_out — TEMP, индекс по batch_idx. beta_raw/alpha_raw — входы (batch_idx).
     if (ch < n_v) {
-        const unsigned int slot_head = slot * n_v + ch;
+        const unsigned int slot_head = bidx * n_v + ch;  // batch_idx для temp/входов
         beta_out[slot_head] = sigmoid_f(beta_raw[slot_head]);
         float alpha_biased = alpha_raw[slot_head] + dt_bias[ch];
         gate_out[slot_head] = softplus_f(alpha_biased) * ssm_a[ch];
@@ -238,25 +241,28 @@ extern "C" __global__ void delta_l2_norm_expand_batched(
 // ═══════════════════════════════════════════════════════════════
 
 extern "C" __global__ void delta_rule_kernel_batched(
-    const float* __restrict__ q,    // [B * n_v_heads * head_k_dim]
-    const float* __restrict__ k,    // [B * n_v_heads * head_k_dim]
-    const float* __restrict__ v,    // [B * n_v_heads * head_v_dim]
-    const float* __restrict__ beta, // [B * n_v_heads]
-    const float* __restrict__ gate, // [B * n_v_heads]
-    float* __restrict__ ssm_state,  // [B * n_v_heads * hd * hd] — persistent
-    float* __restrict__ output,     // [B * n_v_heads * head_v_dim]
-    const DeltaParams params
+    const float* __restrict__ q,    // [B * n_v_heads * head_k_dim] (batch_idx, temp)
+    const float* __restrict__ k,    // [B * n_v_heads * head_k_dim] (batch_idx, temp)
+    const float* __restrict__ v,    // [B * n_v_heads * head_v_dim] (batch_idx, temp)
+    const float* __restrict__ beta, // [B * n_v_heads] (batch_idx, temp)
+    const float* __restrict__ gate, // [B * n_v_heads] (batch_idx, temp)
+    float* __restrict__ ssm_state,  // [CAP * n_v_heads * hd * hd] — persistent (real slot_idx)
+    float* __restrict__ output,     // [B * n_v_heads * head_v_dim] (batch_idx, temp)
+    const DeltaParams params,
+    const unsigned int* __restrict__ slot_ids  // [B] — batch_idx → real slot_idx (indirection)
 ) {
     const unsigned int head = blockIdx.x;   // 0..31
-    const unsigned int slot = blockIdx.y;   // 0..B-1
+    const unsigned int bidx = blockIdx.y;   // 0..B-1 (позиция в активном batch'е)
     const unsigned int col = threadIdx.x;   // 0..127
     const unsigned int hd = params.head_v_dim; // 128
     const unsigned int n_v = params.n_v_heads;
 
-    // Базовые смещения (leading B)
-    const unsigned int slot_head = slot * n_v + head;
-    const unsigned int state_base = slot * n_v * hd * hd + head * hd * hd;
-    const unsigned int vec_base = slot * n_v * hd + head * hd;
+    // Persistent ssm_state — по реальному slot_idx (indirection);
+    // temp q/k/v/beta/gate/output — по batch_idx.
+    const unsigned int real_slot = slot_ids[bidx];
+    const unsigned int slot_head = bidx * n_v + head;                     // temp beta/gate (batch_idx)
+    const unsigned int state_base = real_slot * n_v * hd * hd + head * hd * hd;  // persistent state
+    const unsigned int vec_base = bidx * n_v * hd + head * hd;              // temp q/k/v/output (batch_idx)
 
     __shared__ float shared_sk[128];
     __shared__ float shared_d[128];

@@ -83,32 +83,37 @@ inline float softplus(float x) {
 
 // F32 для precision (см. комментарий в delta_rule.metal — decode precision critical).
 kernel void delta_conv1d_prep_batched(
-    device const float* qkv_raw        [[buffer(0)]],   // [B * channels] — from batched QMatMul
-    device const float* beta_raw       [[buffer(1)]],   // [B * n_v_heads]
-    device const float* alpha_raw      [[buffer(2)]],   // [B * n_v_heads]
+    device const float* qkv_raw        [[buffer(0)]],   // [B * channels] — from batched QMatMul (batch_idx)
+    device const float* beta_raw       [[buffer(1)]],   // [B * n_v_heads] (batch_idx)
+    device const float* alpha_raw      [[buffer(2)]],   // [B * n_v_heads] (batch_idx)
     device const float* conv_weights   [[buffer(3)]],   // [channels * conv_k] — shared
     device const float* dt_bias        [[buffer(4)]],   // [n_v_heads] — shared
     device const float* ssm_a          [[buffer(5)]],   // [n_v_heads] — shared
-    device float*       conv_state     [[buffer(6)]],   // [B * (conv_k-1) * channels] — persistent
-    device float*       qkv_conv_out   [[buffer(7)]],   // [B * channels] — output
-    device float*       beta_out       [[buffer(8)]],   // [B * n_v_heads]
-    device float*       gate_out       [[buffer(9)]],   // [B * n_v_heads]
+    device float*       conv_state     [[buffer(6)]],   // [CAP * (conv_k-1) * channels] — persistent (real slot_idx)
+    device float*       qkv_conv_out   [[buffer(7)]],   // [B * channels] — output (batch_idx)
+    device float*       beta_out       [[buffer(8)]],   // [B * n_v_heads] (batch_idx, temp)
+    device float*       gate_out       [[buffer(9)]],   // [B * n_v_heads] (batch_idx, temp)
     constant DeltaParams& params       [[buffer(10)]],
-    uint2 tid [[thread_position_in_grid]]              // (channel, slot)
+    constant const uint* slot_ids      [[buffer(11)]],  // [B] — batch_idx → real slot_idx (indirection)
+    uint2 tid [[thread_position_in_grid]]              // (channel, batch_idx)
 ) {
     uint channels = params.channels;
     uint conv_k = params.conv_kernel;
     uint n_v = params.n_v_heads;
 
     uint ch = tid.x;
-    uint slot = tid.y;
+    uint bidx = tid.y;            // позиция в активном batch'е (0..B-1)
 
-    if (slot >= params.batch_size) return;
+    if (bidx >= params.batch_size) return;
 
-    // ── Часть A: Conv1d step (per (channel, slot)) ──
+    // Persistent conv_state индексируется по реальному slot_idx (indirection);
+    // входы/выходы (qkv_raw, qkv_conv_out, beta_raw, beta_out, gate_out) — по batch_idx.
+    uint real_slot = slot_ids[bidx];
+
+    // ── Часть A: Conv1d step (per (channel, batch_idx)) ──
     if (ch < channels) {
-        uint slot_conv_base = slot * (conv_k - 1) * channels;
-        uint slot_qkv_base = slot * channels;
+        uint slot_conv_base = real_slot * (conv_k - 1) * channels;  // persistent
+        uint slot_qkv_base = bidx * channels;                         // input/temp (batch_idx)
 
         float sum = 0.0f;
         uint weight_base = ch * conv_k;
@@ -133,10 +138,10 @@ kernel void delta_conv1d_prep_batched(
         conv_state[slot_conv_base + (conv_k - 2) * channels + ch] = qkv_raw[slot_qkv_base + ch];
     }
 
-    // ── Часть B: sigmoid(beta) и softplus(alpha)*A (per (slot, head)) ──
-    // Потоки (ch, slot) где ch < n_v_heads делают beta/gate для этого slot'а.
+    // ── Часть B: sigmoid(beta) и softplus(alpha)*A (per (batch_idx, head)) ──
+    // beta_out/gate_out — TEMP, индекс по batch_idx. beta_raw/alpha_raw — входы (batch_idx).
     if (ch < n_v) {
-        uint slot_head = slot * n_v + ch;
+        uint slot_head = bidx * n_v + ch;  // batch_idx для temp/входов
         beta_out[slot_head] = sigmoid(beta_raw[slot_head]);
         float alpha_biased = alpha_raw[slot_head] + dt_bias[ch];
         gate_out[slot_head] = softplus(alpha_biased) * ssm_a[ch];
@@ -241,27 +246,30 @@ kernel void delta_l2_norm_expand_batched(
 // ═══════════════════════════════════════════════════════════════
 
 kernel void delta_rule_kernel_batched(
-    device const float* q              [[buffer(0)]],   // [B * n_v_heads * head_k_dim]
-    device const float* k              [[buffer(1)]],   // [B * n_v_heads * head_k_dim]
-    device const float* v              [[buffer(2)]],   // [B * n_v_heads * head_v_dim]
-    device const float* beta           [[buffer(3)]],   // [B * n_v_heads]
-    device const float* gate           [[buffer(4)]],   // [B * n_v_heads]
-    device float*       ssm_state      [[buffer(5)]],   // [B * n_v_heads * hd * hd] — persistent
-    device float*       output         [[buffer(6)]],   // [B * n_v_heads * head_v_dim]
+    device const float* q              [[buffer(0)]],   // [B * n_v_heads * head_k_dim] (batch_idx, temp)
+    device const float* k              [[buffer(1)]],   // [B * n_v_heads * head_k_dim] (batch_idx, temp)
+    device const float* v              [[buffer(2)]],   // [B * n_v_heads * head_v_dim] (batch_idx, temp)
+    device const float* beta           [[buffer(3)]],   // [B * n_v_heads] (batch_idx, temp)
+    device const float* gate           [[buffer(4)]],   // [B * n_v_heads] (batch_idx, temp)
+    device float*       ssm_state      [[buffer(5)]],   // [CAP * n_v_heads * hd * hd] — persistent (real slot_idx)
+    device float*       output         [[buffer(6)]],   // [B * n_v_heads * head_v_dim] (batch_idx, temp)
     constant DeltaParams& params       [[buffer(7)]],
-    uint3 tgid [[threadgroup_position_in_grid]],        // (head, slot, 0)
+    constant const uint* slot_ids      [[buffer(8)]],   // [B] — batch_idx → real slot_idx (indirection)
+    uint3 tgid [[threadgroup_position_in_grid]],        // (head, batch_idx, 0)
     uint3 lid  [[thread_position_in_threadgroup]]       // (0, col, 0)
 ) {
     uint head = tgid.x;       // 0..31
-    uint slot = tgid.y;       // 0..B-1
+    uint bidx = tgid.y;       // 0..B-1 (позиция в активном batch'е)
     uint col = lid.y;         // 0..127
     uint hd = params.head_v_dim;  // 128
     uint n_v = params.n_v_heads;
 
-    // Базовые смещения (leading B)
-    uint slot_head = slot * n_v + head;
-    uint state_base = slot * n_v * hd * hd + head * hd * hd;  // начало state (slot, head)
-    uint vec_base = slot * n_v * hd + head * hd;              // начало q/k/v (slot, head)
+    // Persistent ssm_state — по реальному slot_idx (indirection);
+    // temp q/k/v/beta/gate/output — по batch_idx.
+    uint real_slot = slot_ids[bidx];
+    uint slot_head = bidx * n_v + head;                     // temp beta/gate (batch_idx)
+    uint state_base = real_slot * n_v * hd * hd + head * hd * hd;  // persistent state
+    uint vec_base = bidx * n_v * hd + head * hd;              // temp q/k/v/output (batch_idx)
 
     // ── Shared memory для sk и d (один threadgroup = (head, slot), изоляция автоматична) ──
     threadgroup float shared_sk[128];

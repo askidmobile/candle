@@ -249,6 +249,50 @@ impl<M: BatchModel> BatchScheduler<M> {
         Ok(outputs)
     }
 
+    /// Полный прогон с per-request `max_new`: каждый промпт имеет собственный
+    /// лимит генерации (в отличие от `run_with_collection`, где один max_new на
+    /// все). Используется для регрессионных тестов batch shrink: один слот
+    /// короче остальных → раннее завершение → batch сжимается.
+    ///
+    /// `prompts[i].1` = max_new для i-го запроса. Возвращает сгенерированные
+    /// токены per prompt в порядке submit.
+    pub fn run_with_per_request_max(
+        &mut self,
+        prompts: Vec<(Vec<u32>, usize)>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let n = prompts.len();
+        for (p, m) in prompts {
+            self.submit(p, m);
+        }
+        let mut slot_order: Vec<Option<usize>> = vec![None; self.slots.len()];
+        let mut next_order = 0usize;
+        let mut outputs: Vec<Vec<u32>> = (0..n).map(|_| Vec::new()).collect();
+        loop {
+            for s in &self.slots {
+                if s.status != SlotStatus::Idle && slot_order[s.idx].is_none() {
+                    slot_order[s.idx] = Some(next_order);
+                    next_order += 1;
+                }
+            }
+            let finished: Vec<(usize, usize)> = self
+                .slots
+                .iter()
+                .filter(|s| s.status == SlotStatus::Finished)
+                .filter_map(|s| slot_order[s.idx].map(|o| (s.idx, o)))
+                .collect();
+            for (sidx, order) in &finished {
+                outputs[*order] = self.slots[*sidx].generated_tokens().to_vec();
+                self.slots[*sidx].reset();
+                slot_order[*sidx] = None;
+            }
+            match self.step()? {
+                StepOutcome::Idle if self.all_idle() && self.queue.is_empty() => break,
+                _ => {}
+            }
+        }
+        Ok(outputs)
+    }
+
     /// Baseline: каждый prompt по одному через single-slot scheduler.
     /// Паритет: batched (N slots) == sequential per prompt.
     pub fn sequential_reference(
@@ -360,6 +404,47 @@ mod tests {
         assert!(st.total_decode_tokens > 0);
         assert!(st.prefill_chunks > 0);
         assert!(st.max_concurrent_decode >= 1);
+    }
+
+    #[test]
+    fn batched_shrink_parity_early_finish() {
+        // Регрессия slot-indirection: один слот короче остальных → batch
+        // сжимается (B=2→1) после раннего завершения. Оставшийся слот должен
+        // остаться bit-exact vs sequential (state не протекает в чужой slot).
+        // До фикса slot indirection это падало: оставшийся slot читал бы
+        // чужой batch_idx=0 state вместо своего slot_idx state.
+        let n_slots = 2;
+        let vocab = 2048;
+        let eos = u32::MAX;
+        let prompts: Vec<(Vec<u32>, usize)> = vec![
+            (vec![7, 11, 13], 10), // длинный
+            (vec![3, 5], 2),       // короткий → раннее завершение → shrink
+        ];
+
+        let mut sched =
+            BatchScheduler::new(MockRecurrentModel::new(n_slots, vocab), n_slots, eos, vocab);
+        let batched = sched
+            .run_with_per_request_max(prompts.clone())
+            .expect("batched");
+
+        // Sequential reference: каждый prompt по одному в свой single-slot scheduler.
+        let mut seq = Vec::with_capacity(prompts.len());
+        for (p, m) in prompts {
+            let mut s = BatchScheduler::new(MockRecurrentModel::new(1, vocab), 1, eos, vocab);
+            let mut o = s.run_with_per_request_max(vec![(p, m)]).expect("seq");
+            seq.append(&mut o);
+        }
+
+        assert_eq!(batched.len(), seq.len());
+        for (i, (b, s)) in batched.iter().zip(seq.iter()).enumerate() {
+            assert_eq!(
+                b, s,
+                "shrink parity fail на prompt {}: batched {:?} vs seq {:?}",
+                i, b, s
+            );
+        }
+        assert_eq!(batched[0].len(), 10, "длинный слот не досчитал");
+        assert_eq!(batched[1].len(), 2, "короткий слот не досчитал");
     }
 
     #[test]

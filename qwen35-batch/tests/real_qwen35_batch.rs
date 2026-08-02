@@ -188,6 +188,70 @@ fn run_bench(
     }
 }
 
+/// Регрессия slot-indirection (Phase 6 quality-gate fix): batch shrink.
+///
+/// Два промпта декодируются одновременно (B=2): один длинный (max_new=12),
+/// другой короткий (max_new=3). Короткий завершается первым → batch сжимается
+/// (B=2→1). Длинный слот продолжает в одиночном батче. Без slot indirection
+/// оставшийся слот читал бы чужой persistent state (batch_idx=0 → чужой slot)
+/// и дрейфовал — именно это ломало quality-gate case3.
+///
+/// Паритет: длинный слот batched == sequential (его собственный B=1 прогон).
+/// Короткий слот тоже проверяем для полноты.
+#[test]
+#[ignore = "требует GGUF + GPU; регрессия slot-indirection (batch shrink)"]
+fn real_qwen35_batched_equals_sequential_parity_shrink() {
+    let _ = env_logger::try_init();
+    let gguf = gguf_path();
+    assert!(gguf.exists(), "GGUF не найден: {:?}", gguf);
+
+    let device = accelerator_device();
+
+    // Два разных промпта с разной длиной генерации → batch shrink.
+    let prompts: Vec<(Vec<u32>, usize)> = vec![
+        (dummy_prompt_ids(42, 8), 12), // длинный
+        (dummy_prompt_ids(137, 5), 3), // короткий → раннее завершение → shrink
+    ];
+
+    // --- Batched: оба промпта в одном 2-slot scheduler'е (batch shrink в decode) ---
+    let adapter_b = Qwen35BatchAdapter::load(&gguf, device.clone(), 2)
+        .expect("load batched");
+    let vocab = adapter_b.vocab_size();
+    let mut sched_b = BatchScheduler::new(adapter_b, 2, u32::MAX, vocab);
+    let batched = sched_b
+        .run_with_per_request_max(prompts.clone())
+        .expect("batched");
+
+    // --- Sequential: каждый промпт в свой single-slot scheduler (B=1) ---
+    let mut seq = Vec::with_capacity(prompts.len());
+    for (p, m) in prompts {
+        let adapter = Qwen35BatchAdapter::load(&gguf, device.clone(), 1)
+            .expect("load seq");
+        let mut s = BatchScheduler::new(adapter, 1, u32::MAX, vocab);
+        let mut o = s.run_with_per_request_max(vec![(p, m)]).expect("seq");
+        seq.append(&mut o);
+    }
+
+    assert_eq!(batched.len(), seq.len());
+    for (i, (b, s)) in batched.iter().zip(seq.iter()).enumerate() {
+        assert_eq!(
+            b, s,
+            "shrink parity fail на prompt {}: batched {:?} vs seq {:?}",
+            i, b, s
+        );
+    }
+    eprintln!(
+        "[shrink-parity] длинный(B=2→1) и короткий совпали с sequential: BIT-EXACT OK"
+    );
+    eprintln!("  длинный слот: {} токенов", batched[0].len());
+    eprintln!("  короткий слот: {} токенов", batched[1].len());
+    eprintln!(
+        "  batch shrunk: {} decode_steps (B=2 + B=1 после shrink), max_concurrent={}",
+        sched_b.stats().decode_steps,
+        sched_b.stats().max_concurrent_decode
+    );
+}
+
 #[test]
 #[ignore = "требует GGUF + GPU; долгий parity+bench прогон"]
 fn real_qwen35_batched_equals_sequential_parity() {

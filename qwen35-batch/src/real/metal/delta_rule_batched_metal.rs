@@ -235,6 +235,10 @@ pub fn dispatch_delta_rule_batched(
     z_t: &Tensor,     // [B, 1, value_dim]
     beta_t: &Tensor,  // [B, 1, n_v_heads]
     alpha_t: &Tensor, // [B, 1, n_v_heads]
+    // Indirection: batch_idx → реальный slot_idx (persistent state индексация).
+    // Длина B. Нужен т.к. активный batch может быть меньше capacity, и порядок
+    // слотов в batch'е не обязан совпадать с их физическими region-индексами.
+    slot_ids: &[u32],
 ) -> Result<Tensor> {
     let channels = params.channels as usize;
     let n_v = params.n_v_heads as usize;
@@ -281,6 +285,19 @@ pub fn dispatch_delta_rule_batched(
     let beta_buf = get_metal_buffer(&beta_t_f32)?;
     let alpha_buf = get_metal_buffer(&alpha_t_f32)?;
 
+    // Indirection buffer: batch_idx → real slot_idx. Persistent state (ssm_state,
+    // conv_state) индексируется через slot_ids[bidx], а temp/входы — по batch_idx.
+    // Без этого при batch shrink (один slot finished) оставшийся slot попал бы в
+    // чужой state-region → drift.
+    assert_eq!{
+        slot_ids.len(),
+        b,
+        "dispatch_delta_rule_batched: slot_ids.len {} != batch_size {}",
+        slot_ids.len(),
+        b,
+    };
+    let slot_ids_buf = metal_device.new_buffer_with_data(slot_ids)?;
+
     // ═══════════════════════════════════════════════════════════════
     // Kernel 1: delta_conv1d_prep_batched
     // Grid: (channels, B, 1), Threadgroup: (256, 1, 1) — один поток на (channel, slot)
@@ -300,6 +317,7 @@ pub fn dispatch_delta_rule_batched(
         encoder.set_buffer(8, Some(&temp.beta), 0);              // output
         encoder.set_buffer(9, Some(&temp.gate), 0);              // output
         encoder.set_bytes(10, params);                           // DeltaParams
+        encoder.set_buffer(11, Some(&slot_ids_buf), 0);            // slot_ids (indirection)
 
         encoder.use_resource(&*qkv_buf, MTLResourceUsage::Read);
         encoder.use_resource(&*beta_buf, MTLResourceUsage::Read);
@@ -314,6 +332,7 @@ pub fn dispatch_delta_rule_batched(
         encoder.use_resource(&*temp.qkv_conv, MTLResourceUsage::Write);
         encoder.use_resource(&*temp.beta, MTLResourceUsage::Write);
         encoder.use_resource(&*temp.gate, MTLResourceUsage::Write);
+        encoder.use_resource(&*slot_ids_buf, MTLResourceUsage::Read);
 
         let grid = MTLSize {
             width: channels,
@@ -378,6 +397,7 @@ pub fn dispatch_delta_rule_batched(
         encoder.set_buffer(5, Some(&layer_state.ssm_state), 0); // read-write
         encoder.set_buffer(6, Some(&temp.delta_output), 0);     // output
         encoder.set_bytes(7, params);                           // DeltaParams
+        encoder.set_buffer(8, Some(&slot_ids_buf), 0);           // slot_ids (indirection)
 
         encoder.use_resource(&*temp.q, MTLResourceUsage::Read);
         encoder.use_resource(&*temp.k, MTLResourceUsage::Read);
@@ -389,6 +409,7 @@ pub fn dispatch_delta_rule_batched(
             MTLResourceUsage(MTLResourceUsage::Read.0 | MTLResourceUsage::Write.0),
         );
         encoder.use_resource(&*temp.delta_output, MTLResourceUsage::Write);
+        encoder.use_resource(&*slot_ids_buf, MTLResourceUsage::Read);
 
         let tg_count = MTLSize {
             width: n_v,
@@ -799,6 +820,7 @@ mod tests {
             &z_t,
             &beta_t,
             &alpha_t,
+            &(0..b).map(|i| i as u32).collect::<Vec<_>>(),
         )?;
         let flat = out.flatten_all()?.to_vec1::<f32>()?;
         Ok(flat.chunks(value_dim).map(|c| c.to_vec()).collect())

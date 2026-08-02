@@ -208,19 +208,24 @@ impl BatchModel for Qwen35BatchAdapter {
             }
         }
 
-        // Собираем batched входы: tokens [B,1] + positions [B].
+        // Собираем batched входы: tokens [B,1] + positions [B] + slots [B].
+        // `slots` — отображение batch_idx → slot_idx: persistent state (ssm_state,
+        // conv_state, kv_cache) адресуется по slot_idx, а не по batch_idx.
+        // После сжатия батча (ранний EOS) это сохраняет привязку слота к его state.
         let mut tokens = Vec::with_capacity(b);
         let mut positions = Vec::with_capacity(b);
         let mut slot_order = Vec::with_capacity(b); // (batch_idx, slot_idx)
+        let mut slots = Vec::with_capacity(b);
         for it in &batch.items {
             tokens.push(it.token);
             positions.push(it.pos);
             slot_order.push(it.slot_idx);
+            slots.push(it.slot_idx as u32);
         }
         let ids = Tensor::from_vec(tokens, (b, 1usize), &self.device)?;
         let logits = self
             .model
-            .forward_decode_batch(&ids, &positions)
+            .forward_decode_batch(&ids, &positions, &slots)
             .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
         // logits: [B, vocab]. Split per slot.
         let logits_f32 = logits.to_dtype(DType::F32)?;

@@ -171,6 +171,8 @@ pub fn dispatch_delta_rule_batched(
     z_t: &Tensor,
     beta_t: &Tensor,
     alpha_t: &Tensor,
+    // Indirection: batch_idx → реальный slot_idx (persistent state индексация).
+    slot_ids: &[u32],
 ) -> Result<Tensor> {
     let channels = params.channels as u32;
     let n_v = params.n_v_heads as u32;
@@ -223,6 +225,18 @@ pub fn dispatch_delta_rule_batched(
     let beta_v = cuda_slice_view(&beta_st, beta_lay.start_offset())?;
     let alpha_v = cuda_slice_view(&alpha_st, alpha_lay.start_offset())?;
 
+    // Indirection buffer: batch_idx → real slot_idx. Persistent state (ssm_state,
+    // conv_state) индексируется через slot_ids[bidx], temp/входы — по batch_idx.
+    // Без этого при batch shrink оставшийся slot попал бы в чужой state-region.
+    assert_eq!{
+        slot_ids.len(),
+        b,
+        "dispatch_delta_rule_batched: slot_ids.len {} != batch_size {}",
+        slot_ids.len(),
+        b,
+    };
+    let slot_ids_dev = dev.clone_htod(slot_ids)?;
+
     let p = *params;
 
     // ── Kernel 1: delta_conv1d_prep_batched ──
@@ -249,6 +263,7 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&temp.beta); // out
         bb.arg(&temp.gate); // out
         bb.arg(&p);
+        bb.arg(&slot_ids_dev); // slot_ids (indirection)
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
@@ -294,6 +309,7 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&state.ssm_state); // read-write persistent
         bb.arg(&temp.delta_output); // out
         bb.arg(&p);
+        bb.arg(&slot_ids_dev); // slot_ids (indirection)
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
@@ -690,6 +706,7 @@ mod tests {
 
         let out = dispatch_delta_rule_batched(
             dev, batched_state, batched_temp, params, &qkv_t, &z_t, &beta_t, &alpha_t,
+            &(0..b).map(|i| i as u32).collect::<Vec<_>>(),
         )?;
         let flat = out.flatten_all()?.to_vec1::<f32>()?;
         Ok(flat.chunks(value_dim).map(|c| c.to_vec()).collect())
