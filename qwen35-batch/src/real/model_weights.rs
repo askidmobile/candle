@@ -4325,14 +4325,10 @@ impl ModelWeights {
                 HybridLayerType::Attention(attn) => {
                     attn.kv_cache = None;
                     attn.kv_cache_len = 0;
-                    // Per-slot batched KV cache (Phase 5) — обнуляем для новой беседы.
-                    for slot in 0..attn.kv_cache_batched.len() {
-                        attn.kv_cache_batched[slot] = None;
-                    }
-                    for len in attn.kv_cache_len_batched.iter_mut() {
-                        *len = 0;
-                    }
-                    attn.kv_cache_cap_batched = 0;
+                    // Per-slot batched KV cache НЕ сбрасываем здесь: clear_state()
+                    // вызывается per-slot при reset_for_prefill в continuous batching,
+                    // а batched KV других слотов активны. Сброс batched KV — только в
+                    // clear_state_batched() (полный reset) или через reset_slot адаптера.
                 }
             }
         }
