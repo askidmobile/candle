@@ -1485,6 +1485,15 @@ struct DeltaNetLayer {
     /// CUDA batched GPU контекст — Phase 3 true batched decode (NVIDIA Win/Linux).
     #[cfg(feature = "cuda")]
     cuda_ctx_batched: Option<DeltaNetCudaContextBatched>,
+    /// Per-slot CPU state для batched decode fallback (без Metal/CUDA batched ctx).
+    ///
+    /// Длина = DECODE_BATCH_CAPACITY. Каждый слот имеет свой `DeltaNetState`
+    /// (conv_buf + ssm_state), изолированный от других слотов. Seeding из
+    /// prefill-snapshot через `restore_from`; decode loop итерирует по слотам и
+    /// обновляет `cpu_state_batched[slots[bidx]]` (math идентичен single-token
+    /// `forward` CPU path). На macOS+Metal batched ctx активен — это поле просто
+    /// хранится unused (память ~2 МБ/слой × capacity — пренебрежимо).
+    cpu_state_batched: Vec<DeltaNetState>,
     /// Конфигурация размерностей
     n_k_heads: usize,
     n_v_heads: usize,
@@ -1822,11 +1831,152 @@ impl DeltaNetLayer {
             return self.ssm_out.forward(&out);
         }
 
-        candle_core::bail!(
-            "forward_decode_batch: batched GPU контекст отсутствует (capacity_b={}). \
-             Batched decode требует metal_ctx_batched/cuda_ctx_batched (Phase 3 wiring).",
-            DECODE_BATCH_CAPACITY
-        );
+        // ── CPU fallback: per-slot loop через cpu_state_batched (без batched GPU ctx) ──
+        //
+        // Math per slot идентичен single-token `forward` CPU path (lines ~1593-1727):
+        // sigmoid(beta) → softplus(alpha)*ssm_a gate → conv1d_step → L2 norm+expand+Q scale →
+        // delta_rule_step → group RMS norm + SiLU(z) gate. Projections уже сделаны batched
+        // (веса прочитаны один раз на B слотов) — остаётся per-slot recurrent math на CPU.
+        //
+        // Persistent state (conv_buf, ssm_state) индексируется по `slots[bidx]` —
+        // корректно после сжатия батча (ранний EOS), как в GPU batched path.
+        {
+            let key_dim = self.key_dim;
+            let value_dim = self.value_dim;
+            let n_v_heads = self.n_v_heads;
+            let qkv_len = key_dim * 2 + value_dim;
+
+            // Batch transfer: cat [B,1,*] projections → один flatten → CPU Vec.
+            // На CPU device to_vec1 уже zero-copy; на Metal это один GPU→CPU sync.
+            let qkv_flat = qkv_t.flatten_all()?;
+            let z_flat = z_t.flatten_all()?;
+            let beta_flat = beta_t.flatten_all()?;
+            let alpha_flat = alpha_t.flatten_all()?;
+            #[cfg(target_os = "macos")]
+            let qkv_cpu: Vec<f32> = qkv_flat.to_vec1_zero_copy()?;
+            #[cfg(not(target_os = "macos"))]
+            let qkv_cpu: Vec<f32> = qkv_flat.to_vec1()?;
+            #[cfg(target_os = "macos")]
+            let z_cpu: Vec<f32> = z_flat.to_vec1_zero_copy()?;
+            #[cfg(not(target_os = "macos"))]
+            let z_cpu: Vec<f32> = z_flat.to_vec1()?;
+            #[cfg(target_os = "macos")]
+            let beta_cpu: Vec<f32> = beta_flat.to_vec1_zero_copy()?;
+            #[cfg(not(target_os = "macos"))]
+            let beta_cpu: Vec<f32> = beta_flat.to_vec1()?;
+            #[cfg(target_os = "macos")]
+            let alpha_cpu: Vec<f32> = alpha_flat.to_vec1_zero_copy()?;
+            #[cfg(not(target_os = "macos"))]
+            let alpha_cpu: Vec<f32> = alpha_flat.to_vec1()?;
+
+            let eps = 1e-6f32;
+            let q_scale = 1.0 / (self.head_k_dim as f32).sqrt();
+            let mut all_outputs: Vec<f32> = Vec::with_capacity(b * value_dim);
+
+            // Извлекаем read-only ссылки на веса ДО mutable borrow cpu_state_batched,
+            // чтобы borrow checker видел disjoint поля (NLL иначе может зажать `self`).
+            let dt_bias = &self.dt_bias;
+            let ssm_a = &self.ssm_a;
+            let conv_kernel_weights = &self.conv_kernel_weights;
+            let ssm_norm_weight = &self.ssm_norm_weight;
+            let n_k_heads = self.n_k_heads;
+            let n_v_heads_local = self.n_v_heads;
+            let head_k_dim = self.head_k_dim;
+            let head_v_dim = self.head_v_dim;
+            let rms_norm_eps = self.rms_norm_eps;
+
+            for bidx in 0..b {
+                let slot = slots[bidx] as usize;
+                if slot >= self.cpu_state_batched.len() {
+                    candle_core::bail!(
+                        "forward_decode_batch CPU: slot {slot} >= cpu_state_batched len {}",
+                        self.cpu_state_batched.len()
+                    );
+                }
+                let st = &mut self.cpu_state_batched[slot];
+
+                // Per-slot slices из batched projections [B,1,dim] flattened.
+                let qkv = &qkv_cpu[bidx * qkv_len..bidx * qkv_len + qkv_len];
+                let z = &z_cpu[bidx * value_dim..bidx * value_dim + value_dim];
+                let beta_raw = &beta_cpu[bidx * n_v_heads..bidx * n_v_heads + n_v_heads];
+                let alpha_raw = &alpha_cpu[bidx * n_v_heads..bidx * n_v_heads + n_v_heads];
+
+                // sigmoid(beta) + softplus(alpha)*ssm_a gate (идентично single-token).
+                let beta: Vec<f32> = beta_raw.iter().map(|&v| sigmoid_scalar(v)).collect();
+                let gate: Vec<f32> = alpha_raw
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &a)| {
+                        let alpha_biased = a + dt_bias[i];
+                        softplus(alpha_biased) * ssm_a[i]
+                    })
+                    .collect();
+
+                // conv1d_step — allocating variant (избегаем borrow aliasing st vs st.buf_*).
+                let qkv_conv = st.conv1d_step(qkv, conv_kernel_weights);
+
+                // L2 norm per head + expand + Q scale.
+                let q_raw = &qkv_conv[..key_dim];
+                let k_raw = &qkv_conv[key_dim..key_dim * 2];
+                let v_flat = &qkv_conv[key_dim * 2..key_dim * 2 + value_dim];
+
+                let mut q_norm = vec![0.0f32; key_dim];
+                let mut k_norm = vec![0.0f32; key_dim];
+                for h in 0..n_k_heads {
+                    let start = h * head_k_dim;
+                    let end = start + head_k_dim;
+                    l2_normalize_into(&q_raw[start..end], eps, &mut q_norm[start..end]);
+                    l2_normalize_into(&k_raw[start..end], eps, &mut k_norm[start..end]);
+                }
+
+                let (q_expanded, k_expanded) = if n_k_heads != n_v_heads_local {
+                    let mut q_exp = vec![0.0f32; n_v_heads_local * head_k_dim];
+                    let mut k_exp = vec![0.0f32; n_v_heads_local * head_k_dim];
+                    for dst_h in 0..n_v_heads_local {
+                        let src_h = dst_h % n_k_heads;
+                        let src_start = src_h * head_k_dim;
+                        let dst_start = dst_h * head_k_dim;
+                        q_exp[dst_start..dst_start + head_k_dim]
+                            .copy_from_slice(&q_norm[src_start..src_start + head_k_dim]);
+                        k_exp[dst_start..dst_start + head_k_dim]
+                            .copy_from_slice(&k_norm[src_start..src_start + head_k_dim]);
+                    }
+                    (q_exp, k_exp)
+                } else {
+                    (q_norm, k_norm)
+                };
+
+                let q_scaled: Vec<f32> =
+                    q_expanded.iter().map(|&v| v * q_scale).collect();
+
+                // delta_rule_step — allocating variant (мутирует st.ssm_state).
+                let output_raw =
+                    st.delta_rule_step(&q_scaled, &k_expanded, v_flat, &beta, &gate);
+
+                // Group RMS Norm per head + gated output (SiLU(z)).
+                for h in 0..n_v_heads {
+                    let o_start = h * head_v_dim;
+                    let o_end = o_start + head_v_dim;
+                    let head_slice = &output_raw[o_start..o_end];
+                    let sq_mean: f32 =
+                        head_slice.iter().map(|v| v * v).sum::<f32>() / head_v_dim as f32;
+                    let inv_rms = 1.0 / (sq_mean + rms_norm_eps).sqrt();
+                    for j in 0..head_v_dim {
+                        let normed = head_slice[j] * inv_rms * ssm_norm_weight[j];
+                        all_outputs.push(normed * silu_scalar(z[o_start + j]));
+                    }
+                }
+            }
+
+            // Перенос CPU → device + batched output projection.
+            let output_tensor =
+                Tensor::from_vec(all_outputs, (b, 1usize, value_dim), &Device::Cpu)?
+                    .to_device(&device)?;
+            #[cfg(target_os = "macos")]
+            return dispatch_q4k_matmul(&self.ssm_out, self.ssm_out_opt.as_ref(), &output_tensor);
+            #[cfg(not(target_os = "macos"))]
+            return self.ssm_out.forward(&output_tensor);
+        }
     }
 
     /// Batch prefill для DeltaNet.
@@ -3960,6 +4110,12 @@ impl ModelWeights {
 
                 let state = DeltaNetState::new(conv_kernel, conv_channels, n_v_heads, head_v_dim);
 
+                // Per-slot CPU state для batched decode fallback (без batched GPU ctx).
+                // Всегда аллоцируем — память пренебрежимо мала vs весов.
+                let cpu_state_batched = (0..DECODE_BATCH_CAPACITY as usize)
+                    .map(|_| DeltaNetState::new(conv_kernel, conv_channels, n_v_heads, head_v_dim))
+                    .collect::<Vec<_>>();
+
                 // Metal per-layer state (persistent ssm_state + conv_state + weights)
                 #[cfg(target_os = "macos")]
                 let metal_ctx =
@@ -4149,6 +4305,7 @@ impl ModelWeights {
                     metal_ctx_batched,
                     #[cfg(feature = "cuda")]
                     cuda_ctx_batched,
+                    cpu_state_batched,
                     #[cfg(target_os = "macos")]
                     wqkv_opt,
                     #[cfg(target_os = "macos")]
@@ -4558,6 +4715,13 @@ impl ModelWeights {
                     }
                     // Если batched-контекст отсутствует — no-op: batched decode
                     // fallback (адаптер использует time-multiplexed path).
+                    //
+                    // CPU batched fallback: restore per-slot state из snapshot.
+                    // Гарантирует, что `cpu_state_batched[slot]` синхронизирован с
+                    // prefill-state перед первым batched decode-шагом (без batched GPU ctx).
+                    if slot < d.cpu_state_batched.len() {
+                        d.cpu_state_batched[slot].restore_from(s);
+                    }
                 }
                 (HybridLayerType::Attention(a), BlockStateSnap::Attention(kv_opt)) => {
                     match kv_opt {
@@ -4616,6 +4780,10 @@ impl ModelWeights {
                             &dev,
                             &mut ctx.layer_state,
                         );
+                    }
+                    // CPU batched fallback state: зануляем все слоты.
+                    for st in d.cpu_state_batched.iter_mut() {
+                        st.clear();
                     }
                 }
                 HybridLayerType::Attention(a) => {

@@ -22,6 +22,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use qwen35_batch::real::tokenizer::{self, ChatMsg};
 use qwen35_batch::real::Qwen35BatchAdapter;
 use qwen35_batch::scheduler::BatchScheduler;
 use qwen35_batch::{BatchModel, DEFAULT_NUM_SLOTS};
@@ -41,6 +42,16 @@ fn gguf_path() -> PathBuf {
 }
 
 fn accelerator_device() -> candle_core::Device {
+    // Force CPU path (тест batched decode fallback без Metal/CUDA batched ctx).
+    // На macOS: metal feature скомпилирован, но Device::Cpu → metal_ctx/metal_ctx_batched
+    // = None → forward_decode_batch использует CPU fallback (cpu_state_batched).
+    if std::env::var("YTTRI_FORCE_CPU")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("[real] YTTRI_FORCE_CPU=1 → Device::Cpu (CPU batched decode fallback)");
+        return candle_core::Device::Cpu;
+    }
     #[cfg(feature = "cuda")]
     {
         return candle_core::Device::new_cuda(0).expect("CUDA device");
@@ -317,6 +328,107 @@ fn real_qwen35_batched_equals_sequential_parity() {
             r.prefill_ns as f64 / 1e6,
             r.decode_ns as f64 / 1e6,
             r.decode_steps,
+        );
+    }
+}
+
+/// Длинный реальный throughput-замер: 4 разных развёрнутых промпта (ChatML через
+/// настоящий токенизатор, ~150–250 токенов каждый), генерация 256 токенов,
+/// замер B=1/2/3/4 на реальном тексте. Печатает первый ответ полностью (для
+/// оценки качества), throughput по aggregate / per-request / decode-only.
+///
+/// Loads вне таймера. EOS отключён (u32::MAX) — все слоты досчитывают 256 токенов,
+/// чтобы замер был честным по фиксированной нагрузке (без batch shrink).
+#[test]
+#[ignore = "требует GGUF + GPU; длинный throughput bench B=1/2/3/4 (4×256 токенов)"]
+fn real_qwen35_long_throughput_b1234() {
+    let _ = env_logger::try_init();
+    let gguf = gguf_path();
+    assert!(gguf.exists(), "GGUF не найден: {:?}", gguf);
+
+    let tokenizer = tokenizer::load_from_gguf_path(&gguf).expect("load tokenizer");
+    let device = accelerator_device();
+
+    // Четыре разных развёрнутых промпта → 4 разных длинных ответа.
+    // Просим развёрнутый ответ (несколько пунктов) → модель генерит 100+ токенов.
+    let messages_per_case: Vec<Vec<ChatMsg>> = vec![
+        vec![
+            ChatMsg { role: "system", content: "Ты опытный Rust-инженер. Отвечай подробно и технически точно на русском." },
+            ChatMsg { role: "user", content: "Объясни, чем отличается Arc<Mutex<T>> от Arc<RwLock<T>> в Rust. Перечисли 4 ключевых отличия с примерами кода, расскажи когда выбирать каждый из них, и какие есть подводные камни при использовании в async-коде." },
+        ],
+        vec![
+            ChatMsg { role: "system", content: "Ты преподаватель информатики. Отвечай подробно на русском." },
+            ChatMsg { role: "user", content: "Опиши алгоритм быстрой сортировки (quicksort). Объясни временную сложность в лучшем, среднем и худшем случае, стратегии выбора опорного элемента (pivot), и как избежать худшего случая. Приведи 3 примера выбора pivot с оценкой." },
+        ],
+        vec![
+            ChatMsg { role: "system", content: "Ты биолог-популяризатор. Отвечай подробно и понятно на русском." },
+            ChatMsg { role: "user", content: "Расскажи про процесс клеточного дыхания. Опиши три стадии (гликолиз, цикл Кребса, окислительное фосфорилирование), где каждая происходит в клетке, сколько АТФ получается на каждой стадии, и какую роль играет кислород. Дай итоговую сводку по выходу АТФ." },
+        ],
+        vec![
+            ChatMsg { role: "system", content: "Ты финансовый аналитик. Отвечай подробно на русском." },
+            ChatMsg { role: "user", content: "Сравни ETF и взаимные фонды (mutual funds) для долгосрочного инвестора. Перечисли 5 критериев сравнения (комиссии, ликвидность, налоговая эффективность, прозрачность, минимальный порог входа), объясни каждый, и дай рекомендацию для инвестора с горизонтом 10 лет." },
+        ],
+    ];
+    let prompts: Vec<Vec<u32>> = messages_per_case
+        .iter()
+        .map(|msgs| {
+            let text = tokenizer::build_chatml_text(msgs);
+            tokenizer::encode_no_think(&tokenizer, &text)
+                .unwrap_or_else(|e| panic!("encode prompt: {e}"))
+        })
+        .collect();
+
+    const MAX_NEW: usize = 256;
+    let total_tokens = MAX_NEW * prompts.len();
+    let decode_only_tokens = (MAX_NEW - 1) * prompts.len();
+
+    eprintln!(
+        "[long-bench] {} реальных промптов, ChatML, prompt_tokens={:?}, max_new={MAX_NEW}",
+        prompts.len(),
+        prompts.iter().map(|p| p.len()).collect::<Vec<_>>()
+    );
+
+    let mut results = Vec::new();
+    for batch in [1usize, 2, 3, 4] {
+        results.push(run_bench(&gguf, &device, &prompts, MAX_NEW, batch));
+    }
+
+    // Печатаем первый (полный) ответ из B=1 — для оценки качества текста.
+    let first_text = {
+        let ids = &results[0].outputs[0];
+        let raw = tokenizer::decode_text(&tokenizer, ids).expect("decode first answer");
+        tokenizer::strip_thinking(&raw)
+    };
+    eprintln!("\n[long-bench] пример ответа (case 0, Rust Arc/Mutex vs RwLock, B=1):\n{first_text}");
+    eprintln!("[long-bench] длина ответа: {} токенов\n", results[0].outputs[0].len());
+
+    let baseline_tps = total_tokens as f64 / (results[0].wall_ns as f64 / 1e9);
+    let baseline_decode_tps =
+        decode_only_tokens as f64 / (results[0].decode_ns as f64 / 1e9);
+    eprintln!("[long-bench] B | wall_ms | aggregate_tok/s | per_request_tok/s | decode_only_tok/s | vs_B1_agg | vs_B1_decode | peak_concurrent | RSS_MB");
+    for r in &results {
+        let aggregate_tps = total_tokens as f64 / (r.wall_ns as f64 / 1e9);
+        let per_request_tps = aggregate_tps / r.max_concurrent.max(1) as f64;
+        let decode_tps = decode_only_tokens as f64 / (r.decode_ns as f64 / 1e9);
+        eprintln!(
+            "[long-bench] {} | {:.1} | {:.2} | {:.2} | {:.2} | {:.3}x | {:.3}x | {} | {:.1}",
+            r.batch,
+            r.wall_ns as f64 / 1e6,
+            aggregate_tps,
+            per_request_tps,
+            decode_tps,
+            aggregate_tps / baseline_tps,
+            decode_tps / baseline_decode_tps,
+            r.max_concurrent,
+            r.rss_mb,
+        );
+        eprintln!(
+            "[long-bench-detail] B={} prefill_ms={:.1} decode_ms={:.1} decode_steps={} gen_lens={:?}",
+            r.batch,
+            r.prefill_ns as f64 / 1e6,
+            r.decode_ns as f64 / 1e6,
+            r.decode_steps,
+            r.outputs.iter().map(|o| o.len()).collect::<Vec<_>>()
         );
     }
 }

@@ -43,6 +43,14 @@ fn gguf_path() -> PathBuf {
 }
 
 fn accelerator_device() -> candle_core::Device {
+    // Force CPU path (тест batched decode fallback без Metal/CUDA batched ctx).
+    if std::env::var("YTTRI_FORCE_CPU")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("[quality] YTTRI_FORCE_CPU=1 → Device::Cpu");
+        return candle_core::Device::Cpu;
+    }
     #[cfg(feature = "cuda")]
     {
         return candle_core::Device::new_cuda(0).expect("CUDA device");
