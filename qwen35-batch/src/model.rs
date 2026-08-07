@@ -65,7 +65,7 @@ pub struct PrefillChunk {
 }
 
 /// Сэмплер: логиты → токен.
-pub trait Sampler {
+pub trait Sampler: Send {
     fn sample(&mut self, logits: &[f32]) -> u32;
 
     /// Per-slot вызов (qwen36-server: per-request sampling params + penalties).

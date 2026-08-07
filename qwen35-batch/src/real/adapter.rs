@@ -271,4 +271,13 @@ impl Qwen35BatchAdapter {
     pub fn eos(&self) -> u32 {
         self.eos
     }
+
+    /// Размер словаря (для BatchScheduler::new).
+    pub fn vocab_size(&self) -> usize {
+        if self.vocab != 0 {
+            self.vocab
+        } else {
+            151943
+        }
+    }
 }
