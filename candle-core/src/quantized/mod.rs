@@ -135,11 +135,13 @@ impl QStorage {
                 GgmlDType::IQ2S => {
                     cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2S)
                 }
+                GgmlDType::IQ3S => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3S)
+                }
                 GgmlDType::IQ2XXS
                 | GgmlDType::IQ2XS
                 | GgmlDType::IQ1S
                 | GgmlDType::IQ4NL
-                | GgmlDType::IQ3S
                 | GgmlDType::IQ4XS
                 | GgmlDType::IQ1M => crate::bail!("CUDA is not implemented for {:?}", dtype),
             },

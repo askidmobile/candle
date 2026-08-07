@@ -214,6 +214,9 @@ pub fn qtensor_from_ggml(
         GgmlDType::IQ2S => {
             from_raw_data_bytes(raw_data, size_in_bytes, dims, ggml_dtype, device)
         }
+        GgmlDType::IQ3S => {
+            from_raw_data_bytes(raw_data, size_in_bytes, dims, ggml_dtype, device)
+        }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
 }
