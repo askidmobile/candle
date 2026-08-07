@@ -236,6 +236,7 @@ fn dequantize_mul_mat_vec_via_cublas(
     m: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
     let storage = QCudaStorage {
         data: data.clone(),
         dtype,
