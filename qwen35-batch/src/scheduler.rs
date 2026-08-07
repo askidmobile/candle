@@ -155,7 +155,8 @@ impl<M: BatchModel> BatchScheduler<M> {
             // последнего токена prompt'а в рекуррентном state).
             let mut first_emitted = false;
             if self.slots[sidx].is_decoding() {
-                let tok = self.sampler.sample_indexed(sidx, &logits);
+                let gen = self.slots[sidx].generated_tokens().to_vec();
+                let tok = self.sampler.sample_indexed(sidx, &gen, &logits);
                 self.stats.total_decode_tokens += 1;
                 self.slots[sidx].push_token(tok);
                 if should_stop(sidx, &self.slots[sidx].generated) {
@@ -190,7 +191,8 @@ impl<M: BatchModel> BatchScheduler<M> {
         self.stats.decode_ns += t0.elapsed().as_nanos();
         self.stats.decode_steps += 1;
         for (it, logits) in batch.items.iter().zip(logits_vec.iter()) {
-            let tok = self.sampler.sample_indexed(it.slot_idx, logits);
+            let gen = self.slots[it.slot_idx].generated_tokens().to_vec();
+            let tok = self.sampler.sample_indexed(it.slot_idx, &gen, logits);
             self.stats.total_decode_tokens += 1;
             self.slots[it.slot_idx].push_token(tok);
             if should_stop(it.slot_idx, &self.slots[it.slot_idx].generated) {

@@ -68,10 +68,11 @@ pub struct PrefillChunk {
 pub trait Sampler {
     fn sample(&mut self, logits: &[f32]) -> u32;
 
-    /// Per-slot вызов (qwen36-server: per-request sampling params).
-    /// Default — игнорировать slot (поведение не меняется для существующих
-    /// реализаций, включая GreedySampler и тесты parity).
-    fn sample_indexed(&mut self, _slot_idx: usize, logits: &[f32]) -> u32 {
+    /// Per-slot вызов (qwen36-server: per-request sampling params + penalties).
+    /// `generated` — токены, сгенерированные этим слотом ДО текущего шага
+    /// (для presence/repetition penalties). Default — игнорировать slot+generated
+    /// (поведение не меняется для GreedySampler и parity-тестов).
+    fn sample_indexed(&mut self, _slot_idx: usize, _generated: &[u32], logits: &[f32]) -> u32 {
         self.sample(logits)
     }
 }
