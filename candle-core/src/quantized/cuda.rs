@@ -129,6 +129,7 @@ fn dequantize_f32(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb),
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3_xxs_f32", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -189,6 +190,7 @@ fn dequantize_f16(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb),
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3_xxs_f16", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -218,6 +220,35 @@ fn dequantize_f16(
         unsafe { builder.launch(cfg) }.w()?;
     }
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+// IQ-type fallback: dequantize weights to f32 on GPU, then matvec via cuBLAS.
+// Used by dequantize_matmul_vec for IQ3XXS (no fused kernel exists).
+// `rhs` is the [b, m, ncols] f32 activation storage.
+fn dequantize_mul_mat_vec_via_cublas(
+    data: &PaddedCudaSlice,
+    rhs: &CudaStorage,
+    rhs_l: &crate::Layout,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b: usize,
+    m: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let storage = QCudaStorage {
+        data: data.clone(),
+        dtype,
+        device: dev.clone(),
+    };
+    // Dequantize [nrows, ncols] weights to f32
+    let data_f32 = storage.dequantize(nrows * ncols)?;
+    // cuBLAS: result[b, m, nrows] = rhs[b, m, ncols] @ data_f32[nrows, ncols]^T
+    // Weights [nrows, ncols] row-major => transposed view [ncols, nrows] (swap strides).
+    let weight_l =
+        crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
+            .broadcast_as((b, ncols, nrows))?;
+    rhs.matmul(&data_f32, (b, m, nrows, ncols), rhs_l, &weight_l)
 }
 
 fn dequantize_mul_mat_vec(
@@ -569,6 +600,7 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::IQ3XXS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -723,6 +755,10 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        // IQ-types have no MMQ/DMMV kernels yet — always use dequantize + cuBLAS fallback.
+        if matches!(self.dtype, GgmlDType::IQ3XXS) {
+            return self.dequantize_matmul(self_shape, storage, layout);
+        }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
         } else {
@@ -761,26 +797,39 @@ impl QCudaStorage {
         rhs_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
         let (nrows, ncols) = self_shape.dims2()?;
-        let rhs = rhs.as_cuda_slice::<f32>()?;
-        let rhs = match rhs_l.contiguous_offsets() {
-            Some((o1, o2)) => rhs.slice(o1..o2),
+        let rhs_slice = rhs.as_cuda_slice::<f32>()?;
+        let rhs_slice = match rhs_l.contiguous_offsets() {
+            Some((o1, o2)) => rhs_slice.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "dmmv" }.bt())?,
         };
-        let (b_size, k) = match rhs_l.shape().dims() {
-            [b, m, k] => (b * m, *k),
-            [b, k] => (*b, *k),
+        let (b, m, k) = match rhs_l.shape().dims() {
+            [b, m, k] => (*b, *m, *k),
+            [b, k] => (*b, 1, *k),
             _ => crate::bail!("unexpected rhs shape in dmmv {:?}", rhs_l.shape()),
         };
         if ncols != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
         }
+        let b_size = b * m;
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            dequantize_mul_mat_vec(&self.data, &rhs, self.dtype, ncols, nrows, self.device())?
+        // IQ-types have no fused vec/matmul kernels — use dequantize + cuBLAS.
+        let iq_type = matches!(self.dtype, GgmlDType::IQ3XXS);
+        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
+            dequantize_mul_mat_vec_via_cublas(
+                &self.data,
+                rhs,
+                rhs_l,
+                self.dtype,
+                ncols,
+                nrows,
+                b,
+                m,
+                self.device(),
+            )?
         } else {
             mul_mat_vec_via_q8_1(
                 &self.data,
-                &rhs,
+                &rhs_slice,
                 self.dtype,
                 ncols,
                 nrows,
@@ -811,7 +860,9 @@ impl QCudaStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+            || matches!(self.dtype, GgmlDType::IQ3XXS)
+        {
             let data_f32 = self.dequantize(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
@@ -850,6 +901,27 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         std::slice::from_raw_parts(data.as_ptr() as *const u8, core::mem::size_of_val(data))
     };
     let dtype = T::DTYPE;
+    let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner,
+            len: data.len(),
+        },
+        device: device.clone(),
+        dtype,
+    }))
+}
+
+/// Load raw quantized bytes (IQ-types) onto CUDA device.
+/// Analog of metal::load_quantized_bytes — stores raw bytes in a PaddedCudaSlice,
+/// keeps dtype metadata for kernel dispatch.
+pub fn load_quantized_bytes(
+    device: &CudaDevice,
+    data: &[u8],
+    dtype: GgmlDType,
+) -> Result<super::QStorage> {
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
     let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
     device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;

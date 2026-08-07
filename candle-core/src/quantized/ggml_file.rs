@@ -134,6 +134,30 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
     super::QTensor::new(data, dims)
 }
 
+/// Creates a QTensor from raw bytes for IQ-types that don't have a Rust block struct.
+/// On GPU: loads raw bytes via load_quantized_bytes. On CPU: stores as RawQuantizedType.
+fn from_raw_data_bytes(
+    raw_data: &[u8],
+    size_in_bytes: usize,
+    dims: Vec<usize>,
+    dtype: GgmlDType,
+    device: &Device,
+) -> Result<super::QTensor> {
+    let data = match device {
+        Device::Cuda(cuda) => {
+            super::cuda::load_quantized_bytes(cuda, &raw_data[..size_in_bytes], dtype)?
+        }
+        Device::Metal(metal) => {
+            super::metal::load_quantized_bytes(metal, &raw_data[..size_in_bytes], dtype)?
+        }
+        Device::Cpu => QStorage::Cpu(Box::new(super::RawQuantizedType::from_data(
+            dtype,
+            std::borrow::Cow::Borrowed(&raw_data[..size_in_bytes]),
+        ))),
+    };
+    super::QTensor::new(data, dims)
+}
+
 /// Creates a [Tensor] from a raw GGML tensor.
 pub fn qtensor_from_ggml(
     ggml_dtype: GgmlDType,
@@ -183,6 +207,9 @@ pub fn qtensor_from_ggml(
         }
         GgmlDType::Q6K => {
             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3XXS => {
+            from_raw_data_bytes(raw_data, size_in_bytes, dims, ggml_dtype, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }

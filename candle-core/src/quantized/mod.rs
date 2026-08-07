@@ -129,9 +129,11 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::IQ3XXS => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3XXS)
+                }
                 GgmlDType::IQ2XXS
                 | GgmlDType::IQ2XS
-                | GgmlDType::IQ3XXS
                 | GgmlDType::IQ1S
                 | GgmlDType::IQ4NL
                 | GgmlDType::IQ3S
@@ -477,7 +479,7 @@ impl GgmlDType {
     }
 }
 
-struct RawQuantizedType {
+pub(crate) struct RawQuantizedType {
     dtype: GgmlDType,
     data: Vec<u8>,
 }
@@ -491,7 +493,7 @@ impl RawQuantizedType {
         }
     }
 
-    fn from_data(dtype: GgmlDType, data: Cow<'_, [u8]>) -> Self {
+    pub(crate) fn from_data(dtype: GgmlDType, data: Cow<'_, [u8]>) -> Self {
         Self {
             dtype,
             data: data.into_owned(),

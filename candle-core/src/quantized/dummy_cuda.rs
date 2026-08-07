@@ -93,3 +93,11 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
 ) -> Result<super::QStorage> {
     Err(Error::NotCompiledWithCudaSupport)
 }
+
+pub fn load_quantized_bytes(
+    _device: &CudaDevice,
+    _data: &[u8],
+    _dtype: GgmlDType,
+) -> Result<super::QStorage> {
+    Err(Error::NotCompiledWithCudaSupport)
+}
