@@ -67,6 +67,13 @@ pub struct PrefillChunk {
 /// Сэмплер: логиты → токен.
 pub trait Sampler {
     fn sample(&mut self, logits: &[f32]) -> u32;
+
+    /// Per-slot вызов (qwen36-server: per-request sampling params).
+    /// Default — игнорировать slot (поведение не меняется для существующих
+    /// реализаций, включая GreedySampler и тесты parity).
+    fn sample_indexed(&mut self, _slot_idx: usize, logits: &[f32]) -> u32 {
+        self.sample(logits)
+    }
 }
 
 /// Greedy argmax. Достаточен для parity (batched vs single-stream):

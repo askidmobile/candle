@@ -120,6 +120,18 @@ impl<M: BatchModel> BatchScheduler<M> {
 
     /// Один шаг scheduler'а. НЕ сбрасывает Finished-слоты (сбор+reset делает caller).
     pub fn step(&mut self) -> Result<StepOutcome> {
+        self.step_with(&mut |_, _| false)
+    }
+
+    /// Шаг с внешним досрочным завершением слота (qwen36-server: stop-строки,
+    /// отмена клиента). `should_stop(slot_idx, generated_after_step)` вызывается
+    /// ПОСЛЕ model+push_token для каждого эмитнутого токена; true → слот
+    /// переводится в Finished (сгенерированный токен сохраняется в generated —
+    /// caller решает, эмитить ли его текст). По умолчанию (`step`) — как раньше.
+    pub fn step_with(
+        &mut self,
+        should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
+    ) -> Result<StepOutcome> {
         self.admit_from_queue();
 
         // 1. Prefill phase: один чанк для одного Prefilling-слота.
@@ -143,9 +155,12 @@ impl<M: BatchModel> BatchScheduler<M> {
             // последнего токена prompt'а в рекуррентном state).
             let mut first_emitted = false;
             if self.slots[sidx].is_decoding() {
-                let tok = self.sampler.sample(&logits);
+                let tok = self.sampler.sample_indexed(sidx, &logits);
                 self.stats.total_decode_tokens += 1;
                 self.slots[sidx].push_token(tok);
+                if should_stop(sidx, &self.slots[sidx].generated) {
+                    self.slots[sidx].status = SlotStatus::Finished;
+                }
                 first_emitted = true;
             }
             return Ok(StepOutcome::DidPrefill {
@@ -175,9 +190,12 @@ impl<M: BatchModel> BatchScheduler<M> {
         self.stats.decode_ns += t0.elapsed().as_nanos();
         self.stats.decode_steps += 1;
         for (it, logits) in batch.items.iter().zip(logits_vec.iter()) {
-            let tok = self.sampler.sample(logits);
+            let tok = self.sampler.sample_indexed(it.slot_idx, logits);
             self.stats.total_decode_tokens += 1;
             self.slots[it.slot_idx].push_token(tok);
+            if should_stop(it.slot_idx, &self.slots[it.slot_idx].generated) {
+                self.slots[it.slot_idx].status = SlotStatus::Finished;
+            }
         }
         Ok(StepOutcome::DidDecode(b))
     }
@@ -319,6 +337,18 @@ impl<M: BatchModel> BatchScheduler<M> {
     }
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
+    }
+
+    /// Установить сэмплер (qwen36-server: per-request sampling params через
+    /// `Sampler::sample_indexed`). Default — GreedySampler.
+    pub fn set_sampler(&mut self, sampler: Box<dyn Sampler>) {
+        self.sampler = sampler;
+    }
+
+    /// Доступ к слотам для caller-driven сбора Finished (generated валиден
+    /// только до `Slot::reset()`) — continuous-batching loop вне scheduler'а.
+    pub fn slots_mut(&mut self) -> &mut [Slot] {
+        &mut self.slots
     }
 }
 
