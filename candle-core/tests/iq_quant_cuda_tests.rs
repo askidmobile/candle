@@ -61,10 +61,8 @@ fn make_iq_qtensor(
         n_cols % QK_K == 0,
         "n_cols must be multiple of QK_K, got {n_cols}"
     );
-    let n_elems = n_rows * n_cols;
     let blocks_per_row = n_cols / QK_K;
     let total_blocks = n_rows * blocks_per_row;
-    let block_size = dtype.block_size();
     let type_size = dtype.type_size();
     let total_bytes = total_blocks * type_size;
     // Build raw data: each block is zeroed with d=1.0.
@@ -139,10 +137,7 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
 
     // Compare.
     let res_cpu = res.to_device(&Device::Cpu)?;
-    let diff = ((&res_cpu - &ref_mm)?
-        .abs()?
-        .max_all()?
-        .to_scalar::<f32>()?)?;
+    let diff = (&res_cpu - &ref_mm)?.abs()?.max_all()?.to_scalar::<f32>()?;
     // With zeroed quant data and d=1.0, dequant values are deterministic but
     // may be nonzero (grid index 0 has nonzero entries). Allow generous
     // tolerance — we mainly care that CUDA dispatch works and produces
