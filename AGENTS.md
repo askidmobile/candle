@@ -31,12 +31,26 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 
 - Binary: `D:\Projects\yttri-build\qwen36-server\target\release\qwen36-server.exe`.
 - **Server needs env vars** (`QWEN36_MODEL`, `QWEN36_SLOTS`, `QWEN36_CTX`, `QWEN36_PORT`, `QWEN36_API_KEY`, `PATH` with CUDA bin). Launch via a `.bat` that sets them (`run_server_q2.bat`, `start_q2_test.bat`, `start_q2_live.bat`).
+- **Foreground launch (диагностика):** `ssh -t yttri-win "cmd /c D:\Projects\yttri-build\start_q2_live.bat"` — показывает stdout/stderr в реальном времени. Сессия жива пока сервер работает. После Ctrl+C — сервер умираст (exe в foreground).
+- **Detached launch через SSH не виснет** только если launcher .bat запускает `start /b` и сразу `exit /b 0`. Прямой `ssh yttri-win "cmd /c start /b cmd /c ..."` виснет — SSH ждёт фоновый процесс. Паттерн: `launch_server_detached.bat` → `start /b cmd /c "run_live_inner.bat >live.log 2>&1"` → `exit /b 0`. `run_live_inner.bat` задаёт env vars и запускает exe.
+- **curl на yttri-win требует `--noproxy "*"`** — иначе прокси перехватывает localhost запросы, ответ пустой. Рабочий паттерн: `curl -s -m 60 --noproxy "*" http://127.0.0.1:18099/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer test" -d @file.json`. JSON-body через `@file.json` — inline JSON ломается PowerShell кавычками.
 - **`Start-Process ... -RedirectStandardOutput` does NOT capture the server's stdout** — the exe likely writes to its own log or buffers. Observed: process starts, GPU stays at 375 MiB (baseline), logs stay 0 bytes, process exits silently. Use the `run_test.bat` pattern instead (background `start /b`, poll for "loaded:" in a logfile, curl test, then kill).
 - Model: `D:\Models\unsloth\Qwen3.6-27B-GGUF\Qwen3.6-27B-UD-Q2_K_XL.gguf` (~10 GB Q2_K_XL, 27B). Load takes >90s; 12 GB VRAM (RTX 3060).
 - Server logs: `server_q2.log`, `server_q2_iq3.log`, etc. in `D:\Projects\yttri-build\`. All observed 0 bytes → server writes elsewhere or crashes before flush. Check `RUST_BACKTRACE=1` + run foreground with `ssh -t` to see the panic.
-- **Known failure RESOLVED (2026-08-08):** inference bailed with `"CPU matmul is not implemented for IQ3XXS"`. Root cause: `qwen36-server.exe` was built WITHOUT `--features cuda`. `select_device()` (engine.rs:381-394) has `#[cfg(feature = "cuda")]` → `Device::new_cuda(0)`, else falls through to `Ok(Device::Cpu)`. Without the cuda feature, device = CPU → all weights load as `QStorage::Cpu` → `cpu_fwd` → `matmul_t` → bail for RawQuantizedType (IQ types). **Fix: always rebuild via `build_cuda124.bat` (`cargo build --release --features cuda`)** — see build section below.
+- **Known failure RESOLVED (2026-08-08):** inference bailed with `"CPU matmul is not implemented for IQ3XXS"`. Root cause: `qwen36-server.exe` was built WITHOUT `--features cuda`. `select_device()` (engine.rs:381-394) has `#[cfg(feature = "cuda")]` → `Device::new_cuda(0)`, else falls through to `Ok(Device::Cpu)`. Without the cuda feature, device = CPU → all weights load as `QStorage::Cpu` → `cpu_fwd` → `matmul_t` → bail for RawQuantizedType (IQ types). **Fix: always rebuild via `build_cuda124.bat` (`cargo build --release --features cuda`)** — see build section above.
 - **How to verify the binary has cuda:** `dumpbin /dependents qwen36-server.exe`. With cuda, size jumps from ~8.7 MB (no cuda) to ~23.4 MB (cuda kernels embedded). NOTE: `cudart`/`cublas` do NOT appear in dumpbin — candle uses `cudarc` with dynamic-loading (CUDA loaded via `LoadLibrary` at runtime, not statically linked). Size is the reliable indicator.
 - **After rebuilding with cuda feature**: server loads Q2_K_XL on CUDA, inference works end-to-end. First curl returned valid chat completion (`"Hello! How can I help you today"`, 8 completion / 13 prompt tokens).
+
+## Prefill performance (2026-08-08)
+
+- **Prefill НЕ виснет — медленный.** 3000-токенный промпт: 15 чанков × ~39s = ~583s (600s timeout). Время растёт линейно (11s → 43s → 83s → ...).
+- **Chunked prefill** (engine.rs:240-276, `PREFILL_CHUNK=256`): prompt разбит на чанки по 256 токенов, `model.forward` вызывается для каждого. KV cache накапливается.
+- **DeltaNet `forward_prefill` CUDA path** (model_weights.rs:2081-2103): token-by-token loop по seq_len, 4 kernel launches + sync alloc на токен × 32 слоя = 4096 GPU syncs/chunk. CPU fallback (model_weights.rs:2105-2322) медленнее (33s vs 18s/chunk). Оставляем CUDA.
+- **Attention `forward_attn` prefill** (model_weights.rs:2710-2851): chunked F32 manual matmul, scores [256 × kv_len] растут O(n²) с KV cache. На 3000 токенов kv_len=3000 → scores 256×3000×4=3MB, но matmul cuBLAS дороже с ростом.
+- **Tiled dequantize matmul** (cuda.rs:175-213, 923-964): commit `2fdd7a1e`. Снижает dequant buffer peak с 357MB до 35.7MB. IQ tests 12/12 pass.
+- **Короткие промпты (<500 токенов):** ~2 чанка × ~11s = ~22s — приемлемо для live chat.
+- **Длинные промпты (>2000 токенов):** >300s — оптимизация fused batch DeltaNet kernel (как Metal GDN на macOS) отдельная задача.
+- **eprintln timing markers** в engine.rs prefill loop: `[prefill] chunk start={} end={} elapsed={:.1}ms`. Использовать для диагностики. qwen36-server не имеет логгера — `log::debug!`/`log::info!` не выводятся. Только `eprintln!` попадает в stdout/redirect-лог.
 
 ## IQ quant CUDA (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS)
 
