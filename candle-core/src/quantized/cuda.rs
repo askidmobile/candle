@@ -133,6 +133,7 @@ fn dequantize_f32(
         GgmlDType::IQ2S => ("dequantize_block_iq2_s_f32", true, 256, nb),
         GgmlDType::IQ3S => ("dequantize_block_iq3_s_f32", true, 256, nb),
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", true, 256, nb),
+        GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", true, 256, nb),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
@@ -194,6 +195,7 @@ fn dequantize_f32_rowslice(
         GgmlDType::IQ2S => ("dequantize_block_iq2_s_f32", 256),
         GgmlDType::IQ3S => ("dequantize_block_iq3_s_f32", 256),
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", 256),
+        GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", 256),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", 256),
         _ => crate::bail!("unsupported dtype for rowslice dequant: {dtype:?}"),
     };
@@ -245,6 +247,7 @@ fn dequantize_f16(
         GgmlDType::IQ2S => ("dequantize_block_iq2_s_f16", true, 256, nb),
         GgmlDType::IQ3S => ("dequantize_block_iq3_s_f16", true, 256, nb),
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f16", true, 256, nb),
+        GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f16", true, 256, nb),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f16", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
