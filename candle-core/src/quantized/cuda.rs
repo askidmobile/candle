@@ -133,6 +133,7 @@ fn dequantize_f32(
         GgmlDType::IQ2S => ("dequantize_block_iq2_s_f32", true, 256, nb),
         GgmlDType::IQ3S => ("dequantize_block_iq3_s_f32", true, 256, nb),
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", true, 256, nb),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -197,6 +198,7 @@ fn dequantize_f16(
         GgmlDType::IQ2S => ("dequantize_block_iq2_s_f16", true, 256, nb),
         GgmlDType::IQ3S => ("dequantize_block_iq3_s_f16", true, 256, nb),
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f16", true, 256, nb),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f16", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -611,6 +613,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ2S
                 | GgmlDType::IQ3S
                 | GgmlDType::IQ2XS
+                | GgmlDType::IQ4XS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -766,7 +769,7 @@ impl QCudaStorage {
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
         // IQ-types have no MMQ/DMMV kernels yet — always use dequantize + cuBLAS fallback.
-        if matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS) {
+        if matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS) {
             return self.dequantize_matmul(self_shape, storage, layout);
         }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
@@ -823,7 +826,7 @@ impl QCudaStorage {
         let b_size = b * m;
 
         // IQ-types have no fused vec/matmul kernels — use dequantize + cuBLAS.
-        let iq_type = matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS);
+        let iq_type = matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS);
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
             dequantize_mul_mat_vec_via_cublas(
                 &self.data,
@@ -871,7 +874,7 @@ impl QCudaStorage {
         }
 
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
-            || matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS)
+            || matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS)
         {
             let data_f32 = self.dequantize(n * k)?;
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;

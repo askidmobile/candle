@@ -458,6 +458,15 @@ typedef struct {
 } block_iq2_xs;
 static_assert(sizeof(block_iq2_xs) == sizeof(ggml_fp16_t) + QK_K/8*sizeof(uint16_t) + QK_K/32, "wrong iq2_xs block size/padding");
 
+// 4.5 bpw quants
+typedef struct {
+    half d;
+    uint16_t scales_h;
+    uint8_t  scales_l[QK_K/64];
+    uint8_t  qs[QK_K/2];
+} block_iq4_xs;
+static_assert(sizeof(block_iq4_xs) == sizeof(ggml_fp16_t) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
+
 // 3.4375 bpw
 #define IQ3S_N_SCALE (QK_K/64)
 typedef struct {
@@ -973,6 +982,10 @@ static __constant__ uint64_t iq2xs_grid[512] = {
     0x2b2b2b08082b0808, 0x2b2b2b08082b082b, 0x2b2b2b08082b2b08, 0x2b2b2b082b2b0808,
     0x2b2b2b082b2b2b08, 0x2b2b2b1908081908, 0x2b2b2b192b081908, 0x2b2b2b192b08192b,
     0x2b2b2b2b082b2b08, 0x2b2b2b2b082b2b2b, 0x2b2b2b2b2b190819, 0x2b2b2b2b2b2b2b2b,
+};
+
+static __constant__ float kvalues_iq4nl_f[16] = {
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f, 1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
 };
 
 
@@ -1792,6 +1805,32 @@ static __device__ void dequantize_block_iq2_xs(const void * __restrict__ vx, dst
     yy[i * QK_K + pos] = value;
 }
 
+// IQ4_XS dequantize: 256 threads per block, 1 element per thread.
+// Ported from Metal dequantize_iq4_xs (quantized.metal:7260-7278).
+template<typename dst_t>
+static __device__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int i = blockIdx.x;
+    const int pos = threadIdx.x;  // 0..255
+    const block_iq4_xs * x = (const block_iq4_xs *)vx;
+
+    const int ib32 = pos / 32;
+    const int sub_pos = pos % 32;
+    const int il = sub_pos / 16;   // 0 or 1 (first/second 16 of the 32-block)
+    const int j = sub_pos % 16;
+    const int qi = j / 4;          // 0..3 (which uint32_t in the 32-block)
+    const int byte_in_aux = j % 4; // 0..3 (which byte/nibble)
+
+    const uint32_t * q4 = (const uint32_t *)x[i].qs + 4 * ib32;
+    const int ls = ((x[i].scales_l[ib32/2] >> (4*(ib32%2))) & 0xf) | (((x[i].scales_h >> (2*ib32)) & 3) << 4);
+    const float d = __half2float(x[i].d) * (float)(ls - 32);
+
+    const uint32_t aux32 = (q4[qi] >> (4*il)) & 0x0f0f0f0f;
+    const uint8_t nibble = ((const uint8_t *)&aux32)[byte_in_aux];
+
+    const float value = d * kvalues_iq4nl_f[nibble];
+    yy[i * QK_K + pos] = value;
+}
+
 #define DEQUANTIZE_K(QNAME) \
 extern "C" __global__ void dequantize_block_##QNAME##_f32(const void * __restrict__ vx, float * __restrict__ y) { \
   dequantize_block_##QNAME(vx, y); \
@@ -1818,6 +1857,7 @@ DEQUANTIZE_K(iq3_xxs)
 DEQUANTIZE_K(iq2_s)
 DEQUANTIZE_K(iq3_s)
 DEQUANTIZE_K(iq2_xs)
+DEQUANTIZE_K(iq4_xs)
 DEQUANTIZE(q4_0)
 DEQUANTIZE(q4_1)
 DEQUANTIZE(q5_0)
