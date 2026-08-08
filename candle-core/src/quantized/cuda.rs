@@ -165,6 +165,53 @@ fn dequantize_f32(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Dequantize a row-slice [row_start, row_end) of an IQ-type weight [n, k] into
+/// a contiguous f32 buffer [(row_end - row_start) * k].
+///
+/// IQ kernels index blocks by `blockIdx.x` and write `yy[i * QK_K + pos]`, so
+/// slicing `data.inner` by byte offset shifts the base pointer — the kernel
+/// sees the first block of the slice as block 0. This avoids dequantizing the
+/// full [n, k] weight (n*k*4 bytes f32) which can exceed VRAM headroom.
+fn dequantize_f32_rowslice(
+    data: &PaddedCudaSlice,
+    dtype: GgmlDType,
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let block_size = dtype.block_size();
+    let type_size = dtype.type_size();
+    let blocks_per_row = k / block_size;
+    let chunk_rows = row_end - row_start;
+    let nb = chunk_rows * blocks_per_row;
+    let elem_count = chunk_rows * k;
+    let byte_offset = row_start * blocks_per_row * type_size;
+    let byte_len = nb * type_size;
+
+    let (kernel_name, block_dim) = match dtype {
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3_xxs_f32", 256),
+        GgmlDType::IQ2S => ("dequantize_block_iq2_s_f32", 256),
+        GgmlDType::IQ3S => ("dequantize_block_iq3_s_f32", 256),
+        GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", 256),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", 256),
+        _ => crate::bail!("unsupported dtype for rowslice dequant: {dtype:?}"),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nb as u32, 1, 1),
+        block_dim: (block_dim as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let src_view = data.inner.slice(byte_offset..byte_offset + byte_len);
+    let mut builder = func.builder();
+    builder.arg(&src_view);
+    builder.arg(&dst);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
 fn dequantize_f16(
     data: &PaddedCudaSlice,
     dtype: GgmlDType,
@@ -876,9 +923,45 @@ impl QCudaStorage {
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
             || matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS)
         {
-            let data_f32 = self.dequantize(n * k)?;
-            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-            storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
+            // Tiled dequantize matmul: dequantize weight in row-chunks to avoid
+            // allocating the full f32 weight (n*k*4 bytes) which can exceed VRAM
+            // headroom during prefill and trigger CUDA unified-memory paging.
+            // Each chunk: dequant [chunk_n, k] f32, cuBLAS matmul with activations
+            // [b, m, k], scatter result into pre-allocated output [b, m, n].
+            // Chunks write disjoint row ranges — no accumulation needed.
+            let chunk_n = std::cmp::min(n, 512);
+            let mut out_storage = CudaStorage::wrap_cuda_slice(
+                unsafe { self.device.alloc::<f32>(b * m * n)? },
+                self.device.clone(),
+            );
+            let mut row_start = 0;
+            while row_start < n {
+                let row_end = std::cmp::min(row_start + chunk_n, n);
+                let chunk_rows = row_end - row_start;
+                let data_f32 = dequantize_f32_rowslice(
+                    &self.data,
+                    self.dtype,
+                    row_start,
+                    row_end,
+                    k,
+                    self.device(),
+                )?;
+                let rhs_l = crate::Layout::new((k, chunk_rows).into(), vec![1, k], 0)
+                    .broadcast_as((b, k, chunk_rows))?;
+                let chunk_out =
+                    storage.matmul(&data_f32, (b, m, chunk_rows, k), layout, &rhs_l)?;
+                chunk_out.copy2d(
+                    &mut out_storage,
+                    /* d1 */ b * m,
+                    /* d2 */ chunk_rows,
+                    /* src_s */ chunk_rows,
+                    /* dst_s */ n,
+                    /* src_o */ 0,
+                    /* dst_o */ row_start,
+                )?;
+                row_start = row_end;
+            }
+            out_storage
         } else {
             let storage = storage.as_cuda_slice::<f32>()?;
             let storage = match layout.contiguous_offsets() {
