@@ -663,6 +663,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ2S
                 | GgmlDType::IQ3S
                 | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
                 | GgmlDType::IQ4XS
         );
         if fast_kernel {
@@ -819,7 +820,15 @@ impl QCudaStorage {
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
         // IQ-types have no MMQ/DMMV kernels yet — always use dequantize + cuBLAS fallback.
-        if matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS) {
+        if matches!(
+            self.dtype,
+            GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
+        ) {
             return self.dequantize_matmul(self_shape, storage, layout);
         }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
@@ -876,7 +885,15 @@ impl QCudaStorage {
         let b_size = b * m;
 
         // IQ-types have no fused vec/matmul kernels — use dequantize + cuBLAS.
-        let iq_type = matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS);
+        let iq_type = matches!(
+            self.dtype,
+            GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
+        );
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
             dequantize_mul_mat_vec_via_cublas(
                 &self.data,
@@ -924,8 +941,15 @@ impl QCudaStorage {
         }
 
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
-            || matches!(self.dtype, GgmlDType::IQ3XXS | GgmlDType::IQ2S | GgmlDType::IQ3S | GgmlDType::IQ2XS | GgmlDType::IQ4XS)
-        {
+            || matches!(
+                self.dtype,
+                GgmlDType::IQ3XXS
+                    | GgmlDType::IQ2S
+                    | GgmlDType::IQ3S
+                    | GgmlDType::IQ2XS
+                    | GgmlDType::IQ2XXS
+                    | GgmlDType::IQ4XS
+            ) {
             // Tiled dequantize matmul: dequantize weight in row-chunks to avoid
             // allocating the full f32 weight (n*k*4 bytes) which can exceed VRAM
             // headroom during prefill and trigger CUDA unified-memory paging.
