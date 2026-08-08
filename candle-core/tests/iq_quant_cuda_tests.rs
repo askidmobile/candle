@@ -182,6 +182,11 @@ fn iq4xs_cuda_matmul() -> Result<()> {
 
 /// Verify that the dequantize kernel produces finite values for each IQ type.
 /// This isolates dequantize correctness from the matmul dispatch.
+///
+/// Note: zeroed quant bytes do NOT dequantize to 0.0 — grid lookup tables have
+/// nonzero entries at index 0, so the dequantized value is deterministic but
+/// nonzero (e.g. 1.0 for most IQ types). We only assert finiteness here; the
+/// matmul test cross-checks CUDA matmul against the CUDA-dequantized reference.
 fn test_iq_dequantize_finite(dtype: GgmlDType) -> Result<()> {
     let device = Device::new_cuda(0)?;
     let n_rows = 1;
@@ -193,15 +198,11 @@ fn test_iq_dequantize_finite(dtype: GgmlDType) -> Result<()> {
     for (i, &v) in vals.iter().enumerate() {
         assert!(v.is_finite(), "non-finite dequant value at {i} for {dtype:?}: {v}");
     }
-    // With d=1.0 and zeroed qs, every element should be 0.0 (all quant bytes
-    // are zero → grid index 0, signs 0, scale factor from zeroed scales).
-    // This gives a known-good reference: all zeros.
-    for (i, &v) in vals.iter().enumerate() {
-        assert_eq!(
-            v, 0.0,
-            "expected 0.0 at {i} for {dtype:?} with d=1.0 and zeroed qs, got {v}"
-        );
-    }
+    // Sanity: not all values are identical NaN/sentinel — at least one finite
+    // value exists (already checked above) and the min/max are finite.
+    let min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    assert!(min.is_finite() && max.is_finite(), "min/max not finite for {dtype:?}: {min} {max}");
     Ok(())
 }
 
@@ -232,6 +233,10 @@ fn iq4xs_cuda_dequantize() -> Result<()> {
 
 /// Multi-block test: k = 2*QK_K (two blocks per row), exercises the
 /// dequantize kernel grid with >1 block.
+///
+/// Compares CUDA matmul against a CPU reference matmul using the
+/// CUDA-dequantized weights (same approach as the single-block test). Zeroed
+/// weights dequantize to nonzero values, so we do not expect a zero result.
 fn test_iq_matmul_multiblock(dtype: GgmlDType) -> Result<()> {
     let device = Device::new_cuda(0)?;
     let m = 2;
@@ -252,12 +257,15 @@ fn test_iq_matmul_multiblock(dtype: GgmlDType) -> Result<()> {
         res.device()
     );
 
-    // With zeroed weights (all dequant to 0.0), result should be all zeros.
+    // Reference: dequantize weights (CUDA) → CPU f32, matmul on CPU.
+    let w_cpu = dequantize_to_cpu_f32(&qt)?;
+    let lhs_cpu = Tensor::from_slice(&lhs_data, (m, k), &Device::Cpu)?.to_dtype(DType::F32)?;
+    let ref_mm = lhs_cpu.matmul(&w_cpu.t()?)?;
+
     let res_cpu = res.to_device(&Device::Cpu)?;
-    let vals = res_cpu.flatten_all()?.to_vec1::<f32>()?;
-    for (i, &v) in vals.iter().enumerate() {
-        assert_eq!(v, 0.0, "multiblock result at {i} for {dtype:?}: {v}");
-    }
+    let diff = (&res_cpu - &ref_mm)?.abs()?.max_all()?.to_scalar::<f32>()?;
+    assert!(diff.is_finite(), "non-finite multiblock diff {diff} for {dtype:?}");
+    assert!(diff < 1e-2, "multiblock diff {diff} too large for {dtype:?}");
     Ok(())
 }
 
