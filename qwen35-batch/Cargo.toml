@@ -60,6 +60,11 @@ name = "model_profile"
 path = "tests/model_profile.rs"
 required-features = ["real-model"]
 
+[[test]]
+name = "qwen35moe_reference"
+path = "tests/qwen35moe_reference.rs"
+required-features = ["real-model"]
+
 [[bin]]
 name = "qwen36_inspect"
 path = "src/bin/qwen36_inspect.rs"

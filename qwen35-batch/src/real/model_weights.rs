@@ -30,6 +30,7 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use super::delta_rule_batched_cuda;
 #[cfg(feature = "cuda")]
 use super::delta_rule_cuda;
+use super::moe::{ForwardMode, Qwen35MoeBlock};
 #[cfg(target_os = "macos")]
 use super::metal;
 use std::cell::RefCell;
@@ -972,11 +973,11 @@ impl QuantizedEmbedding {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// MLP (SwiGLU) — идентично Qwen3
+// Dense MLP (SwiGLU) — идентично Qwen3
 // ════════════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
-struct Mlp {
+struct DenseMlp {
     feed_forward_w1: QMatMul, // gate_proj (ffn_gate)
     feed_forward_w2: QMatMul, // down_proj (ffn_down)
     feed_forward_w3: QMatMul, // up_proj   (ffn_up)
@@ -990,7 +991,7 @@ struct Mlp {
     feed_forward_w3_opt: Option<Arc<Q4KOptMetadataGpu>>,
 }
 
-impl Module for Mlp {
+impl Module for DenseMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         #[cfg(target_os = "macos")]
         let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
@@ -1013,6 +1014,47 @@ impl Module for Mlp {
         #[cfg(not(target_os = "macos"))]
         {
             self.feed_forward_w2.forward(&silu_mul)
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// FeedForward: enum dispatch Dense SwiGLU vs MoE
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Feed-forward variant per trunk block.
+///
+/// - `Dense` — standard SwiGLU MLP (Qwen3.5 dense models).
+/// - `Moe` — Qwen3.6 35B-A3B routed + shared expert MoE.
+enum FeedForward {
+    Dense(DenseMlp),
+    Moe(Qwen35MoeBlock),
+}
+
+impl FeedForward {
+    /// Standard forward — used by the attention (full-attention) block path.
+    /// MoE blocks are stateless w.r.t. recurrence, so `ForwardMode::Prefill`
+    /// is the safe default for the non-batched forward path.
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(xs),
+            Self::Moe(moe) => moe.forward(xs, ForwardMode::Prefill),
+        }
+    }
+
+    /// Prefill forward (chunked, KV-accumulating) — DeltaNet block path.
+    fn forward_prefill(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(xs),
+            Self::Moe(moe) => moe.forward(xs, ForwardMode::Prefill),
+        }
+    }
+
+    /// Decode-batch forward — batched decode path.
+    fn forward_decode_batch(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(xs),
+            Self::Moe(moe) => moe.forward(xs, ForwardMode::DecodeBatch),
         }
     }
 }
@@ -3202,8 +3244,8 @@ pub(crate) struct HybridBlock {
     ffn_norm: RmsNorm,
     /// Тип слоя: DeltaNet или Gated Attention
     layer: HybridLayerType,
-    /// SwiGLU MLP (общий для обоих типов слоёв)
-    mlp: Mlp,
+    /// Feed-forward: Dense SwiGLU (Qwen3.5) или MoE (Qwen3.6 35B-A3B)
+    ff: FeedForward,
 }
 
 impl HybridBlock {
@@ -3238,7 +3280,7 @@ impl HybridBlock {
         let t_norm2 = t0.elapsed();
 
         let t0 = std::time::Instant::now();
-        let ffn_out = self.mlp.forward(&normed)?;
+        let ffn_out = self.ff.forward(&normed)?;
         let t_mlp = t0.elapsed();
 
         let x = (ffn_out + residual)?;
@@ -3285,7 +3327,7 @@ impl HybridBlock {
         // FFN norm → MLP → residual (batch — эффективно на GPU)
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
-        let ffn_out = self.mlp.forward(&normed)?;
+        let ffn_out = self.ff.forward_prefill(&normed)?;
         let x = (ffn_out + residual)?;
 
         Ok(x)
@@ -3322,7 +3364,7 @@ impl HybridBlock {
         // FFN norm → MLP → residual (batched).
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
-        let ffn_out = self.mlp.forward(&normed)?;
+        let ffn_out = self.ff.forward_decode_batch(&normed)?;
         let x = (ffn_out + residual)?;
 
         Ok(x)
@@ -3533,8 +3575,23 @@ impl ModelWeights {
                     .and_then(|v| v.to_u32().ok())
                     .unwrap_or(0) as usize
             };
-            let hidden = md_get_u32("qwen35.embedding_length");
-            let ff_dim = md_get_u32("qwen35.feed_forward_length");
+            // Architecture-aware prefix for arena sizing.
+            let is_moe = matches!(
+                ct.metadata.get("general.architecture"),
+                Some(candle_core::quantized::gguf_file::Value::String(s)) if s == "qwen35moe"
+            );
+            let arch_prefix: &str = if is_moe { "qwen35moe" } else { "qwen35" };
+            let hidden = md_get_u32(&format!("{arch_prefix}.embedding_length"));
+            // ff_dim: dense uses feed_forward_length; MoE uses max(routed, shared) intermediate.
+            let ff_dim = if is_moe {
+                let routed = md_get_u32("qwen35moe.feed_forward_length.experts")
+                    .max(md_get_u32("qwen35moe.intermediate_size_experts"));
+                let shared = md_get_u32("qwen35moe.feed_forward_length.shared_expert")
+                    .max(md_get_u32("qwen35moe.intermediate_size_shared_expert"));
+                routed.max(shared)
+            } else {
+                md_get_u32("qwen35.feed_forward_length")
+            };
             const CHUNK: usize = 2048; // должен совпадать с CHUNK_SIZE в generation.rs
 
             // Round up to nearest power-of-2 MB для arena slot.
@@ -3608,8 +3665,21 @@ impl ModelWeights {
                         .and_then(|v| v.to_u32().ok())
                         .unwrap_or(0) as usize
                 };
-                let hidden = md_get_u32("qwen35.embedding_length");
-                let ff_dim = md_get_u32("qwen35.feed_forward_length");
+                let is_moe_ua = matches!(
+                    ct.metadata.get("general.architecture"),
+                    Some(candle_core::quantized::gguf_file::Value::String(s)) if s == "qwen35moe"
+                );
+                let arch_prefix_ua: &str = if is_moe_ua { "qwen35moe" } else { "qwen35" };
+                let hidden = md_get_u32(&format!("{arch_prefix_ua}.embedding_length"));
+                let ff_dim = if is_moe_ua {
+                    let routed = md_get_u32("qwen35moe.feed_forward_length.experts")
+                        .max(md_get_u32("qwen35moe.intermediate_size_experts"));
+                    let shared = md_get_u32("qwen35moe.feed_forward_length.shared_expert")
+                        .max(md_get_u32("qwen35moe.intermediate_size_shared_expert"));
+                    routed.max(shared)
+                } else {
+                    md_get_u32("qwen35.feed_forward_length")
+                };
                 const CHUNK: usize = 2048;
                 let round_mb = |bytes: usize| -> usize {
                     let mb = (bytes + 1024 * 1024 - 1) / (1024 * 1024);
@@ -3667,36 +3737,104 @@ impl ModelWeights {
             Some(v) => Ok(v),
         };
 
-        // ── Qwen3.5 metadata ──
-        let block_count = md_get("qwen35.block_count")?.to_u32()? as usize;
-        let embedding_length = md_get("qwen35.embedding_length")?.to_u32()? as usize;
-        let _feed_forward_length = md_get("qwen35.feed_forward_length")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("qwen35.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_freq_base = md_get("qwen35.rope.freq_base")
+        // Architecture dispatch: dense qwen35 vs MoE qwen35moe.
+        let is_moe = matches!(
+            ct.metadata.get("general.architecture"),
+            Some(candle_core::quantized::gguf_file::Value::String(s)) if s == "qwen35moe"
+        );
+        let prefix: &str = if is_moe { "qwen35moe" } else { "qwen35" };
+
+        // ── Qwen3.5/Qwen3.6MoE metadata (prefix-selected) ──
+        let block_count = md_get(&format!("{prefix}.block_count"))?.to_u32()? as usize;
+        let embedding_length = md_get(&format!("{prefix}.embedding_length"))?.to_u32()? as usize;
+        // feed_forward_length: dense only (unused but validated). MoE uses expert/shared lengths.
+        let _feed_forward_length = md_get(&format!("{prefix}.feed_forward_length"))
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let rms_norm_eps = md_get(&format!("{prefix}.attention.layer_norm_rms_epsilon"))?
+            .to_f32()? as f64;
+        let rope_freq_base = md_get(&format!("{prefix}.rope.freq_base"))
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
         // Attention параметры
-        let attn_head_count = md_get("qwen35.attention.head_count")?.to_u32()? as usize;
-        let attn_head_count_kv = md_get("qwen35.attention.head_count_kv")?.to_u32()? as usize;
-        let attn_head_dim = md_get("qwen35.attention.key_length")
+        let attn_head_count = md_get(&format!("{prefix}.attention.head_count"))?
+            .to_u32()? as usize;
+        let attn_head_count_kv = md_get(&format!("{prefix}.attention.head_count_kv"))?
+            .to_u32()? as usize;
+        let attn_head_dim = md_get(&format!("{prefix}.attention.key_length"))
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
             .unwrap_or(256);
 
         // DeltaNet (SSM) параметры
-        let conv_kernel = md_get("qwen35.ssm.conv_kernel")
+        let conv_kernel = md_get(&format!("{prefix}.ssm.conv_kernel"))
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
             .unwrap_or(4);
-        let ssm_inner_size = md_get("qwen35.ssm.inner_size")?.to_u32()? as usize; // value_dim
-        let ssm_state_size = md_get("qwen35.ssm.state_size")?.to_u32()? as usize; // head_k_dim (DeltaNet)
-        let n_v_heads = md_get("qwen35.ssm.time_step_rank")?.to_u32()? as usize;
-        let n_k_heads = md_get("qwen35.ssm.group_count")?.to_u32()? as usize;
-        let full_attention_interval = md_get("qwen35.full_attention_interval")
+        let ssm_inner_size = md_get(&format!("{prefix}.ssm.inner_size"))?.to_u32()? as usize;
+        let ssm_state_size = md_get(&format!("{prefix}.ssm.state_size"))?.to_u32()? as usize;
+        let n_v_heads = md_get(&format!("{prefix}.ssm.time_step_rank"))?.to_u32()? as usize;
+        let n_k_heads = md_get(&format!("{prefix}.ssm.group_count"))?.to_u32()? as usize;
+        let full_attention_interval = md_get(&format!("{prefix}.full_attention_interval"))
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
             .unwrap_or(4);
+
+        // MoE параметры (только для qwen35moe)
+        let moe_n_experts = if is_moe {
+            md_get("qwen35moe.expert_count")?.to_u32()? as usize
+        } else {
+            0
+        };
+        let moe_n_experts_per_tok = if is_moe {
+            md_get("qwen35moe.expert_used_count")?.to_u32()? as usize
+        } else {
+            0
+        };
+        let moe_routed_intermediate = if is_moe {
+            md_get("qwen35moe.feed_forward_length.experts")
+                .and_then(|m| m.to_u32())
+                .map(|v| v as usize)
+                .unwrap_or_else(|_| {
+                    // Fallback key.
+                    md_get("qwen35moe.intermediate_size_experts")
+                        .and_then(|m| m.to_u32())
+                        .map(|v| v as usize)
+                        .unwrap_or(0)
+                })
+        } else {
+            0
+        };
+        let moe_shared_intermediate = if is_moe {
+            md_get("qwen35moe.feed_forward_length.shared_expert")
+                .and_then(|m| m.to_u32())
+                .map(|v| v as usize)
+                .unwrap_or_else(|_| {
+                    md_get("qwen35moe.intermediate_size_shared_expert")
+                        .and_then(|m| m.to_u32())
+                        .map(|v| v as usize)
+                        .unwrap_or(0)
+                })
+        } else {
+            0
+        };
+        let _moe_shared_expert_count = if is_moe {
+            md_get("qwen35moe.shared_expert_count")
+                .and_then(|m| m.to_u32())
+                .map(|v| v as usize)
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        let moe_norm_topk = if is_moe {
+            md_get("qwen35moe.router_norm_topk")
+                .and_then(|m| m.to_bool())
+                .unwrap_or(true)
+        } else {
+            false
+        };
 
         // Вычисляемые размерности
         let head_k_dim_delta = ssm_state_size; // head_dim для DeltaNet Q/K
@@ -3717,7 +3855,7 @@ impl ModelWeights {
         //     + sync per 4 layers держат память в норме на 16+ ГБ Mac.
         // Qwen3.5-4B native = 262144 (1M с YaRN); клэмпим до 65536 для разумного RAM.
         // Fallback 32768 если ключ отсутствует (консервативный).
-        let model_context_length = md_get("qwen35.context_length")
+        let model_context_length = md_get(&format!("{prefix}.context_length"))
             .and_then(|v| {
                 v.to_u32()
                     .map_err(|e| candle_core::Error::Msg(e.to_string()))
@@ -4046,8 +4184,65 @@ impl ModelWeights {
                 &Device::Cpu,
             )?;
 
-            // MLP (SwiGLU) — общий для обоих типов
-            let mlp = {
+            // Feed-forward: Dense SwiGLU или MoE
+            let ff = if is_moe {
+                // ── MoE: router + packed routed experts + sigmoid-gated shared ──
+                use super::moe::{
+                    MoeBackend, MoeRouter, PackedExperts, Qwen35MoeBlock, Qwen35MoeConfig,
+                    SharedExpert,
+                };
+
+                // Router: ffn_gate_inp → dequantize to F32 Linear [n_experts, n_embd]
+                let router_qt = load_heavy(&format!("{prefix}.ffn_gate_inp.weight"))?;
+                let router_w = router_qt.dequantize(device)?.to_dtype(DType::F32)?;
+                let router = MoeRouter::new(
+                    candle_nn::Linear::new(router_w, None),
+                    moe_n_experts,
+                    moe_n_experts_per_tok,
+                    moe_norm_topk,
+                );
+
+                // Packed routed experts: Arc<QTensor> (not dequantized at load).
+                let gate = Arc::new(load_heavy(&format!("{prefix}.ffn_gate_exps.weight"))?);
+                let up = Arc::new(load_heavy(&format!("{prefix}.ffn_up_exps.weight"))?);
+                let down = Arc::new(load_heavy(&format!("{prefix}.ffn_down_exps.weight"))?);
+                let routed = PackedExperts {
+                    gate,
+                    up,
+                    down,
+                    n_experts: moe_n_experts,
+                };
+
+                // Shared expert: scalar gate_inp (Linear) + SwiGLU gate/up/down (QMatMul).
+                let shexp_gate_inp_qt =
+                    load_heavy(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?;
+                let shexp_gate_inp_w = shexp_gate_inp_qt.dequantize(device)?.to_dtype(DType::F32)?;
+                let shared = SharedExpert::new(
+                    candle_nn::Linear::new(shexp_gate_inp_w, None),
+                    QMatMul::from_qtensor(load_heavy(&format!("{prefix}.ffn_gate_shexp.weight"))?)?,
+                    QMatMul::from_qtensor(load_heavy(&format!("{prefix}.ffn_up_shexp.weight"))?)?,
+                    QMatMul::from_qtensor(load_heavy(&format!("{prefix}.ffn_down_shexp.weight"))?)?,
+                );
+
+                let cfg = Qwen35MoeConfig {
+                    hidden_size: embedding_length,
+                    n_experts: moe_n_experts,
+                    n_experts_per_tok: moe_n_experts_per_tok,
+                    routed_intermediate: moe_routed_intermediate,
+                    shared_intermediate: moe_shared_intermediate,
+                    norm_topk_prob: moe_norm_topk,
+                };
+                // Backend: Reference for Phase 2. PTX is Phase 3.
+                let backend = match std::env::var("QWEN36_MOE_BACKEND")
+                    .unwrap_or_default()
+                    .as_str()
+                {
+                    "ptx" => MoeBackend::Ptx,
+                    _ => MoeBackend::Reference,
+                };
+                FeedForward::Moe(Qwen35MoeBlock::new(cfg, router, routed, shared, backend))
+            } else {
+                // ── Dense SwiGLU MLP ──
                 let w1 = load_heavy(&format!("{prefix}.ffn_gate.weight"))?;
                 let w2 = load_heavy(&format!("{prefix}.ffn_down.weight"))?;
                 let w3 = load_heavy(&format!("{prefix}.ffn_up.weight"))?;
@@ -4060,7 +4255,7 @@ impl ModelWeights {
                 let w2_opt = maybe_repack_q4k_opt(&qm_w2, device)?;
                 #[cfg(target_os = "macos")]
                 let w3_opt = maybe_repack_q4k_opt(&qm_w3, device)?;
-                Mlp {
+                FeedForward::Dense(DenseMlp {
                     feed_forward_w1: qm_w1,
                     feed_forward_w2: qm_w2,
                     feed_forward_w3: qm_w3,
@@ -4070,7 +4265,7 @@ impl ModelWeights {
                     feed_forward_w2_opt: w2_opt,
                     #[cfg(target_os = "macos")]
                     feed_forward_w3_opt: w3_opt,
-                }
+                })
             };
 
             let layer = if is_deltanet {
@@ -4414,7 +4609,7 @@ impl ModelWeights {
                 attn_norm: rms_norm_cpu(attn_norm_qt, rms_norm_eps, device)?,
                 ffn_norm: rms_norm_cpu(ffn_norm_qt, rms_norm_eps, device)?,
                 layer,
-                mlp,
+                ff,
             });
         }
 
@@ -4827,8 +5022,14 @@ impl ModelWeights {
             .blocks
             .first()
             .ok_or_else(|| candle_core::Error::Msg("model has no blocks".into()))?;
-        let w1 = &block0.mlp.feed_forward_w1;
-        let w1_opt = block0.mlp.feed_forward_w1_opt.as_ref();
+        let dense_mlp = match &block0.ff {
+            FeedForward::Dense(m) => m,
+            FeedForward::Moe(_) => candle_core::bail!(
+                "debug_capture_single_matmul: MoE blocks have no dense w1 — use a dense Qwen3.5 model"
+            ),
+        };
+        let w1 = &dense_mlp.feed_forward_w1;
+        let w1_opt = dense_mlp.feed_forward_w1_opt.as_ref();
 
         // Realistic input tensor: F32 [1, seq_len, n_embd] на Metal device.
         // Production embeddings produce F32; Q4_K_M matmul kernel — `kernel_mul_mm_q4_K_f32`.
