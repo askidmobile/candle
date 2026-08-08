@@ -18,6 +18,7 @@
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use half::f16;
+use std::sync::Arc;
 
 const QK_K: usize = 256;
 
@@ -107,8 +108,9 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
     let n = 4;
 
     // Build IQ weight tensor on CUDA: shape (n, k) — n rows, k cols.
-    let qt = make_iq_qtensor(n, k, dtype, &device)?;
-    let qmatmul = QMatMul::from_qtensor(qt.clone())?;
+    // Wrap in Arc so we can both feed QMatMul and dequantize the same weights.
+    let qt = Arc::new(make_iq_qtensor(n, k, dtype, &device)?);
+    let qmatmul = QMatMul::from_arc(qt.clone())?;
 
     // Input: (m, k) f32 on CUDA.
     let lhs_data: Vec<f32> = (0..m * k).map(|i| (i as f32) / (m * k) as f32).collect();
@@ -117,10 +119,10 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
     // Run quantized matmul on CUDA. If dispatch is broken, this bails with
     // "CPU matmul is not implemented for IQ3XXS".
     let res = qmatmul.forward(&lhs)?;
-    assert_eq!(
-        res.device(),
-        device,
-        "result should be on CUDA for {dtype:?}"
+    assert!(
+        res.device().same_device(&device),
+        "result should be on CUDA for {dtype:?}, got {:?}",
+        res.device()
     );
     assert_eq!(res.dtype(), DType::F32, "result dtype for {dtype:?}");
     assert_eq!(
@@ -137,7 +139,10 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
 
     // Compare.
     let res_cpu = res.to_device(&Device::Cpu)?;
-    let diff: f32 = ((&res_cpu - &ref_mm)?.abs()?.max_all()?.to_scalar::<f32>()?)?;
+    let diff = ((&res_cpu - &ref_mm)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?)?;
     // With zeroed quant data and d=1.0, dequant values are deterministic but
     // may be nonzero (grid index 0 has nonzero entries). Allow generous
     // tolerance — we mainly care that CUDA dispatch works and produces
@@ -238,15 +243,19 @@ fn test_iq_matmul_multiblock(dtype: GgmlDType) -> Result<()> {
     let k = 2 * QK_K;
     let n = 4;
 
-    let qt = make_iq_qtensor(n, k, dtype, &device)?;
-    let qmatmul = QMatMul::from_qtensor(qt.clone())?;
+    let qt = Arc::new(make_iq_qtensor(n, k, dtype, &device)?);
+    let qmatmul = QMatMul::from_arc(qt.clone())?;
 
     let lhs_data: Vec<f32> = (0..m * k).map(|i| (i as f32) / (m * k) as f32).collect();
     let lhs = Tensor::from_slice(&lhs_data, (m, k), &device)?.to_dtype(DType::F32)?;
 
     let res = qmatmul.forward(&lhs)?;
     assert_eq!(res.shape().dims(), [m, n], "multiblock shape for {dtype:?}");
-    assert_eq!(res.device(), device, "multiblock device for {dtype:?}");
+    assert!(
+        res.device().same_device(&device),
+        "multiblock device for {dtype:?}, got {:?}",
+        res.device()
+    );
 
     // With zeroed weights (all dequant to 0.0), result should be all zeros.
     let res_cpu = res.to_device(&Device::Cpu)?;
