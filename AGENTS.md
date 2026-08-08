@@ -76,6 +76,36 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - `block_iq4_xs`: `half d` + `uint16_t scales_h` + `scales_l[QK_K/64]` + `qs[QK_K/2]` = 2 + 2 + 4 + 128 = 136 bytes.
 - `QK_K = 256` for all IQ types. Block size = 256.
 
+## Local environment (macOS)
+
+- **`git`, `ssh`, `ls` NOT in PATH zsh.** `git --no-pager status` → `zsh: command not found: git` (exit 127). Use full paths: `/usr/bin/git`, `/usr/bin/ssh`, `/bin/ls`. `/usr/bin/ssh -V` works. `/usr/bin/git push origin feat/qwen35-batching` works.
+- **`cargo` IS in PATH** (via rustup/cargo env). Only system binaries are missing from zsh PATH.
+
+## Reference tests (CPU-only, qwen35-batch)
+
+- **CPU-only reference tests run on yttri-win without CUDA/Metal/MSVC.** `cargo test -p qwen35-batch --test qwen35moe_reference --features real-model` — no `--features metal` or `--features cuda` needed when device=CPU. Runs in 0.01s.
+- **Test loop (macOS → yttri-win):** `cargo check --tests --features real-model,metal` locally (compile validation) → commit → `git push origin feat/qwen35-batching` → SSH pull on yttri-win → `cargo test --features real-model` on yttri-win (execution). macOS lacks a linker for the `real-model` test binaries; yttri-win has full toolchain.
+
+## Self-improvement loop (auto)
+
+After a non-trivial task (bugfix, build, deploy, debug, refactor >5 steps) — run the `learn-from-work` skill (`/learn`).
+Trigger conditions:
+- An error took more than one attempt to fix, or required googling/experimenting.
+- The same thing was fixed twice in one session (pattern signal).
+- User asks to "learn", "retrospective", "remember", "record lesson", "what did we learn".
+Skip for: trivial one-shot fixes, typos, obvious errors. Do not record noise.
+
+`/learn` uses layered memory — writes to the correct tier:
+- **Kernel (this file)**: one-line facts that change behavior on most tasks. ≤200 lines total.
+- **Wiki**: details, root cause analysis, dates. `docs/lessons/` if no wiki configured.
+- **Agent Memory** (Oz, when available): cross-session/cross-project facts.
+- **Skill**: multi-step procedures that don't fit in 1-3 lines.
+- **Global Rule**: universal patterns (text to user, can't write programmatically).
+
+This file is the kernel — keep it short. If >150 lines, `/learn` triggers an audit:
+verbose entries promoted to wiki, one-line pointer left here. Precision test:
+"if I remove this line, will the agent make a mistake?" If no → move to wiki.
+
 ## Conventions
 
 - Respond in Russian (per Global Rule).

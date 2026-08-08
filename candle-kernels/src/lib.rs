@@ -14,6 +14,9 @@ pub enum Id {
     DeltaRuleBatched,
     Fill,
     Indexing,
+    /// Phase 3: device-only MoE routing + quantized expert kernels (PTX).
+    MoeRouter,
+    MoeQuantized,
     Quantized,
     Reduce,
     Sort,
@@ -21,7 +24,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 13] = [
+pub const ALL_IDS: [Id; 15] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -30,6 +33,8 @@ pub const ALL_IDS: [Id; 13] = [
     Id::DeltaRuleBatched,
     Id::Fill,
     Id::Indexing,
+    Id::MoeRouter,
+    Id::MoeQuantized,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -80,6 +85,8 @@ mdl!(DELTA_RULE, DeltaRule);
 mdl!(DELTA_RULE_BATCHED, DeltaRuleBatched);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
+mdl!(MOE_ROUTER, MoeRouter);
+mdl!(MOE_QUANTIZED, MoeQuantized);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);

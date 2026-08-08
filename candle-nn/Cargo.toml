@@ -39,6 +39,9 @@ cuda = ["candle/cuda"]
 # Включать только вместе с восстановлением libmoe.a в candle-kernels под
 # dynamic-loading-совместимой схемой. См. candle-nn/src/moe.rs.
 cuda_moe = ["cuda"]
+# Phase 3: PTX MoE backend via cudarc dynamic-loading (no libmoe.a hard-link).
+# K-quant (Q2_K/Q4_K) fused kernels; IQ types fall back to reference backend.
+moe-cuda = ["cuda"]
 cudnn = ["candle/cudnn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl"]
 metal = ["candle/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
