@@ -138,8 +138,10 @@ impl QStorage {
                 GgmlDType::IQ3S => {
                     cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3S)
                 }
+                GgmlDType::IQ2XS => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2XS)
+                }
                 GgmlDType::IQ2XXS
-                | GgmlDType::IQ2XS
                 | GgmlDType::IQ1S
                 | GgmlDType::IQ4NL
                 | GgmlDType::IQ4XS
