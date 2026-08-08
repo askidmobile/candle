@@ -1,0 +1,242 @@
+//! Integration tests for model_profile validation (Phase 1).
+//!
+//! Tests cover metadata validation, tensor contract checks, corruption
+//! detection, and architecture dispatch for both dense `qwen35` and
+//! MoE `qwen35moe`.
+
+#![cfg(feature = "real-model")]
+
+use candle_core::quantized::gguf_file::{Content, TensorInfo, Value, VersionedMagic};
+use candle_core::quantized::GgmlDType;
+use candle_core::Shape;
+use qwen35_batch::real::model_profile::{Architecture, ModelProfile};
+use std::collections::HashMap;
+
+fn make_content(metadata: HashMap<String, Value>, tensor_infos: HashMap<String, TensorInfo>) -> Content {
+    Content {
+        magic: VersionedMagic::GgufV2,
+        metadata,
+        tensor_infos,
+        tensor_data_offset: 4096,
+    }
+}
+
+fn u32_val(v: u32) -> Value {
+    Value::U32(v)
+}
+
+fn f32_val(v: f32) -> Value {
+    Value::F32(v)
+}
+
+fn str_val(v: &str) -> Value {
+    Value::String(v.to_string())
+}
+
+fn tensor_info(dtype: GgmlDType, shape: &[usize], offset: u64) -> TensorInfo {
+    TensorInfo {
+        ggml_dtype: dtype,
+        shape: Shape::from(shape.to_vec()),
+        offset,
+    }
+}
+
+fn dense_metadata() -> HashMap<String, Value> {
+    let mut md = HashMap::new();
+    md.insert("general.architecture".into(), str_val("qwen35"));
+    md.insert("qwen35.block_count".into(), u32_val(36));
+    md.insert("qwen35.embedding_length".into(), u32_val(2560));
+    md.insert("qwen35.context_length".into(), u32_val(32768));
+    md.insert("qwen35.feed_forward_length".into(), u32_val(9728));
+    md.insert("qwen35.attention.head_count".into(), u32_val(32));
+    md.insert("qwen35.attention.head_count_kv".into(), u32_val(8));
+    md.insert("qwen35.attention.key_length".into(), u32_val(256));
+    md.insert("qwen35.attention.value_length".into(), u32_val(256));
+    md.insert("qwen35.attention.layer_norm_rms_epsilon".into(), f32_val(1e-6));
+    md.insert("qwen35.full_attention_interval".into(), u32_val(4));
+    md
+}
+
+fn dense_tensors() -> HashMap<String, TensorInfo> {
+    let mut ti = HashMap::new();
+    ti.insert("token_embd.weight".into(), tensor_info(GgmlDType::Q4K, &[151943, 2560], 0));
+    ti.insert("output_norm.weight".into(), tensor_info(GgmlDType::F32, &[2560], 1000));
+    // Block 0 dense tensors.
+    let block0 = [
+        "attn_norm", "attn_q", "attn_k", "attn_v", "attn_output",
+        "ffn_gate", "ffn_up", "ffn_down",
+    ];
+    for name in &block0 {
+        let full = format!("qwen35.blk.0.{name}.weight");
+        ti.insert(full, tensor_info(GgmlDType::Q4K, &[2560, 2560], 2000));
+    }
+    // Last block (35).
+    for name in &block0 {
+        let full = format!("qwen35.blk.35.{name}.weight");
+        ti.insert(full, tensor_info(GgmlDType::Q4K, &[2560, 2560], 3000));
+    }
+    ti
+}
+
+fn moe_metadata() -> HashMap<String, Value> {
+    let mut md = HashMap::new();
+    md.insert("general.architecture".into(), str_val("qwen35moe"));
+    md.insert("qwen35moe.block_count".into(), u32_val(40));
+    md.insert("qwen35moe.embedding_length".into(), u32_val(2560));
+    md.insert("qwen35moe.context_length".into(), u32_val(81920));
+    md.insert("qwen35moe.feed_forward_length".into(), u32_val(9728));
+    md.insert("qwen35moe.attention.head_count".into(), u32_val(32));
+    md.insert("qwen35moe.attention.head_count_kv".into(), u32_val(8));
+    md.insert("qwen35moe.attention.key_length".into(), u32_val(256));
+    md.insert("qwen35moe.attention.value_length".into(), u32_val(256));
+    md.insert("qwen35moe.attention.layer_norm_rms_epsilon".into(), f32_val(1e-6));
+    md.insert("qwen35moe.full_attention_interval".into(), u32_val(4));
+    md.insert("qwen35moe.expert_count".into(), u32_val(128));
+    md.insert("qwen35moe.expert_used_count".into(), u32_val(8));
+    md.insert("qwen35moe.shared_expert_count".into(), u32_val(1));
+    md.insert("qwen35moe.feed_forward_length.experts".into(), u32_val(4864));
+    md.insert("qwen35moe.feed_forward_length.shared_expert".into(), u32_val(9728));
+    md
+}
+
+fn moe_tensors() -> HashMap<String, TensorInfo> {
+    let mut ti = HashMap::new();
+    ti.insert("token_embd.weight".into(), tensor_info(GgmlDType::IQ2XXS, &[151943, 2560], 0));
+    ti.insert("output_norm.weight".into(), tensor_info(GgmlDType::F32, &[2560], 1000));
+    // MoE block 0 tensors.
+    let block0 = [
+        "attn_norm", "attn_q", "attn_k", "attn_v", "attn_output",
+        "ffn_gate_inp",  // router
+        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",  // routed
+        "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",  // shared
+    ];
+    for name in &block0 {
+        let full = format!("qwen35moe.blk.0.{name}.weight");
+        ti.insert(full, tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 2000));
+    }
+    // Last block (39).
+    for name in &block0 {
+        let full = format!("qwen35moe.blk.39.{name}.weight");
+        ti.insert(full, tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 3000));
+    }
+    // All 40 blocks.
+    for layer in 0..40 {
+        for name in &block0 {
+            let full = format!("qwen35moe.blk.{layer}.{name}.weight");
+            ti.insert(full, tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 4000 + layer as u64 * 100));
+        }
+    }
+    ti
+}
+
+#[test]
+fn test_dense_profile_validates() {
+    let ct = make_content(dense_metadata(), dense_tensors());
+    let profile = ModelProfile::read_and_validate(&ct, 1024 * 1024).unwrap();
+    assert_eq!(profile.architecture, Architecture::DenseQwen35);
+    assert_eq!(profile.block_count, 36);
+    assert_eq!(profile.hidden_size, 2560);
+    assert!(profile.routed_experts.is_none());
+    assert!(!profile.fingerprint.hash.is_empty());
+}
+
+#[test]
+fn test_moe_profile_validates() {
+    let ct = make_content(moe_metadata(), moe_tensors());
+    let profile = ModelProfile::read_and_validate(&ct, 10 * 1024 * 1024 * 1024).unwrap();
+    assert_eq!(profile.architecture, Architecture::Qwen35Moe);
+    assert_eq!(profile.block_count, 40);
+    assert_eq!(profile.routed_experts, Some(128));
+    assert_eq!(profile.experts_per_token, Some(8));
+    assert_eq!(profile.shared_expert_count, Some(1));
+    assert!(profile.quant_set.contains(&GgmlDType::IQ2XXS));
+}
+
+#[test]
+fn test_moe_wrong_block_count_fails() {
+    let mut md = moe_metadata();
+    md.insert("qwen35moe.block_count".into(), u32_val(32));
+    let ct = make_content(md, moe_tensors());
+    let result = ModelProfile::read_and_validate(&ct, 0);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("block_count=32") || msg.contains("expected 40"));
+}
+
+#[test]
+fn test_moe_wrong_expert_used_count_fails() {
+    let mut md = moe_metadata();
+    md.insert("qwen35moe.expert_used_count".into(), u32_val(4));
+    let ct = make_content(md, moe_tensors());
+    let result = ModelProfile::read_and_validate(&ct, 0);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("expert_used_count=4") || msg.contains("expected 8"));
+}
+
+#[test]
+fn test_moe_missing_router_tensor_fails() {
+    let mut ti = moe_tensors();
+    ti.remove("qwen35moe.blk.0.ffn_gate_inp.weight");
+    let ct = make_content(moe_metadata(), ti);
+    let result = ModelProfile::read_and_validate(&ct, 0);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("ffn_gate_inp"));
+}
+
+#[test]
+fn test_moe_missing_shared_expert_tensor_fails() {
+    let mut ti = moe_tensors();
+    ti.remove("qwen35moe.blk.0.ffn_gate_shexp.weight");
+    let ct = make_content(moe_metadata(), ti);
+    let result = ModelProfile::read_and_validate(&ct, 0);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("ffn_gate_shexp"));
+}
+
+#[test]
+fn test_aggregated_errors_report_multiple() {
+    let mut md = moe_metadata();
+    md.remove("qwen35moe.expert_count");
+    md.remove("qwen35moe.expert_used_count");
+    md.insert("qwen35moe.block_count".into(), u32_val(32));
+    let ct = make_content(md, moe_tensors());
+    let result = ModelProfile::read_and_validate(&ct, 0);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    // Should contain multiple errors.
+    assert!(msg.contains("expert_count"));
+    assert!(msg.contains("expert_used_count"));
+    assert!(msg.contains("block_count=32"));
+}
+
+#[test]
+fn test_dense_missing_block_tensor_fails() {
+    let mut ti = dense_tensors();
+    ti.remove("qwen35.blk.0.ffn_gate.weight");
+    let ct = make_content(dense_metadata(), ti);
+    let result = ModelProfile::read_and_validate(&ct, 0);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("ffn_gate"));
+}
+
+#[test]
+fn test_fingerprint_stable_across_same_input() {
+    let ct1 = make_content(moe_metadata(), moe_tensors());
+    let ct2 = make_content(moe_metadata(), moe_tensors());
+    let p1 = ModelProfile::read_and_validate(&ct1, 1024).unwrap();
+    let p2 = ModelProfile::read_and_validate(&ct2, 1024).unwrap();
+    assert_eq!(p1.fingerprint.hash, p2.fingerprint.hash);
+}
+
+#[test]
+fn test_fingerprint_changes_with_different_file_size() {
+    let ct1 = make_content(moe_metadata(), moe_tensors());
+    let ct2 = make_content(moe_metadata(), moe_tensors());
+    let p1 = ModelProfile::read_and_validate(&ct1, 1024).unwrap();
+    let p2 = ModelProfile::read_and_validate(&ct2, 2048).unwrap();
+    assert_ne!(p1.fingerprint.hash, p2.fingerprint.hash);
+}

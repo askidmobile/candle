@@ -15,9 +15,11 @@ pub mod delta_rule_batched_cuda;
 pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod metal_utils;
+pub mod model_profile;
 pub mod model_weights;
 #[cfg(feature = "real-model")]
 pub mod tokenizer;
 
 pub use adapter::Qwen35BatchAdapter;
+pub use model_profile::{Architecture, ModelFingerprint, ModelProfile};
 pub use model_weights::ModelWeights;

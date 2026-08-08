@@ -17,6 +17,7 @@ rayon = "1.7.0"
 memmap2 = { version = "0.9.3", features = ["stable_deref_trait"], optional = true }
 tokenizers = { version = "0.22.0", default-features = false, features = ["onig"], optional = true }
 env_logger = { version = "0.11", optional = true }
+serde_json = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-metal-kernels = { path = "../candle-metal-kernels" }
@@ -31,7 +32,7 @@ cudarc = { workspace = true, optional = true }
 [features]
 # Активировать адаптер реальной Qwen3.5 модели (GGUF loader + port quantized_qwen35).
 # Backend выбирается отдельно: `metal` на macOS или `cuda` на Windows/Linux.
-real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger"]
+real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger", "dep:serde_json"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = [
     "candle-core/cuda",
@@ -52,4 +53,14 @@ required-features = ["real-model"]
 [[test]]
 name = "real_qwen35_quality"
 path = "tests/real_qwen35_quality.rs"
+required-features = ["real-model"]
+
+[[test]]
+name = "model_profile"
+path = "tests/model_profile.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "qwen36_inspect"
+path = "src/bin/qwen36_inspect.rs"
 required-features = ["real-model"]

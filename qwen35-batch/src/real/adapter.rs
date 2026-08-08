@@ -21,12 +21,15 @@ use candle_core::{DType, Device, Tensor};
 use std::path::Path;
 
 use crate::model::{BatchModel, DecodeBatch, PrefillChunk};
+use crate::real::model_profile::ModelProfile;
 use crate::real::model_weights::{ModelWeights, StateSnapshot};
 
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
 pub struct Qwen35BatchAdapter {
     model: ModelWeights,
     device: Device,
+    /// Валидированный profile модели (Phase 1 preflight).
+    profile: ModelProfile,
     /// Per-slot snapshot после prefill — источник state для seed в batched buffers.
     /// Хранится и для time-multiplexed fallback (если batched decode disabled).
     slot_snaps: Vec<Option<StateSnapshot>>,
@@ -52,6 +55,21 @@ impl Qwen35BatchAdapter {
         // Один проход чтения GGUF: EOS + vocab (из token_embd.weight shape[0]) + веса.
         let mut c = std::io::Cursor::new(mmap.as_ref());
         let ct = gguf_file::Content::read(&mut c).map_err(|e| anyhow!("read GGUF: {e}"))?;
+
+        // Phase 1 preflight: validate architecture, metadata, and tensor contracts
+        // BEFORE heavy tensor loading. Fail-fast with aggregated errors.
+        let file_size = mmap.len() as u64;
+        let profile = ModelProfile::read_and_validate(&ct, file_size)
+            .map_err(|e| anyhow!("GGUF validation failed: {e}"))?;
+        log::info!(
+            "[qwen35-batch] profile: arch={:?} blocks={} hidden={} ctx={} quant_count={} fingerprint={}",
+            profile.architecture,
+            profile.block_count,
+            profile.hidden_size,
+            profile.context_length,
+            profile.quant_set.len(),
+            profile.fingerprint.hash,
+        );
 
         let eos = ct
             .metadata
@@ -84,6 +102,7 @@ impl Qwen35BatchAdapter {
         Ok(Self {
             model,
             device,
+            profile,
             slot_snaps: (0..num_slots).map(|_| None).collect(),
             slot_seeded: vec![false; num_slots],
             eos,
@@ -106,6 +125,11 @@ impl Qwen35BatchAdapter {
     /// Делегированный доступ к модели (для profiling / debug_capture).
     pub fn model(&self) -> &ModelWeights {
         &self.model
+    }
+
+    /// Доступ к валидированному profile модели (Phase 1).
+    pub fn profile(&self) -> &ModelProfile {
+        &self.profile
     }
 
     /// Сбросить single-stream state модели в нули (для свежего prefill).
