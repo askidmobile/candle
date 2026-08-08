@@ -25,6 +25,7 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **Build candle with CUDA on yttri-win**: use a `.bat` that sets VsDevCmd + CUDA env then runs cargo. Pattern: `D:\Projects\yttri-build\run_iq_tests.bat`. Do NOT run bare `cargo test --features cuda` over SSH — it lacks MSVC env.
 - **Run IQ CUDA tests**: `ssh yttri-win "cmd /c \"D:\\Projects\\yttri-build\\run_iq_tests.bat\""`. The bat does `cd /d D:\Projects\yttri-build\candle-fork-qwen35-batch && cargo test --features cuda --package candle-core --test iq_quant_cuda_tests`.
 - Repo on yttri-win: `D:\Projects\yttri-build\candle-fork-qwen35-batch` (separate from `candle-fork` which is the older copy).
+- **Build qwen36-server with CUDA**: `ssh -t yttri-win "cmd /c D:\Projects\yttri-build\build_cuda124.bat"` (28s incremental, foreground). The bat calls VsDevCmd + sets CUDA 12.4 PATH then `cargo build --release --features cuda` inside the qwen36-server dir. Do NOT build without `--features cuda` — the binary falls back to CPU device (see qwen36-server section).
 
 ## qwen36-server (Q2_K_XL inference) — launch + diagnostics
 
@@ -33,13 +34,16 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **`Start-Process ... -RedirectStandardOutput` does NOT capture the server's stdout** — the exe likely writes to its own log or buffers. Observed: process starts, GPU stays at 375 MiB (baseline), logs stay 0 bytes, process exits silently. Use the `run_test.bat` pattern instead (background `start /b`, poll for "loaded:" in a logfile, curl test, then kill).
 - Model: `D:\Models\unsloth\Qwen3.6-27B-GGUF\Qwen3.6-27B-UD-Q2_K_XL.gguf` (~10 GB Q2_K_XL, 27B). Load takes >90s; 12 GB VRAM (RTX 3060).
 - Server logs: `server_q2.log`, `server_q2_iq3.log`, etc. in `D:\Projects\yttri-build\`. All observed 0 bytes → server writes elsewhere or crashes before flush. Check `RUST_BACKTRACE=1` + run foreground with `ssh -t` to see the panic.
-- Known failure: inference bails with `"CPU matmul is not implemented for IQ3XXS"` — see IQ quant section below.
+- **Known failure RESOLVED (2026-08-08):** inference bailed with `"CPU matmul is not implemented for IQ3XXS"`. Root cause: `qwen36-server.exe` was built WITHOUT `--features cuda`. `select_device()` (engine.rs:381-394) has `#[cfg(feature = "cuda")]` → `Device::new_cuda(0)`, else falls through to `Ok(Device::Cpu)`. Without the cuda feature, device = CPU → all weights load as `QStorage::Cpu` → `cpu_fwd` → `matmul_t` → bail for RawQuantizedType (IQ types). **Fix: always rebuild via `build_cuda124.bat` (`cargo build --release --features cuda`)** — see build section below.
+- **How to verify the binary has cuda:** `dumpbin /dependents qwen36-server.exe`. With cuda, size jumps from ~8.7 MB (no cuda) to ~23.4 MB (cuda kernels embedded). NOTE: `cudart`/`cublas` do NOT appear in dumpbin — candle uses `cudarc` with dynamic-loading (CUDA loaded via `LoadLibrary` at runtime, not statically linked). Size is the reliable indicator.
+- **After rebuilding with cuda feature**: server loads Q2_K_XL on CUDA, inference works end-to-end. First curl returned valid chat completion (`"Hello! How can I help you today"`, 8 completion / 13 prompt tokens).
 
 ## IQ quant CUDA (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS)
 
 - **Isolated CUDA tests**: `candle-core/tests/iq_quant_cuda_tests.rs`. Run via `run_iq_tests.bat` on yttri-win. All 12 tests PASS (matmul dispatches to `cuda_fwd`, dequantize finite, multiblock correct) as of 2026-08-08.
-- **The isolated test path works.** Bug `"CPU matmul is not implemented for IQ3XXS"` is NOT in the candle dispatch — it's in how `qwen35-batch` model passes input tensors to `QMatMul::forward`. The error fires in `cpu_fwd` (`candle-core/src/quantized/mod.rs:530`) which only runs when BOTH: input `xs` is on CPU (`Storage::Cpu`) AND weight is `QStorage::Cpu`. So in the server, either the weight landed on CPU (wrong load path) or the input `xs` is on CPU (engine passes CPU tensor to `QMatMul::forward`).
-- **Next investigation target**: `qwen35-batch/src/real/model_weights.rs` — `forward_inner` (line ~5013) calls `self.tok_embeddings.forward(x)` which returns CPU f32 (`QuantizedEmbedding::forward` → `Tensor::from_vec(..., &Device::Cpu)`), then `.to_device(x.device())`. If `x.device()` is CPU (not CUDA), the whole pipeline stays on CPU and IQ weights on CPU hit the bail. Check what device the server passes as the model device and whether `forward_inner`'s `layer_in` ever reaches CUDA before `QMatMul::forward`.
+- **The candle dispatch is CORRECT.** `QMatMul::forward` (mod.rs:1037-1060) → `xs.apply_op1_no_bwd(t)` → `Storage::apply_op1` (storage.rs:205-220) dispatches by INPUT storage → `cuda_fwd` for Cuda, `cpu_fwd` for Cpu. `QStorage::from_data` (mod.rs:87-153) routes IQ types to `cuda::load_quantized_bytes` for CUDA device. Loading path verified correct. The only failure mode is building without the cuda feature (see qwen36-server section above).
+- **Dispatch path** (confirmed correct): `QMatMul::forward` → `cuda_fwd` (mod.rs:952-1035 CustomOp1) → for IQ types, fallback to `dequantize + cuBLAS` matmul in `cuda.rs:765`.
+- **Model forward path** (`model_weights.rs:5009-5024`): `forward_inner` → `emb_cpu = tok_embeddings.forward(x)` (returns CPU f32) → `layer_in = emb_cpu.to_device(x.device())`. If `x.device()` = CUDA → `layer_in` on CUDA → all `QMatMul` weights already on CUDA (loaded via `load_heavy` with CUDA device).
 
 ### candle API gotchas (learned the hard way — do NOT repeat)
 
