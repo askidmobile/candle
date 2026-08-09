@@ -58,6 +58,15 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn dequantize_rowslice(
+        &self,
+        _row_start: usize,
+        _row_end: usize,
+        _k: usize,
+    ) -> Result<CudaStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn storage_size_in_bytes(&self) -> usize {
         0
     }

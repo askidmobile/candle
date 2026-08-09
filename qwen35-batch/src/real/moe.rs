@@ -319,10 +319,38 @@ fn reference_routed_swiglu(
     let (n_tokens, n_embd) = xs.dims2()?;
     let n_experts = experts.n_experts;
 
-    // Dequantize packed experts to F32 on the compute device.
-    let gate_f = experts.gate.dequantize(device)?.to_dtype(DType::F32)?;
-    let up_f = experts.up.dequantize(device)?.to_dtype(DType::F32)?;
-    let down_f = experts.down.dequantize(device)?.to_dtype(DType::F32)?;
+    // Per-expert dequantize on demand. The packed shapes are
+    // gate/up: [n_experts, n_ff, n_embd], down: [n_experts, n_embd, n_ff].
+    // For expert `e`, the rowslice [e, e+1) of the 2D view [n_experts, n_ff*n_embd]
+    // gives a [1, n_ff*n_embd] f32 tensor; reshape to [n_ff, n_embd].
+    // This avoids dequantizing all 256 experts to f32 at once (the OOM cause).
+    // n_ff is recovered from the gate shape dims().
+    let gate_dims = experts.gate.shape().dims();
+    // Packed shape can be [n_experts, n_ff, n_embd] (3D) or a flat [n_experts*n_ff*n_embd].
+    let n_ff = match gate_dims {
+        [_, a, _b] => *a,                    // [n_experts, n_ff, n_embd]
+        _ => candle_core::bail!(
+            "reference_routed_swiglu: unexpected gate rank {:?}",
+            gate_dims
+        ),
+    };
+    let down_dims = experts.down.shape().dims();
+    match down_dims {
+        [_, a, _b] => {
+            if *a != n_ff {
+                candle_core::bail!(
+                    "reference_routed_swiglu: n_ff mismatch gate {} vs down {}",
+                    n_ff,
+                    a
+                );
+            }
+        }
+        _ => candle_core::bail!(
+            "reference_routed_swiglu: unexpected down rank {:?}",
+            down_dims
+        ),
+    };
+    let gate_k = n_ff * n_embd;      // cols of 2D view [n_experts, n_ff*n_embd]
 
     // Group tokens by selected expert: expert → [(token_idx, weight)].
     let mut expert_tokens: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_experts];
@@ -344,9 +372,19 @@ fn reference_routed_swiglu(
         let idx = Tensor::from_vec(token_ids.clone(), token_ids.len(), device)?;
         let x_subset = xs.index_select(&idx, 0)?; // [n_sel, n_embd]
 
-        let gate_w = gate_f.narrow(0, e, 1)?.squeeze(0)?; // [n_ff, n_embd]
-        let up_w = up_f.narrow(0, e, 1)?.squeeze(0)?; // [n_ff, n_embd]
-        let down_w = down_f.narrow(0, e, 1)?.squeeze(0)?; // [n_embd, n_ff]
+        // Dequantize just expert e: rowslice [e, e+1) → [1, n_ff*n_embd] → squeeze [n_ff, n_embd].
+        let gate_w = experts
+            .gate
+            .dequantize_rowslice(e, e + 1, gate_k, device)?
+            .reshape((n_ff, n_embd))?;
+        let up_w = experts
+            .up
+            .dequantize_rowslice(e, e + 1, gate_k, device)?
+            .reshape((n_ff, n_embd))?;
+        let down_w = experts
+            .down
+            .dequantize_rowslice(e, e + 1, gate_k, device)?
+            .reshape((n_embd, n_ff))?;
 
         let gate_out = x_subset.matmul(&gate_w.t()?)?; // [n_sel, n_ff]
         let up_out = x_subset.matmul(&up_w.t()?)?; // [n_sel, n_ff]

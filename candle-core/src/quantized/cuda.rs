@@ -859,6 +859,21 @@ impl QCudaStorage {
         use cudarc::driver::DevicePtr;
         Ok(self.data.inner.device_ptr(self.data.inner.stream()).0 as *const u8)
     }
+
+    /// Dequantize a row-slice [row_start, row_end) of a 2D weight [n, k] into
+    /// a contiguous f32 buffer [(row_end - row_start) * k].
+    ///
+    /// Uses the per-block IQ kernel by slicing the device buffer at a byte
+    /// offset — no full-weight f32 allocation. Only IQ-types are supported
+    /// (other dtypes fall back to `dequantize` + reshape).
+    pub fn dequantize_rowslice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        k: usize,
+    ) -> Result<CudaStorage> {
+        dequantize_f32_rowslice(&self.data, self.dtype, row_start, row_end, k, self.device())
+    }
 }
 
 impl QCudaStorage {

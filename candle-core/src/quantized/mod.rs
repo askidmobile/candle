@@ -260,6 +260,33 @@ impl QStorage {
         }
     }
 
+    /// Dequantize a row-slice [row_start, row_end) of a 2D weight [n, k] into
+    /// a contiguous f32 buffer [(row_end - row_start) * k] on the compute
+    /// device.
+    ///
+    /// CUDA-only: uses the per-block dequantize kernel slicing the device
+    /// buffer at a byte offset — no full-weight f32 allocation. Non-CUDA
+    /// backends are intentionally not supported here (they use the
+    /// `QTensor::dequantize_rowslice` fallback which does full dequant +
+    /// reshape + narrow).
+    pub fn dequantize_rowslice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        k: usize,
+    ) -> Result<Storage> {
+        match self {
+            QStorage::Cuda(storage) => {
+                let cuda = storage.dequantize_rowslice(row_start, row_end, k)?;
+                Ok(Storage::Cuda(cuda))
+            }
+            _ => crate::bail!(
+                "dequantize_rowslice (storage-level) only supports CUDA storage; \
+                 use QTensor::dequantize_rowslice for CPU/Metal fallback"
+            ),
+        }
+    }
+
     fn data(&self) -> Result<Cow<'_, [u8]>> {
         match self {
             QStorage::Cpu(storage) => {
@@ -798,6 +825,70 @@ impl QTensor {
         let storage = self.storage.dequantize(self.shape.elem_count())?;
         let none = crate::op::BackpropOp::none();
         crate::tensor::from_storage(storage, self.shape.clone(), none, false).to_device(device)
+    }
+
+    /// Dequantize a row-slice `[row_start, row_end)` of a 2D view `[n, k]` into
+    /// a contiguous f32 tensor `[(row_end - row_start), k]` on `device`.
+    ///
+    /// `k` is the number of columns (last dim of the shape). The tensor is
+    /// treated as 2D `[n, k]` where `n = elem_count / k`.
+    ///
+    /// CUDA IQ-types: per-block dequantize kernel slices the device buffer at
+    /// a byte offset — no full-weight f32 allocation (the OOM-avoiding path).
+    /// CPU/Metal: falls back to full `dequantize` + reshape + narrow.
+    pub fn dequantize_rowslice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        k: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let rows = row_end
+            .checked_sub(row_start)
+            .ok_or_else(|| crate::Error::Msg(format!("row_end < row_start ({row_end} < {row_start})")).bt())?;
+        if k == 0 {
+            crate::bail!("dequantize_rowslice: k must be non-zero");
+        }
+        let elem_count = self.shape.elem_count();
+        let n = elem_count / k;
+        if row_end > n {
+            crate::bail!(
+                "dequantize_rowslice: row_end {} > n_rows {} (elem_count={}, k={})",
+                row_end,
+                n,
+                elem_count,
+                k
+            );
+        }
+        // Fast path: CUDA storage uses the per-block rowslice kernel directly.
+        let out_shape = Shape::from((rows, k));
+        if rows == 0 {
+            // Empty slice: return a zero-element tensor with the right shape.
+            let none = crate::op::BackpropOp::none();
+            return crate::tensor::from_storage(
+                Storage::Cpu(crate::CpuStorage::F32(Vec::new())),
+                out_shape,
+                none,
+                false,
+            )
+            .to_device(device);
+        }
+        match &self.storage {
+            QStorage::Cuda(storage) => {
+                let cuda = storage.dequantize_rowslice(row_start, row_end, k)?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Cuda(cuda), out_shape, none, false)
+                    .to_device(device)
+            }
+            // Fallback: full dequant + reshape to [n, k] + narrow(0, row_start, rows).
+            // CPU/Metal reference tests use small experts so the full dequant
+            // is fine and matches the reference numerically.
+            _ => {
+                let full = self.dequantize(device)?;
+                let full = full.to_dtype(crate::DType::F32)?.reshape((n, k))?;
+                full.narrow(0, row_start, rows)
+            }
+        }
     }
 
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
