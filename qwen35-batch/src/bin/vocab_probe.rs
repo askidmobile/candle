@@ -44,5 +44,13 @@ fn main() -> Result<()> {
             None => println!("tok {id}: OUT OF RANGE"),
         }
     }
+
+    // End-to-end: decode заданной последовательности через production decode_text.
+    if !ids.is_empty() {
+        let tok = qwen35_batch::real::tokenizer::load_from_gguf_path(std::path::Path::new(&path))?;
+        let ids32: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+        let text = qwen35_batch::real::tokenizer::decode_text(&tok, &ids32)?;
+        println!("decode_text({ids32:?}) = {text:?}");
+    }
     Ok(())
 }
