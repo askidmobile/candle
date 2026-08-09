@@ -360,8 +360,17 @@ impl ModelProfile {
             .unwrap_or(0);
         let context_length = md_u32(&metadata, &format!("{prefix}.context_length"), &mut errs)
             .unwrap_or(0);
-        let feed_forward_length =
-            md_u32(&metadata, &format!("{prefix}.feed_forward_length"), &mut errs).unwrap_or(0);
+        // feed_forward_length: у dense обязателен; у qwen35moe отсутствует
+        // (все FFN — MoE, unsloth-GGUF этот ключ не пишет).
+        let feed_forward_length = if matches!(architecture, Architecture::Qwen35Moe) {
+            metadata
+                .get(&format!("{prefix}.feed_forward_length"))
+                .and_then(|v| v.to_u32().ok())
+                .map(|v| v as usize)
+                .unwrap_or(0)
+        } else {
+            md_u32(&metadata, &format!("{prefix}.feed_forward_length"), &mut errs).unwrap_or(0)
+        };
         let attention_head_count =
             md_u32(&metadata, &format!("{prefix}.attention.head_count"), &mut errs).unwrap_or(0);
         let attention_head_count_kv =
@@ -393,29 +402,37 @@ impl ModelProfile {
                 Architecture::Qwen35Moe => {
                     let re = md_u32(&metadata, "qwen35moe.expert_count", &mut errs);
                     let ept = md_u32(&metadata, "qwen35moe.expert_used_count", &mut errs);
-                    let ri = md_u32(
-                        &metadata,
+                    // Ключи у разных GGUF-билдеров: llama.cpp-style,
+                    // промежуточные, unsloth (expert_*_feed_forward_length).
+                    let mut scratch = ValidationErrors::default();
+                    let ri = [
                         "qwen35moe.feed_forward_length.experts",
-                        &mut errs,
-                    )
+                        "qwen35moe.intermediate_size_experts",
+                        "qwen35moe.expert_feed_forward_length",
+                    ]
+                    .iter()
+                    .find_map(|k| md_u32(&metadata, k, &mut scratch))
                     .or_else(|| {
-                        // Some GGUFs use a different key; try fallback.
-                        md_u32(&metadata, "qwen35moe.intermediate_size_experts", &mut errs)
+                        errs.push_missing("qwen35moe.expert_feed_forward_length");
+                        None
                     });
-                    let si = md_u32(
-                        &metadata,
+                    let si = [
                         "qwen35moe.feed_forward_length.shared_expert",
-                        &mut errs,
-                    )
+                        "qwen35moe.intermediate_size_shared_expert",
+                        "qwen35moe.expert_shared_feed_forward_length",
+                    ]
+                    .iter()
+                    .find_map(|k| md_u32(&metadata, k, &mut scratch))
                     .or_else(|| {
-                        md_u32(
-                            &metadata,
-                            "qwen35moe.intermediate_size_shared_expert",
-                            &mut errs,
-                        )
+                        errs.push_missing("qwen35moe.expert_shared_feed_forward_length");
+                        None
                     });
-                    let sec =
-                        md_u32(&metadata, "qwen35moe.shared_expert_count", &mut errs);
+                    // shared_expert_count: в unsloth-GGUF отсутствует, default 1.
+                    let sec = metadata
+                        .get("qwen35moe.shared_expert_count")
+                        .and_then(|v| v.to_u32().ok())
+                        .map(|v| v as usize)
+                        .or(Some(1));
                     let rnt = md_bool_opt(&metadata, "qwen35moe.router_norm_topk");
                     (re, ept, ri, si, sec, rnt)
                 }

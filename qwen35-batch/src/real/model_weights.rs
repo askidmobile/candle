@@ -3585,9 +3585,11 @@ impl ModelWeights {
             // ff_dim: dense uses feed_forward_length; MoE uses max(routed, shared) intermediate.
             let ff_dim = if is_moe {
                 let routed = md_get_u32("qwen35moe.feed_forward_length.experts")
-                    .max(md_get_u32("qwen35moe.intermediate_size_experts"));
+                    .max(md_get_u32("qwen35moe.intermediate_size_experts"))
+                    .max(md_get_u32("qwen35moe.expert_feed_forward_length"));
                 let shared = md_get_u32("qwen35moe.feed_forward_length.shared_expert")
-                    .max(md_get_u32("qwen35moe.intermediate_size_shared_expert"));
+                    .max(md_get_u32("qwen35moe.intermediate_size_shared_expert"))
+                    .max(md_get_u32("qwen35moe.expert_shared_feed_forward_length"));
                 routed.max(shared)
             } else {
                 md_get_u32("qwen35.feed_forward_length")
@@ -3673,9 +3675,11 @@ impl ModelWeights {
                 let hidden = md_get_u32(&format!("{arch_prefix_ua}.embedding_length"));
                 let ff_dim = if is_moe_ua {
                     let routed = md_get_u32("qwen35moe.feed_forward_length.experts")
-                        .max(md_get_u32("qwen35moe.intermediate_size_experts"));
+                        .max(md_get_u32("qwen35moe.intermediate_size_experts"))
+                        .max(md_get_u32("qwen35moe.expert_feed_forward_length"));
                     let shared = md_get_u32("qwen35moe.feed_forward_length.shared_expert")
-                        .max(md_get_u32("qwen35moe.intermediate_size_shared_expert"));
+                        .max(md_get_u32("qwen35moe.intermediate_size_shared_expert"))
+                        .max(md_get_u32("qwen35moe.expert_shared_feed_forward_length"));
                     routed.max(shared)
                 } else {
                     md_get_u32("qwen35.feed_forward_length")
@@ -3793,30 +3797,32 @@ impl ModelWeights {
         } else {
             0
         };
+        // Ключи у разных GGUF-билдеров разные: llama.cpp-style
+        // (feed_forward_length.experts), промежуточные (intermediate_size_*),
+        // unsloth (expert_feed_forward_length / expert_shared_feed_forward_length).
+        let moe_u32 = |keys: &[&str]| -> usize {
+            for k in keys {
+                if let Ok(v) = md_get(k).and_then(|m| m.to_u32()) {
+                    return v as usize;
+                }
+            }
+            0
+        };
         let moe_routed_intermediate = if is_moe {
-            md_get("qwen35moe.feed_forward_length.experts")
-                .and_then(|m| m.to_u32())
-                .map(|v| v as usize)
-                .unwrap_or_else(|_| {
-                    // Fallback key.
-                    md_get("qwen35moe.intermediate_size_experts")
-                        .and_then(|m| m.to_u32())
-                        .map(|v| v as usize)
-                        .unwrap_or(0)
-                })
+            moe_u32(&[
+                "qwen35moe.feed_forward_length.experts",
+                "qwen35moe.intermediate_size_experts",
+                "qwen35moe.expert_feed_forward_length",
+            ])
         } else {
             0
         };
         let moe_shared_intermediate = if is_moe {
-            md_get("qwen35moe.feed_forward_length.shared_expert")
-                .and_then(|m| m.to_u32())
-                .map(|v| v as usize)
-                .unwrap_or_else(|_| {
-                    md_get("qwen35moe.intermediate_size_shared_expert")
-                        .and_then(|m| m.to_u32())
-                        .map(|v| v as usize)
-                        .unwrap_or(0)
-                })
+            moe_u32(&[
+                "qwen35moe.feed_forward_length.shared_expert",
+                "qwen35moe.intermediate_size_shared_expert",
+                "qwen35moe.expert_shared_feed_forward_length",
+            ])
         } else {
             0
         };
