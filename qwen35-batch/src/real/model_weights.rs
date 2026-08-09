@@ -5462,12 +5462,18 @@ impl ModelWeights {
                 let is_delta = matches!(block.layer, HybridLayerType::DeltaNet(_));
                 let t0 = std::time::Instant::now();
                 layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
+                let el = t0.elapsed();
                 if is_delta {
-                    t_delta += t0.elapsed();
+                    t_delta += el;
                 } else {
-                    t_attn += t0.elapsed();
+                    t_attn += el;
                 }
-                let _ = bi;
+                if el.as_millis() > 50 {
+                    eprintln!(
+                        "[fdb] slow block {bi} {} {el:?}",
+                        if is_delta { "delta" } else { "attn" }
+                    );
+                }
             } else {
                 layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
             }
