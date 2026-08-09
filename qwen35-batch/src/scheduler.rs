@@ -212,8 +212,14 @@ impl<M: BatchModel> BatchScheduler<M> {
         self.stats.decode_ns += t0.elapsed().as_nanos();
         self.stats.decode_steps += 1;
         for (it, logits) in batch.items.iter().zip(logits_vec.iter()) {
+            if trace_on() {
+                eprintln!("[step] sample slot={}", it.slot_idx);
+            }
             let gen = self.slots[it.slot_idx].generated_tokens().to_vec();
             let tok = self.sampler.sample_indexed(it.slot_idx, &gen, logits);
+            if trace_on() {
+                eprintln!("[step] sampled slot={} tok={tok}", it.slot_idx);
+            }
             self.stats.total_decode_tokens += 1;
             self.slots[it.slot_idx].push_token(tok);
             if should_stop(it.slot_idx, &self.slots[it.slot_idx].generated) {
