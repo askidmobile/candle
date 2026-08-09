@@ -63,6 +63,14 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **Dispatch path** (confirmed correct): `QMatMul::forward` → `cuda_fwd` (mod.rs:952-1035 CustomOp1) → for IQ types, fallback to `dequantize + cuBLAS` matmul in `cuda.rs:765`.
 - **Model forward path** (`model_weights.rs:5009-5024`): `forward_inner` → `emb_cpu = tok_embeddings.forward(x)` (returns CPU f32) → `layer_in = emb_cpu.to_device(x.device())`. If `x.device()` = CUDA → `layer_in` on CUDA → all `QMatMul` weights already on CUDA (loaded via `load_heavy` with CUDA device).
 
+### Tokenizer GGUF gotchas (2026-08-09)
+
+- **GGUF vocab хранит byte-mapped строки** (GPT-2 bytes_to_unicode): пробел = `Ġ`(U+0120), байт 0xF0 = `ð`(U+00F0), 0x9F = `Ł`(U+0141). Emoji разрезан BPE на частичные UTF-8 куски (`ĠðŁ` + `Ĳ±`).
+- **HF tokenizers ByteLevel decoder декодит каждый токен отдельно** → частичные UTF-8 → U+FFFD. Поэтому `decode_text` — ручной: char→byte inverse map по всем токенам, один `from_utf8_lossy` на всю последовательность (tokenizer.rs).
+- **Стриминг: holdback U+FFFD-хвоста** — промежуточный decode заканчивается '�' (недостроенный emoji), следующий токен достраивает. Эмитить '�' нельзя: префикс разойдётся. Flush в finish (qwen36-server engine*.rs).
+- **vocab_probe.exe** (bin в qwen35-batch): `vocab_probe <gguf> [id...]` — печатает строки/байты токенов + e2e decode_text. Быстрее чем PowerShell-парсинг GGUF.
+- **`Tokenizer::decode` skip_special не нужен вручную** — decode_text пропускает `<|...|>` сам.
+
 ### candle API gotchas (learned the hard way — do NOT repeat)
 
 - **`QTensor` does NOT impl `Clone`.** Use `Arc<QTensor>` + `QMatMul::from_arc(arc.clone())` when you need the same weights for both `QMatMul` and `dequantize`.
