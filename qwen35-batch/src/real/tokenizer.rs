@@ -207,10 +207,62 @@ pub fn encode_no_think(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
 }
 
 /// Декодировать сгенерированные токены в текст, пропуская специальные токены.
+/// Byte-mapped char → исходный байт (GPT-2 bytes_to_unicode, inverse).
+/// Печатные диапазоны мапятся в себя; остальные байты — в U+0100+n по порядку.
+fn char_to_byte(ch: char) -> Option<u8> {
+    let c = ch as u32;
+    let printable = (0x21..=0x7Eu32).contains(&c)
+        || (0xA1..=0xACu32).contains(&c)
+        || (0xAE..=0xFFu32).contains(&c);
+    if printable {
+        return Some(c as u8);
+    }
+    if (0x100..0x200).contains(&c) {
+        let idx = (c - 0x100) as usize;
+        // n-й непечатный байт в порядке 0..=255.
+        let mut n = 0usize;
+        for b in 0..=255u32 {
+            let p = (0x21..=0x7Eu32).contains(&b)
+                || (0xA1..=0xACu32).contains(&b)
+                || (0xAE..=0xFFu32).contains(&b);
+            if !p {
+                if n == idx {
+                    return Some(b as u8);
+                }
+                n += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Декод токенов в текст. Ручной: собираем байты из byte-mapped строк ВСЕХ
+/// токенов и делаем from_utf8_lossy один раз на всю последовательность.
+/// Стандартный ByteLevel decoder декодит каждый токен отдельно — emoji/CJK,
+/// разрезанные на несколько токенов (частичные UTF-8 последовательности),
+/// превращались в U+FFFD. Спецтокены <|...|> пропускаются (skip_special).
 pub fn decode_text(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
-    tokenizer
-        .decode(ids, true)
-        .map_err(|e| anyhow!("decode: {e}"))
+    let mut bytes: Vec<u8> = Vec::with_capacity(ids.len() * 4);
+    for &id in ids {
+        let Some(tok) = tokenizer.id_to_token(id) else {
+            continue;
+        };
+        if tok.starts_with("<|") && tok.ends_with("|>") {
+            continue;
+        }
+        for ch in tok.chars() {
+            match char_to_byte(ch) {
+                Some(b) => bytes.push(b),
+                // Символ вне byte-mapping (прямая запись, напр. emoji в vocab) —
+                // кодируем UTF-8 как есть.
+                None => {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Удалить потенциальные хвостовые пустые строки из сгенерированного текста.
@@ -244,5 +296,28 @@ mod tests {
         let tok = build_from_ggml_keys(&md).unwrap();
         let text = decode_text(&tok, &[1]).unwrap();
         assert_eq!(text, "🐱");
+    }
+
+    // Byte-mapped форма (как в реальном GGUF): пробел=Ġ(U+0120),
+    // 🐱 = F0 9F 90 B1 → ð(U+00F0) Ł(U+0141) Ĳ(U+0132) ±(U+00B1),
+    // разрезан на два токена — decode обязан склеить байты до UTF-8.
+    #[test]
+    fn byte_mapped_split_emoji_decodes() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Array(vec![
+                Value::String("a".to_string()),
+                Value::String("\u{120}\u{F0}\u{141}".to_string()), // " " + F0 9F
+                Value::String("\u{132}\u{B1}".to_string()),       // 90 B1
+                Value::String("<|im_end|>".to_string()),
+            ]),
+        );
+        let tok = build_from_ggml_keys(&md).unwrap();
+        let text = decode_text(&tok, &[1, 2]).unwrap();
+        assert_eq!(text, " 🐱");
+        // Спецтокен пропускается.
+        let text = decode_text(&tok, &[1, 2, 3]).unwrap();
+        assert_eq!(text, " 🐱");
     }
 }
