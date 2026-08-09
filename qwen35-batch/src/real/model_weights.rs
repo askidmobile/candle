@@ -5454,8 +5454,15 @@ impl ModelWeights {
         layer_in = layer_in.reshape((b_sz, 1usize, self.hidden_size()))?; // [b_sz, 1, n_embd]
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
-        for block in self.blocks.iter_mut() {
+        let trace = crate::scheduler::trace_on();
+        for (bi, block) in self.blocks.iter_mut().enumerate() {
+            if trace {
+                eprintln!("[fdb] block {bi} begin");
+            }
             layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
+            if trace {
+                eprintln!("[fdb] block {bi} end");
+            }
         }
 
         // Head: norm -> take last token -> output projection -> [b_sz, vocab].
