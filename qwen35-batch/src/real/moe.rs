@@ -334,14 +334,15 @@ fn reference_routed_swiglu(
             gate_dims
         ),
     };
+    // down shape is [n_experts, n_embd, n_ff] — n_ff is dims[2], not dims[1].
     let down_dims = experts.down.shape().dims();
     match down_dims {
-        [_, a, _b] => {
-            if *a != n_ff {
+        [_, _embd, ff] => {
+            if *ff != n_ff {
                 candle_core::bail!(
                     "reference_routed_swiglu: n_ff mismatch gate {} vs down {}",
                     n_ff,
-                    a
+                    ff
                 );
             }
         }
