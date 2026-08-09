@@ -224,3 +224,25 @@ pub fn strip_thinking(text: &str) -> String {
         .trim()
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::quantized::gguf_file::Value;
+
+    // Emoji-токен в GGUF vocab: decode должен вернуть emoji, не U+FFFD.
+    #[test]
+    fn emoji_token_decodes() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Array(vec![
+                Value::String("a".to_string()),
+                Value::String("🐱".to_string()),
+            ]),
+        );
+        let tok = build_from_ggml_keys(&md).unwrap();
+        let text = decode_text(&tok, &[1]).unwrap();
+        assert_eq!(text, "🐱");
+    }
+}

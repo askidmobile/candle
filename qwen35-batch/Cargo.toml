@@ -69,3 +69,8 @@ required-features = ["real-model"]
 name = "qwen36_inspect"
 path = "src/bin/qwen36_inspect.rs"
 required-features = ["real-model"]
+
+[[bin]]
+name = "vocab_probe"
+path = "src/bin/vocab_probe.rs"
+required-features = ["real-model"]
