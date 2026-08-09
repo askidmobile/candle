@@ -5455,14 +5455,25 @@ impl ModelWeights {
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
         let trace = crate::scheduler::trace_on();
+        let mut t_delta = std::time::Duration::ZERO;
+        let mut t_attn = std::time::Duration::ZERO;
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             if trace {
-                eprintln!("[fdb] block {bi} begin");
+                let is_delta = matches!(block.layer, HybridLayerType::DeltaNet(_));
+                let t0 = std::time::Instant::now();
+                layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
+                if is_delta {
+                    t_delta += t0.elapsed();
+                } else {
+                    t_attn += t0.elapsed();
+                }
+                let _ = bi;
+            } else {
+                layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
             }
-            layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
-            if trace {
-                eprintln!("[fdb] block {bi} end");
-            }
+        }
+        if trace {
+            eprintln!("[fdb] step blocks: delta={t_delta:?} attn={t_attn:?}");
         }
 
         // Head: norm -> take last token -> output projection -> [b_sz, vocab].
