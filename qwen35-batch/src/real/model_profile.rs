@@ -250,31 +250,59 @@ fn require_tensor(
 }
 
 /// Check tensors for a single block at the given layer index.
+/// GGUF tensor names have NO architecture prefix (`blk.N....`); the prefix is
+/// only for metadata keys. Hybrid trunk: DeltaNet blocks (linear recurrence)
+/// interleave with full-attention blocks every `full_attention_interval`.
 fn require_block_tensors(
     tensor_infos: &BTreeMap<String, TensorInfo>,
     arch: Architecture,
     layer: usize,
+    full_attention_interval: usize,
     errs: &mut ValidationErrors,
 ) {
-    let prefix = arch.metadata_prefix();
-    // Dense tensors (both architectures share the hybrid trunk).
-    let dense_tensors = [
-        format!("{prefix}.blk.{layer}.attn_norm.weight"),
-        format!("{prefix}.blk.{layer}.attn_q.weight"),
-        format!("{prefix}.blk.{layer}.attn_k.weight"),
-        format!("{prefix}.blk.{layer}.attn_v.weight"),
-        format!("{prefix}.blk.{layer}.attn_output.weight"),
-    ];
-    for t in &dense_tensors {
-        require_tensor(tensor_infos, t, errs);
+    let prefix = format!("blk.{layer}");
+    // Common norms for both block types.
+    require_tensor(tensor_infos, &format!("{prefix}.attn_norm.weight"), errs);
+    require_tensor(
+        tensor_infos,
+        &format!("{prefix}.post_attention_norm.weight"),
+        errs,
+    );
+    // Sequence mixer depends on hybrid layout.
+    let interval = full_attention_interval.max(1);
+    if (layer + 1) % interval == 0 {
+        // Full attention block.
+        for t in [
+            format!("{prefix}.attn_q.weight"),
+            format!("{prefix}.attn_k.weight"),
+            format!("{prefix}.attn_v.weight"),
+            format!("{prefix}.attn_output.weight"),
+        ] {
+            require_tensor(tensor_infos, &t, errs);
+        }
+    } else {
+        // DeltaNet block.
+        for t in [
+            format!("{prefix}.attn_qkv.weight"),
+            format!("{prefix}.attn_gate.weight"),
+            format!("{prefix}.ssm_beta.weight"),
+            format!("{prefix}.ssm_alpha.weight"),
+            format!("{prefix}.ssm_out.weight"),
+            format!("{prefix}.ssm_dt.bias"),
+            format!("{prefix}.ssm_a"),
+            format!("{prefix}.ssm_conv1d.weight"),
+            format!("{prefix}.ssm_norm.weight"),
+        ] {
+            require_tensor(tensor_infos, &t, errs);
+        }
     }
     // Feed-forward tensors depend on architecture.
     match arch {
         Architecture::DenseQwen35 => {
             let ffn = [
-                format!("{prefix}.blk.{layer}.ffn_gate.weight"),
-                format!("{prefix}.blk.{layer}.ffn_up.weight"),
-                format!("{prefix}.blk.{layer}.ffn_down.weight"),
+                format!("{prefix}.ffn_gate.weight"),
+                format!("{prefix}.ffn_up.weight"),
+                format!("{prefix}.ffn_down.weight"),
             ];
             for t in &ffn {
                 require_tensor(tensor_infos, t, errs);
@@ -283,13 +311,13 @@ fn require_block_tensors(
         Architecture::Qwen35Moe => {
             // MoE: router + shared expert + packed routed experts.
             let moe_tensors = [
-                format!("{prefix}.blk.{layer}.ffn_gate_inp.weight"), // router
-                format!("{prefix}.blk.{layer}.ffn_gate_exps.weight"), // routed gate
-                format!("{prefix}.blk.{layer}.ffn_up_exps.weight"),  // routed up
-                format!("{prefix}.blk.{layer}.ffn_down_exps.weight"), // routed down
-                format!("{prefix}.blk.{layer}.ffn_gate_shexp.weight"), // shared gate
-                format!("{prefix}.blk.{layer}.ffn_up_shexp.weight"),  // shared up
-                format!("{prefix}.blk.{layer}.ffn_down_shexp.weight"), // shared down
+                format!("{prefix}.ffn_gate_inp.weight"),  // router
+                format!("{prefix}.ffn_gate_exps.weight"), // routed gate
+                format!("{prefix}.ffn_up_exps.weight"),   // routed up
+                format!("{prefix}.ffn_down_exps.weight"), // routed down
+                format!("{prefix}.ffn_gate_shexp.weight"), // shared gate
+                format!("{prefix}.ffn_up_shexp.weight"),  // shared up
+                format!("{prefix}.ffn_down_shexp.weight"), // shared down
             ];
             for t in &moe_tensors {
                 require_tensor(tensor_infos, t, errs);
@@ -424,14 +452,15 @@ impl ModelProfile {
         // 7. Per-block tensor validation (sample first + last block; full check
         //    for small models, sampled for large to keep validation fast).
         if block_count > 0 {
+            let interval = full_attention_interval.max(1) as usize;
             // Always check block 0 and last block.
             for layer in [0usize, block_count - 1] {
-                require_block_tensors(&tensor_infos, architecture, layer, &mut errs);
+                require_block_tensors(&tensor_infos, architecture, layer, interval, &mut errs);
             }
             // For MoE with <= 48 blocks, check all (40 is the target).
             if matches!(architecture, Architecture::Qwen35Moe) && block_count <= 48 {
                 for layer in 0..block_count {
-                    require_block_tensors(&tensor_infos, architecture, layer, &mut errs);
+                    require_block_tensors(&tensor_infos, architecture, layer, interval, &mut errs);
                 }
             }
         }

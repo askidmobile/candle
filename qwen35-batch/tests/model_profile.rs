@@ -57,23 +57,46 @@ fn dense_metadata() -> HashMap<String, Value> {
     md
 }
 
+/// Mixer tensor names per hybrid layout (interval=4): DeltaNet blocks lack
+/// attn_q/k/v/output; full-attention blocks lack ssm_*/attn_qkv/attn_gate.
+/// GGUF tensor names have no architecture prefix.
+fn mixer_tensors(layer: usize) -> Vec<String> {
+    let prefix = format!("blk.{layer}");
+    let mut v = vec![
+        format!("{prefix}.attn_norm.weight"),
+        format!("{prefix}.post_attention_norm.weight"),
+    ];
+    if (layer + 1) % 4 == 0 {
+        for n in ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"] {
+            v.push(format!("{prefix}.{n}"));
+        }
+    } else {
+        for n in [
+            "attn_qkv.weight", "attn_gate.weight", "ssm_beta.weight", "ssm_alpha.weight",
+            "ssm_out.weight", "ssm_dt.bias", "ssm_a", "ssm_conv1d.weight", "ssm_norm.weight",
+        ] {
+            v.push(format!("{prefix}.{n}"));
+        }
+    }
+    v
+}
+
 fn dense_tensors() -> HashMap<String, TensorInfo> {
     let mut ti = HashMap::new();
     ti.insert("token_embd.weight".into(), tensor_info(GgmlDType::Q4K, &[151943, 2560], 0));
     ti.insert("output_norm.weight".into(), tensor_info(GgmlDType::F32, &[2560], 1000));
-    // Block 0 dense tensors.
-    let block0 = [
-        "attn_norm", "attn_q", "attn_k", "attn_v", "attn_output",
-        "ffn_gate", "ffn_up", "ffn_down",
-    ];
-    for name in &block0 {
-        let full = format!("qwen35.blk.0.{name}.weight");
-        ti.insert(full, tensor_info(GgmlDType::Q4K, &[2560, 2560], 2000));
-    }
-    // Last block (35).
-    for name in &block0 {
-        let full = format!("qwen35.blk.35.{name}.weight");
-        ti.insert(full, tensor_info(GgmlDType::Q4K, &[2560, 2560], 3000));
+    let ffn = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+    // Validator checks block 0 (DeltaNet) and last block 35 (attention).
+    for (i, layer) in [0usize, 35].iter().enumerate() {
+        for name in mixer_tensors(*layer) {
+            ti.insert(name, tensor_info(GgmlDType::Q4K, &[2560, 2560], 2000 + i as u64 * 1000));
+        }
+        for n in &ffn {
+            ti.insert(
+                format!("blk.{layer}.{n}"),
+                tensor_info(GgmlDType::Q4K, &[2560, 2560], 2000 + i as u64 * 1000),
+            );
+        }
     }
     ti
 }
@@ -103,27 +126,24 @@ fn moe_tensors() -> HashMap<String, TensorInfo> {
     let mut ti = HashMap::new();
     ti.insert("token_embd.weight".into(), tensor_info(GgmlDType::IQ2XXS, &[151943, 2560], 0));
     ti.insert("output_norm.weight".into(), tensor_info(GgmlDType::F32, &[2560], 1000));
-    // MoE block 0 tensors.
-    let block0 = [
-        "attn_norm", "attn_q", "attn_k", "attn_v", "attn_output",
-        "ffn_gate_inp",  // router
-        "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",  // routed
-        "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",  // shared
+    let moe_ffn = [
+        "ffn_gate_inp.weight",  // router
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",  // routed
+        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",  // shared
     ];
-    for name in &block0 {
-        let full = format!("qwen35moe.blk.0.{name}.weight");
-        ti.insert(full, tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 2000));
-    }
-    // Last block (39).
-    for name in &block0 {
-        let full = format!("qwen35moe.blk.39.{name}.weight");
-        ti.insert(full, tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 3000));
-    }
-    // All 40 blocks.
-    for layer in 0..40 {
-        for name in &block0 {
-            let full = format!("qwen35moe.blk.{layer}.{name}.weight");
-            ti.insert(full, tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 4000 + layer as u64 * 100));
+    // All 40 blocks (validator does full check for MoE <= 48 blocks).
+    for layer in 0..40usize {
+        for name in mixer_tensors(layer) {
+            ti.insert(
+                name,
+                tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 4000 + layer as u64 * 100),
+            );
+        }
+        for n in &moe_ffn {
+            ti.insert(
+                format!("blk.{layer}.{n}"),
+                tensor_info(GgmlDType::IQ2XXS, &[2560, 2560], 4000 + layer as u64 * 100),
+            );
         }
     }
     ti
@@ -177,7 +197,7 @@ fn test_moe_wrong_expert_used_count_fails() {
 #[test]
 fn test_moe_missing_router_tensor_fails() {
     let mut ti = moe_tensors();
-    ti.remove("qwen35moe.blk.0.ffn_gate_inp.weight");
+    ti.remove("blk.0.ffn_gate_inp.weight");
     let ct = make_content(moe_metadata(), ti);
     let result = ModelProfile::read_and_validate(&ct, 0);
     assert!(result.is_err());
@@ -188,7 +208,7 @@ fn test_moe_missing_router_tensor_fails() {
 #[test]
 fn test_moe_missing_shared_expert_tensor_fails() {
     let mut ti = moe_tensors();
-    ti.remove("qwen35moe.blk.0.ffn_gate_shexp.weight");
+    ti.remove("blk.0.ffn_gate_shexp.weight");
     let ct = make_content(moe_metadata(), ti);
     let result = ModelProfile::read_and_validate(&ct, 0);
     assert!(result.is_err());
@@ -215,7 +235,7 @@ fn test_aggregated_errors_report_multiple() {
 #[test]
 fn test_dense_missing_block_tensor_fails() {
     let mut ti = dense_tensors();
-    ti.remove("qwen35.blk.0.ffn_gate.weight");
+    ti.remove("blk.0.ffn_gate.weight");
     let ct = make_content(dense_metadata(), ti);
     let result = ModelProfile::read_and_validate(&ct, 0);
     assert!(result.is_err());
