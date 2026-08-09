@@ -4223,6 +4223,13 @@ impl ModelWeights {
                 let shexp_gate_inp_qt =
                     load_heavy(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?;
                 let shexp_gate_inp_w = shexp_gate_inp_qt.dequantize(device)?.to_dtype(DType::F32)?;
+                // unsloth GGUF хранит gate как rank-1 [hidden] — Linear ждёт [1, hidden].
+                let shexp_gate_inp_w = if shexp_gate_inp_w.rank() == 1 {
+                    let h = shexp_gate_inp_w.dim(0)?;
+                    shexp_gate_inp_w.reshape((1, h))?
+                } else {
+                    shexp_gate_inp_w
+                };
                 let shared = SharedExpert::new(
                     candle_nn::Linear::new(shexp_gate_inp_w, None),
                     QMatMul::from_qtensor(load_heavy(&format!("{prefix}.ffn_gate_shexp.weight"))?)?,
