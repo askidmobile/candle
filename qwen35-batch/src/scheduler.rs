@@ -64,6 +64,14 @@ impl SchedulerStats {
 /// чанк-чекпойнтов рекуррентного GDN state (checkpoint complexity, beyond scope).
 pub const PREFILL_CHUNK: usize = usize::MAX;
 
+/// Диагностический trace шагов (QWEN36_TRACE=1) — для расследования зависаний
+/// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
+#[inline]
+pub fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN36_TRACE").is_some())
+}
+
 pub struct BatchScheduler<M: BatchModel> {
     model: M,
     slots: Vec<Slot>,
@@ -146,7 +154,13 @@ impl<M: BatchModel> BatchScheduler<M> {
                 start_pos,
             };
             let t0 = Instant::now();
+            if trace_on() {
+                eprintln!("[step] prefill begin slot={sidx} tokens={chunk_size} start={start_pos}");
+            }
             let logits = self.model.prefill_chunk(&chunk)?;
+            if trace_on() {
+                eprintln!("[step] prefill end slot={sidx} ({:?})", t0.elapsed());
+            }
             self.stats.prefill_ns += t0.elapsed().as_nanos();
             self.stats.prefill_chunks += 1;
             self.slots[sidx].advance_prefill(chunk_size);
@@ -187,7 +201,14 @@ impl<M: BatchModel> BatchScheduler<M> {
         let b = batch.len();
         self.stats.max_concurrent_decode = self.stats.max_concurrent_decode.max(b);
         let t0 = Instant::now();
+        if trace_on() {
+            let poss: Vec<usize> = batch.items.iter().map(|i| i.pos).collect();
+            eprintln!("[step] decode begin B={b} pos={poss:?}");
+        }
         let logits_vec = self.model.decode_batch(&batch)?;
+        if trace_on() {
+            eprintln!("[step] decode end B={b} ({:?})", t0.elapsed());
+        }
         self.stats.decode_ns += t0.elapsed().as_nanos();
         self.stats.decode_steps += 1;
         for (it, logits) in batch.items.iter().zip(logits_vec.iter()) {
