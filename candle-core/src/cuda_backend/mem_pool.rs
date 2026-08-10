@@ -40,6 +40,17 @@ pub fn retain_default_mempool(dev: &CudaDevice) -> Result<()> {
     Ok(())
 }
 
+/// Свободная VRAM (MiB) по драйверу. Для условного включения retain:
+/// retain на карте с малым запасом = reserved-память пула добивает карту
+/// до paging (измерено: 12GB карта 98% → 7x регресс decode).
+pub fn free_mib(dev: &CudaDevice) -> Result<u64> {
+    let (free, _total) = dev
+        .context
+        .mem_get_info()
+        .map_err(|e| crate::Error::Msg(format!("cuMemGetInfo: {e}")))?;
+    Ok((free / 1024 / 1024) as u64)
+}
+
 /// Текущее использование пула (MiB): (used, reserved). Для trace-диагностики.
 pub fn default_mempool_usage(dev: &CudaDevice) -> Result<(u64, u64)> {
     let cu_dev = dev.context.cu_device();
