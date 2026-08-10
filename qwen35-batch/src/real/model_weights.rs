@@ -3078,29 +3078,30 @@ impl GatedAttentionLayer {
                 candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?
                     .to_dtype(DType::F32)?
             } else {
-                // CUDA manual matmul (F32, как forward_attn decode).
-                let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
-                let k_f32 = k.to_dtype(DType::F32)?.contiguous()?;
-                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?;
+                // CUDA: F16 matmul (cuBLAS HGEMM). KV cache уже F16 — не
+                // конвертируем в F32 (экономия: 2x memory traffic на чтение KV
+                // + убраны to_dtype-ядра + GQA-копии вполовину меньше).
+                // Softmax — в F32 (численная стабильность), результат обратно в F16.
+                let q_f16 = q.to_dtype(DType::F16)?.contiguous()?;
                 let (k_exp, v_exp) = if self.n_kv_head != self.n_head {
                     let repeats = self.n_head / self.n_kv_head;
-                    let k = k_f32
+                    let kx = k
                         .unsqueeze(2)?
                         .broadcast_as((1, self.n_kv_head, repeats, kv_len, self.head_dim))?
                         .contiguous()?
                         .reshape((1, self.n_head, kv_len, self.head_dim))?;
-                    let v = v_f32
+                    let vx = v
                         .unsqueeze(2)?
                         .broadcast_as((1, self.n_kv_head, repeats, kv_len, self.head_dim))?
                         .contiguous()?
                         .reshape((1, self.n_head, kv_len, self.head_dim))?;
-                    (k, v)
+                    (kx, vx)
                 } else {
-                    (k_f32, v_f32)
+                    (k.contiguous()?, v.contiguous()?)
                 };
-                let scores = (q_f32.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
-                let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-                attn.matmul(&v_exp)?
+                let scores = (q_f16.matmul(&k_exp.transpose(2, 3)?.contiguous()?)? * scale)?;
+                let attn = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?;
+                attn.to_dtype(DType::F16)?.matmul(&v_exp)?.to_dtype(DType::F32)?
             };
             slot_outs.push(y);
         }
