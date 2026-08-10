@@ -59,10 +59,26 @@ impl SchedulerStats {
     }
 }
 
-/// Размер чанка prefill. В прототипе — весь prompt (prefill последовательный).
-/// Уменьшение → interleaving prefill и decode (true LLM-level batching); требует
-/// чанк-чекпойнтов рекуррентного GDN state (checkpoint complexity, beyond scope).
-pub const PREFILL_CHUNK: usize = usize::MAX;
+/// Размер чанка prefill. usize::MAX = весь prompt одним forward (прототип).
+/// Ограничение обязательно для длинных промптов: цельный prefill на N токенов
+/// создаёт attention scores N×N×F32×heads (5.6K → ~2 GB transient → CUDA OOM
+/// на 12 GB карте). 512 → scores 512×kv_len, десятки MB.
+/// Interleaving с decode других слотов безопасен: prefill копит single-slot
+/// state, decode работает по batched buffers — пересечений нет.
+pub const PREFILL_CHUNK: usize = 512;
+
+/// Размер чанка prefill с учётом env QWEN36_PREFILL_CHUNK (0/большое = целиком).
+#[inline]
+pub fn prefill_chunk_size() -> usize {
+    static SZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SZ.get_or_init(|| {
+        std::env::var("QWEN36_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(PREFILL_CHUNK)
+    })
+}
 
 /// Диагностический trace шагов (QWEN36_TRACE=1) — для расследования зависаний
 /// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
@@ -240,7 +256,7 @@ impl<M: BatchModel> BatchScheduler<M> {
     fn next_prefill_chunk(&self) -> Option<(usize, usize)> {
         for s in &self.slots {
             if s.is_prefilling() {
-                let n = s.prefill_remaining_slice().len().min(PREFILL_CHUNK);
+                let n = s.prefill_remaining_slice().len().min(prefill_chunk_size());
                 return Some((s.idx, n));
             }
         }
