@@ -45,6 +45,14 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **How to verify the binary has cuda:** `dumpbin /dependents qwen36-server.exe`. With cuda, size jumps from ~8.7 MB (no cuda) to ~23.4 MB (cuda kernels embedded). NOTE: `cudart`/`cublas` do NOT appear in dumpbin — candle uses `cudarc` with dynamic-loading (CUDA loaded via `LoadLibrary` at runtime, not statically linked). Size is the reliable indicator.
 - **After rebuilding with cuda feature**: server loads Q2_K_XL on CUDA, inference works end-to-end. First curl returned valid chat completion (`"Hello! How can I help you today"`, 8 completion / 13 prompt tokens).
 
+## Attention CUDA decode — F16 (2026-08-10)
+
+- **Batched decode attention на CUDA — F16 matmul** (model_weights.rs, ветка `forward_attn_decode_batch`): KV cache хранится F16 → НЕ конвертировать в F32. q→F16, HGEMM, softmax в F32, out→F32. Дёшево и точно: `gemm_reduced_precision_f16=false` (default) = CUBLAS_COMPUTE_32F — аккумуляция F32.
+- **Выигрыш на длинном контексте (35B-A3B, KV 5.4K, B=2): 2.2s → 0.35s/токен (6x).** На коротком контексте разницы нет (доминирует DeltaNet).
+- Старый коммент «F16 дал numerical drift» — про ПОЛНУЮ F16-цепочку с F16 softmax. F16 matmul + F32 softmax дрейфа не даёт (проверено: 2×2500 токенов на 5.4K ctx, когерентно).
+- Single-slot decode (`forward_attn` seq_len=1) оставлен F32 — там drift-комментарий не оспорен, сервер использует batched путь.
+- **PREFILL_CHUNK=512** (scheduler.rs, env QWEN36_PREFILL_CHUNK): цельный prefill создаёт scores N×N×F32×heads (~2GB на 5.6K промпт) → CUDA OOM на 12GB. Чанкинг обязателен. Заодно decode других слотов interleave'ится с prefill.
+
 ## Prefill performance (2026-08-08)
 
 - **Prefill НЕ виснет — медленный.** 3000-токенный промпт: 15 чанков × ~39s = ~583s (600s timeout). Время растёт линейно (11s → 43s → 83s → ...).
