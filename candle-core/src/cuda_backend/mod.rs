@@ -15,6 +15,7 @@ use half::{bf16, f16};
 pub mod cudnn;
 mod device;
 mod error;
+pub mod mem_pool;
 mod utils;
 pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
