@@ -20,7 +20,7 @@
 use candle_core::quantized::q4k_opt::Q4KOptMetadataGpu;
 use candle_core::{
     quantized::{gguf_file, QMatMul},
-    DType, Device, IndexOp, Result, Tensor,
+    DType, Device, IndexOp, Result, Tensor, D,
 };
 use candle_nn::{Module, RmsNorm};
 #[cfg(target_os = "macos")]
@@ -2474,6 +2474,38 @@ pub struct KvCacheSnap {
 
 /// Веса и логика Gated Attention слоя (каждый 4-й слой в Qwen3.5).
 ///
+/// Q8_0 KV-cache для batched decode: K/V хранятся как u8 (biased +128)
+/// + per-row F32 scale. ~2x меньше VRAM и вдвое меньше bandwidth чтения
+/// на длинном контексте (по мотивам llama.cpp --cache-type-k q8_0 /
+/// ik turbo3). Деквантизация в F16 при чтении — дальше обычный HGEMM path.
+#[derive(Debug, Clone)]
+struct Q8KvCache {
+    /// [1, n_kv_head, cap, head_dim] u8
+    k_q: Tensor,
+    /// [1, n_kv_head, cap, 1] f32
+    k_s: Tensor,
+    v_q: Tensor,
+    v_s: Tensor,
+}
+
+/// Квантование per-row (последняя ось = head_dim): scale = amax/127.
+/// t: [.., seq, hd] → (u8 biased [.., seq, hd], f32 scale [.., seq, 1]).
+fn q8_quantize_rows(t: &Tensor) -> Result<(Tensor, Tensor)> {
+    let tf = t.to_dtype(DType::F32)?;
+    let amax = tf.abs()?.max(D::Minus1)?;
+    let scale = (amax / 127.0)?.clamp(1e-6, f64::INFINITY)?;
+    let scale = scale.unsqueeze(D::Minus1)?;
+    let q = tf.broadcast_div(&scale)?.round()?;
+    let q = (q + 128.0)?.to_dtype(DType::U8)?;
+    Ok((q, scale))
+}
+
+/// Деквантизация → F16 [.., seq, hd].
+fn q8_dequantize_rows(q: &Tensor, s: &Tensor) -> Result<Tensor> {
+    let qf = (q.to_dtype(DType::F32)? - 128.0)?;
+    qf.broadcast_mul(s)?.to_dtype(DType::F16)
+}
+
 /// Отличия от стандартного Qwen3 attention:
 /// - Joint Q+gate проекция: attn_q.weight → [head_k_dim * n_head * 2]
 /// - Sigmoid gating на выходе attention
@@ -2521,10 +2553,10 @@ pub(crate) struct GatedAttentionLayer {
     /// поэтому attention окно не теряет долгосрочный контекст.
     attn_window: usize,
     /// Per-slot KV-cache для true batched decode (Phase 5). Каждый слот имеет
-    /// свой [1, n_kv_head, cap, hd] F16 буфер + длину. Размер = capacity B
+    /// свой Q8-квантованный буфер (u8+scale) + длину. Размер = capacity B
     /// (DECODE_BATCH_CAPACITY). Используется ТОЛЬКО в forward_attn_decode_batch;
     /// single-slot `forward_attn` использует `kv_cache` выше (shared path).
-    kv_cache_batched: Vec<Option<(Tensor, Tensor)>>,
+    kv_cache_batched: Vec<Option<Q8KvCache>>,
     /// Per-slot длина заполненного KV-cache (для batched path).
     kv_cache_len_batched: Vec<usize>,
     /// Pre-allocated ёмкость KV-кэша для batched path (== attn_window cap).
@@ -2995,82 +3027,109 @@ impl GatedAttentionLayer {
             let q = self.apply_partial_rotary_emb(&q, pos)?;
             let k = self.apply_partial_rotary_emb(&k, pos)?;
 
-            // KV-cache append (per-slot). F16 для memory (как single-slot path).
-            let k = k.to_dtype(DType::F16)?;
-            let v = v.to_dtype(DType::F16)?;
+            // KV-cache append (per-slot). Q8_0 квантование (см. Q8KvCache):
+            // память и bandwidth вдвое меньше F16.
+            let (kq, ks) = q8_quantize_rows(&k)?;
+            let (vq, vs) = q8_quantize_rows(&v)?;
 
             let need_init = self.kv_cache_batched[slot].is_none();
             if need_init {
                 let init_cap = 512.min(self.attn_window);
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
-                let k_buf = Tensor::zeros(
+                let k_q = Tensor::zeros(
                     (1, self.n_kv_head, init_cap, self.head_dim),
-                    DType::F16, &device,
+                    DType::U8, &device,
+                )?;
+                let k_s = Tensor::zeros(
+                    (1, self.n_kv_head, init_cap, 1),
+                    DType::F32, &device,
                 )?;
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
-                let v_buf = Tensor::zeros(
+                let v_q = Tensor::zeros(
                     (1, self.n_kv_head, init_cap, self.head_dim),
-                    DType::F16, &device,
+                    DType::U8, &device,
                 )?;
-                self.kv_cache_batched[slot] = Some((k_buf, v_buf));
+                let v_s = Tensor::zeros(
+                    (1, self.n_kv_head, init_cap, 1),
+                    DType::F32, &device,
+                )?;
+                self.kv_cache_batched[slot] = Some(Q8KvCache { k_q, k_s, v_q, v_s });
                 self.kv_cache_len_batched[slot] = 0;
                 self.kv_cache_cap_batched = init_cap;
             }
 
             let cache_len = self.kv_cache_len_batched[slot];
             let new_len = cache_len + seq_len;
-            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().0.dim(2)?;
+            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().k_q.dim(2)?;
 
             if seq_len == 1 && new_len > self.attn_window {
                 // Sliding window eviction (decode): отбрасываем 1 старый, пишем 1 новый.
                 let keep = self.attn_window - 1;
-                let (k_cache, v_cache) = self.kv_cache_batched[slot].as_mut().unwrap();
-                let old_k = k_cache.narrow(2, 1, keep)?.contiguous()?;
-                let old_v = v_cache.narrow(2, 1, keep)?.contiguous()?;
-                k_cache.slice_set(&old_k, 2, 0)?;
-                v_cache.slice_set(&old_v, 2, 0)?;
-                k_cache.slice_set(&k, 2, keep)?;
-                v_cache.slice_set(&v, 2, keep)?;
+                let c = self.kv_cache_batched[slot].as_mut().unwrap();
+                for (buf, src) in [(&c.k_q, &kq), (&c.v_q, &vq)] {
+                    let old = buf.narrow(2, 1, keep)?.contiguous()?;
+                    buf.slice_set(&old, 2, 0)?;
+                    buf.slice_set(src, 2, keep)?;
+                }
+                for (buf, src) in [(&c.k_s, &ks), (&c.v_s, &vs)] {
+                    let old = buf.narrow(2, 1, keep)?.contiguous()?;
+                    buf.slice_set(&old, 2, 0)?;
+                    buf.slice_set(src, 2, keep)?;
+                }
                 self.kv_cache_len_batched[slot] = self.attn_window;
             } else if new_len > current_cap {
-                // Рост буфера (как forward_attn). Копируем старое + пишем новое.
+                // Рост буфера. Копируем старое + пишем новое.
                 let new_cap = (new_len + 512).min(self.max_cache_len).min(self.attn_window);
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
-                let new_k = Tensor::zeros(
-                    (1, self.n_kv_head, new_cap, self.head_dim), k.dtype(), &device,
-                )?;
+                let mk = |dt: DType, last: usize| -> Result<Tensor> {
+                    Ok(Tensor::zeros((1, self.n_kv_head, new_cap, last), dt, &device)?)
+                };
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
-                let new_v = Tensor::zeros(
-                    (1, self.n_kv_head, new_cap, self.head_dim), v.dtype(), &device,
-                )?;
-                let (k_cache, v_cache) = self.kv_cache_batched[slot].as_ref().unwrap();
+                let (new_kq, new_ks) = (mk(DType::U8, self.head_dim)?, mk(DType::F32, 1)?);
+                let (new_vq, new_vs) = (mk(DType::U8, self.head_dim)?, mk(DType::F32, 1)?);
+                let c = self.kv_cache_batched[slot].as_ref().unwrap();
                 if cache_len > 0 {
-                    let old_k = k_cache.narrow(2, 0, cache_len)?.contiguous()?;
-                    let old_v = v_cache.narrow(2, 0, cache_len)?.contiguous()?;
-                    new_k.slice_set(&old_k, 2, 0)?;
-                    new_v.slice_set(&old_v, 2, 0)?;
+                    for (dst, src) in [(&new_kq, &c.k_q), (&new_vq, &c.v_q), (&new_ks, &c.k_s), (&new_vs, &c.v_s)] {
+                        let old = src.narrow(2, 0, cache_len)?.contiguous()?;
+                        dst.slice_set(&old, 2, 0)?;
+                    }
                 }
-                new_k.slice_set(&k, 2, cache_len)?;
-                new_v.slice_set(&v, 2, cache_len)?;
-                self.kv_cache_batched[slot] = Some((new_k, new_v));
+                new_kq.slice_set(&kq, 2, cache_len)?;
+                new_ks.slice_set(&ks, 2, cache_len)?;
+                new_vq.slice_set(&vq, 2, cache_len)?;
+                new_vs.slice_set(&vs, 2, cache_len)?;
+                self.kv_cache_batched[slot] = Some(Q8KvCache {
+                    k_q: new_kq,
+                    k_s: new_ks,
+                    v_q: new_vq,
+                    v_s: new_vs,
+                });
                 self.kv_cache_len_batched[slot] = new_len;
                 self.kv_cache_cap_batched = new_cap;
             } else {
                 // Обычный append.
-                let (k_cache, v_cache) = self.kv_cache_batched[slot].as_mut().unwrap();
-                k_cache.slice_set(&k, 2, cache_len)?;
-                v_cache.slice_set(&v, 2, cache_len)?;
+                let c = self.kv_cache_batched[slot].as_mut().unwrap();
+                c.k_q.slice_set(&kq, 2, cache_len)?;
+                c.k_s.slice_set(&ks, 2, cache_len)?;
+                c.v_q.slice_set(&vq, 2, cache_len)?;
+                c.v_s.slice_set(&vs, 2, cache_len)?;
                 self.kv_cache_len_batched[slot] = new_len;
             }
 
             let kv_len = self.kv_cache_len_batched[slot];
-            let (k_cache, v_cache) = self.kv_cache_batched[slot].as_ref().unwrap();
-            let k = k_cache.narrow(2, 0, kv_len)?.contiguous()?;
-            let v = v_cache.narrow(2, 0, kv_len)?.contiguous()?;
+            let c = self.kv_cache_batched[slot].as_ref().unwrap();
+            let k = q8_dequantize_rows(
+                &c.k_q.narrow(2, 0, kv_len)?.contiguous()?,
+                &c.k_s.narrow(2, 0, kv_len)?.contiguous()?,
+            )?;
+            let v = q8_dequantize_rows(
+                &c.v_q.narrow(2, 0, kv_len)?.contiguous()?,
+                &c.v_s.narrow(2, 0, kv_len)?.contiguous()?,
+            )?;
 
             // SDPA (seq_len=1, decode path — идентичен forward_attn).
             let y = if q.device().is_metal() || q.device().is_cpu() {
@@ -4935,12 +4994,13 @@ impl ModelWeights {
                 (HybridLayerType::Attention(a), BlockStateSnap::Attention(kv_opt)) => {
                     match kv_opt {
                         Some(kv) => {
-                            // Deep-clone K/V из snapshot в per-slot batched буфер.
-                            // Snapshot хранит [1, n_kv_head, cache_len, head_dim];
-                            // клонируем в новую аллокацию (detach от snapshot storage).
+                            // Deep-clone K/V из snapshot в per-slot batched буфер
+                            // (Q8-квантование, как decode append path).
                             let k = tensor_deep_clone(&kv.k)?;
                             let v = tensor_deep_clone(&kv.v)?;
-                            a.kv_cache_batched[slot] = Some((k, v));
+                            let (k_q, k_s) = q8_quantize_rows(&k)?;
+                            let (v_q, v_s) = q8_quantize_rows(&v)?;
+                            a.kv_cache_batched[slot] = Some(Q8KvCache { k_q, k_s, v_q, v_s });
                             a.kv_cache_len_batched[slot] = kv.cache_len;
                         }
                         None => {
@@ -6042,5 +6102,30 @@ mod tests {
         assert_ne!(n1, n2, "rand::random<u64> collision (extremely unlikely)");
         assert_ne!(n2, n3, "rand::random<u64> collision (extremely unlikely)");
         // Не проверяем n1 != n3 — это purely sanity check на rand
+    }
+}
+
+#[cfg(test)]
+mod q8_kv_tests {
+    use super::*;
+
+    #[test]
+    fn q8_roundtrip_close() {
+        let dev = Device::Cpu;
+        let t = Tensor::randn(0f32, 3.0, (1, 2, 8, 64), &dev).unwrap();
+        let (q, s) = q8_quantize_rows(&t).unwrap();
+        assert_eq!(q.dtype(), DType::U8);
+        assert_eq!(s.dims(), &[1, 2, 8, 1]);
+        let back = q8_dequantize_rows(&q, &s).unwrap();
+        let diff = (&t.to_dtype(DType::F32).unwrap() - &back.to_dtype(DType::F32).unwrap())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        // Ошибка ≤ 2 шага квантования (scale = amax/127).
+        assert!(diff < 3.0 * 3.0 / 60.0, "q8 roundtrip error too big: {diff}");
     }
 }
