@@ -40,7 +40,26 @@ pub fn retain_default_mempool(dev: &CudaDevice) -> Result<()> {
     Ok(())
 }
 
-/// Свободная VRAM (MiB) по драйверу. Для условного включения retain:
+/// Принудительно освободить retained-страницы пула (cuMemPoolTrimTo(0)).
+/// Вызывать при выгрузке модели: иначе retain держит страницы старых весов
+/// навсегда и следующая модель не влезает (урок 2026-08-10).
+pub fn trim_default_mempool(dev: &CudaDevice) -> Result<()> {
+    let cu_dev = dev.context.cu_device();
+    unsafe {
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        let res = sys::cuDeviceGetDefaultMemPool(&mut pool, cu_dev);
+        if res != sys::CUresult::CUDA_SUCCESS {
+            crate::bail!("cuDeviceGetDefaultMemPool failed: {res:?}");
+        }
+        let res = sys::cuMemPoolTrimTo(pool, 0);
+        if res != sys::CUresult::CUDA_SUCCESS {
+            crate::bail!("cuMemPoolTrimTo failed: {res:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Свободная/полная VRAM (MiB) по драйверу. Для условного включения retain:
 /// retain на карте с малым запасом = reserved-память пула добивает карту
 /// до paging (измерено: 12GB карта 98% → 7x регресс decode).
 pub fn free_mib(dev: &CudaDevice) -> Result<u64> {
