@@ -17,6 +17,16 @@ pub struct QCudaStorage {
     data: PaddedCudaSlice,
     dtype: GgmlDType,
     device: CudaDevice,
+    /// Кэш полной F16-деквантизации весов (IQ-типы). Один раз при первом
+    /// matmul; дальше чистый HGEMM вместо dequant-всей-матрицы-на-шаг.
+    /// Включается env QWEN36_DEQUANT_CACHE=1 (смысл: карты с большим VRAM,
+    /// A100 80GB; на 12GB не влезает — там tiled fallback как было).
+    dequant_cache: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<CudaStorage>>>>,
+}
+
+fn dequant_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN36_DEQUANT_CACHE").is_some())
 }
 
 static FORCE_DMMV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -299,6 +309,7 @@ fn dequantize_mul_mat_vec_via_cublas(
         data: data.clone(),
         dtype,
         device: dev.clone(),
+        dequant_cache: Default::default(),
     };
     // Dequantize [nrows, ncols] weights to f32
     let data_f32 = storage.dequantize(nrows * ncols)?;
@@ -628,6 +639,7 @@ impl QCudaStorage {
             },
             device: device.clone(),
             dtype,
+            dequant_cache: Default::default(),
         })
     }
 
@@ -637,6 +649,23 @@ impl QCudaStorage {
 
     pub fn device(&self) -> &CudaDevice {
         &self.device
+    }
+
+    /// Деквантизация всей матрицы с кэшем (IQ-типы, QWEN36_DEQUANT_CACHE=1):
+    /// один раз dequant в F32, дальше cuBLAS SGEMM по кэшу.
+    fn cached_dequant_f32(&self, elem_count: usize) -> Result<std::sync::Arc<CudaStorage>> {
+        let mut g = self.dequant_cache.lock().unwrap();
+        if g.is_none() {
+            let w = QCudaStorage {
+                data: self.data.clone(),
+                dtype: self.dtype,
+                device: self.device.clone(),
+                dequant_cache: Default::default(),
+            }
+            .dequantize(elem_count)?;
+            *g = Some(std::sync::Arc::new(w));
+        }
+        Ok(g.as_ref().unwrap().clone())
     }
 
     pub fn dequantize(&self, elem_count: usize) -> Result<CudaStorage> {
@@ -910,17 +939,24 @@ impl QCudaStorage {
                 | GgmlDType::IQ4XS
         );
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
-            dequantize_mul_mat_vec_via_cublas(
-                &self.data,
-                rhs,
-                rhs_l,
-                self.dtype,
-                ncols,
-                nrows,
-                b,
-                m,
-                self.device(),
-            )?
+            if iq_type && dequant_cache_enabled() {
+                let w = self.cached_dequant_f32(nrows * ncols)?;
+                let weight_l = crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
+                    .broadcast_as((b, ncols, nrows))?;
+                rhs.matmul(w.as_ref(), (b, m, nrows, ncols), rhs_l, &weight_l)?
+            } else {
+                dequantize_mul_mat_vec_via_cublas(
+                    &self.data,
+                    rhs,
+                    rhs_l,
+                    self.dtype,
+                    ncols,
+                    nrows,
+                    b,
+                    m,
+                    self.device(),
+                )?
+            }
         } else {
             mul_mat_vec_via_q8_1(
                 &self.data,
@@ -955,16 +991,31 @@ impl QCudaStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
+        let is_iq = matches!(
+            self.dtype,
+            GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
+        );
+        // Кэшированная полная деквантизация (A100 80GB): один matmul по кэшу
+        // вместо tiled dequant каждый вызов.
+        if is_iq && dequant_cache_enabled() && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            let w = self.cached_dequant_f32(n * k)?;
+            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0)
+                .broadcast_as((b, k, n))?;
+            let out = storage.matmul(w.as_ref(), (b, m, n, k), layout, &rhs_l)?;
+            let mut out_shape = layout.shape().dims().to_vec();
+            out_shape.pop();
+            out_shape.push(n);
+            return Ok((out, out_shape.into()));
+        }
+
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
-            || matches!(
-                self.dtype,
-                GgmlDType::IQ3XXS
-                    | GgmlDType::IQ2S
-                    | GgmlDType::IQ3S
-                    | GgmlDType::IQ2XS
-                    | GgmlDType::IQ2XXS
-                    | GgmlDType::IQ4XS
-            ) {
+            || is_iq
+            {
             // Tiled dequantize matmul: dequantize weight in row-chunks to avoid
             // allocating the full f32 weight (n*k*4 bytes) which can exceed VRAM
             // headroom during prefill and trigger CUDA unified-memory paging.
@@ -1049,6 +1100,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         },
         device: device.clone(),
         dtype,
+        dequant_cache: Default::default(),
     }))
 }
 
@@ -1070,6 +1122,7 @@ pub fn load_quantized_bytes(
         },
         device: device.clone(),
         dtype,
+        dequant_cache: Default::default(),
     }))
 }
 
