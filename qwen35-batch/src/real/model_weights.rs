@@ -3397,6 +3397,8 @@ impl HybridBlock {
     ///   лимита threadgroup memory 32KB)
     fn forward_prefill(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, _seq_len, _n_embd) = x.dims3()?;
+        let trace = crate::scheduler::trace_on();
+        let t_mix = std::time::Instant::now();
 
         // Pre-norm (batch — эффективно на GPU)
         let residual = x;
@@ -3416,12 +3418,21 @@ impl HybridBlock {
             }
         };
         let x = (layer_out + residual)?;
+        let t_mix_el = t_mix.elapsed();
 
         // FFN norm → MLP → residual (batch — эффективно на GPU)
+        let t_ffn = std::time::Instant::now();
         let residual = &x;
         let normed = self.ffn_norm.forward(&x)?;
         let ffn_out = self.ff.forward_prefill(&normed)?;
         let x = (ffn_out + residual)?;
+        if trace {
+            let mix_ms = t_mix_el.as_secs_f64() * 1000.0;
+            let ffn_ms = t_ffn.elapsed().as_secs_f64() * 1000.0;
+            if mix_ms + ffn_ms > 50.0 {
+                eprintln!("[pfb] mix={mix_ms:.1}ms ffn={ffn_ms:.1}ms");
+            }
+        }
 
         Ok(x)
     }
