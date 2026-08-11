@@ -2126,7 +2126,7 @@ impl DeltaNetLayer {
         // никакого CPU-sync. Fused batch-kernel (как Metal GDN) — фаза 2 (perf).
         // ═══════════════════════════════════════════════════════════════════
         #[cfg(feature = "cuda")]
-        if let Some(ctx) = &self.cuda_ctx {
+        if let Some(ctx) = &mut self.cuda_ctx {
             // Fused prefill: 4 launch'а на всю последовательность (рекуррентность
             // циклом внутри delta_rule_prefill). Fallback на token-by-token —
             // env QWEN36_DISABLE_FUSED_PREFILL=1 (откат при регрессии).
@@ -2136,7 +2136,7 @@ impl DeltaNetLayer {
             if !disable_fused {
                 let gated_all = delta_rule_cuda::dispatch_delta_rule_prefill(
                     &ctx.dev,
-                    &ctx.layer_state,
+                    &mut ctx.layer_state,
                     &ctx.params,
                     &qkv_t,
                     &z_t,

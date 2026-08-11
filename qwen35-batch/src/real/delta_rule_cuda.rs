@@ -322,7 +322,7 @@ pub fn cuda_device_of(t: &Tensor) -> Result<CudaDevice> {
 // ═══════════════════════════════════════════════════════════════
 pub fn dispatch_delta_rule_prefill(
     dev: &CudaDevice,
-    state: &DeltaNetCudaState,
+    state: &mut DeltaNetCudaState,
     params: &DeltaParams,
     qkv_t: &Tensor,   // [1, T, channels]
     z_t: &Tensor,     // [1, T, value_dim]
