@@ -78,7 +78,7 @@ pub struct DeltaNetCudaTempBatched {
     /// Кэш slot_ids на device (пересоздаётся только при смене состава батча).
     /// Раньше clone_htod делал H2D+alloc на КАЖДЫЙ блок на КАЖДЫЙ шаг —
     /// ~350µs × 30-48 блоков = доминирующий overhead decode-шага (A100 замер).
-    pub slot_ids_cache: std::cell::RefCell<Option<(std::sync::Arc<CudaSlice<u32>>, Vec<u32>)>>,
+    pub slot_ids_cache: std::sync::Mutex<Option<(std::sync::Arc<CudaSlice<u32>>, Vec<u32>)>>,
     /// B — capacity (slot count), фиксированная при аллокации.
     pub capacity_b: u32,
 }
@@ -143,7 +143,7 @@ pub fn create_temp_buffers_batched(
         gate: dev.alloc_zeros::<f32>(b * n_v)?,
         delta_output: dev.alloc_zeros::<f32>(b * n_v * hvd)?,
         gated_output: dev.alloc_zeros::<f32>(b * value_dim)?,
-        slot_ids_cache: std::cell::RefCell::new(None),
+        slot_ids_cache: std::sync::Mutex::new(None),
         capacity_b,
     })
 }
@@ -241,7 +241,7 @@ pub fn dispatch_delta_rule_batched(
         b,
     };
     let slot_ids_arc = {
-        let mut cache = temp.slot_ids_cache.borrow_mut();
+        let mut cache = temp.slot_ids_cache.lock().expect("slot_ids cache");
         let stale = match &*cache {
             Some((_, ids)) => ids.as_slice() != slot_ids,
             None => true,
