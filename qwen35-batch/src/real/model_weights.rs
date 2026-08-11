@@ -3213,7 +3213,9 @@ impl GatedAttentionLayer {
                 // на длинном KV). Иначе FA2.
                 #[cfg(feature = "cuda")]
                 {
-                    if kv_len >= 2048 {
+                    let splitk_ok = kv_len >= 2048
+                        && std::env::var("QWEN36_DISABLE_SPLITK_DECODE").is_err();
+                    if splitk_ok {
                         super::flash_decode_cuda::dispatch_flash_decode(
                             device.as_cuda_device()?,
                             &q,
