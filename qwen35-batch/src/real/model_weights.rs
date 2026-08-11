@@ -418,15 +418,17 @@ macro_rules! prefill_loop_multi_cb {
                 }
             }
             if (i + 1) % $every == 0 {
-                log::info!(
-                    "[Qwen3.5/profile] Layers {}-{}: DeltaNet {:.1}ms ({}), Attn {:.1}ms ({})",
-                    i + 2 - $every,
-                    i + 1,
-                    _delta_us as f64 / 1000.0,
-                    _delta_cnt,
-                    _attn_us as f64 / 1000.0,
-                    _attn_cnt,
-                );
+                if crate::scheduler::trace_on() {
+                    eprintln!(
+                        "[pf] layers {}-{}: delta {:.1}ms ({}), attn {:.1}ms ({})",
+                        i + 2 - $every,
+                        i + 1,
+                        _delta_us as f64 / 1000.0,
+                        _delta_cnt,
+                        _attn_us as f64 / 1000.0,
+                        _attn_cnt,
+                    );
+                }
                 _delta_us = 0;
                 _attn_us = 0;
                 _delta_cnt = 0;
