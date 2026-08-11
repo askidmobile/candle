@@ -940,6 +940,7 @@ impl QCudaStorage {
         );
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
             if iq_type && dequant_cache_enabled() {
+                use crate::backend::BackendStorage;
                 let w = self.cached_dequant_f32(nrows * ncols)?;
                 let weight_l = crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
                     .broadcast_as((b, ncols, nrows))?;
