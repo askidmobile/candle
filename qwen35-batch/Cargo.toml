@@ -28,6 +28,7 @@ objc2-foundation = "0.3.2"
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 candle-kernels = { path = "../candle-kernels", optional = true }
 cudarc = { workspace = true, optional = true }
+candle-flash-attn = { path = "../candle-flash-attn", optional = true }
 
 [features]
 # Активировать адаптер реальной Qwen3.5 модели (GGUF loader + port quantized_qwen35).
@@ -39,6 +40,7 @@ cuda = [
     "candle-nn/cuda",
     "dep:candle-kernels",
     "dep:cudarc",
+    "dep:candle-flash-attn",
 ]
 
 [[test]]
