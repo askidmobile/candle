@@ -60,7 +60,8 @@ pub struct Slot {
     /// Текущая абсолютная позиция в последовательности (= prefill_done + generated.len()).
     /// Нужна модели для RoPE index_pos и append'а KV-cache.
     /// Возрастает на 1 за decode-шаг; во время prefill — растёт на размер чанка.
-    index_pos: usize,
+    /// pub(crate): scheduler выставляет при primed-admit (prefix cache).
+    pub(crate) index_pos: usize,
 }
 
 impl Slot {

@@ -135,6 +135,35 @@ impl<M: BatchModel> BatchScheduler<M> {
         None
     }
 
+    /// Prefix-cache admit: snapshot уже покрывает `primed_prefix_len` токенов
+    /// prompt'а. Слот стартует в Prefilling с prefill_done = primed_prefix_len —
+    /// остаётся ОДИН токен (последний), который прогоняется через модель после
+    /// restore snapshot'а (adapter.prefill_chunk, reset_first=false).
+    /// Caller обязан внедрить snapshot через `model_mut().inject_slot_snapshot`
+    /// сразу после возврата индекса слота.
+    pub fn submit_primed(
+        &mut self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        primed_prefix_len: usize,
+    ) -> Option<usize> {
+        debug_assert!(primed_prefix_len + 1 == prompt.len());
+        let req = SlotRequest {
+            prompt,
+            max_new,
+            eos: self.eos,
+        };
+        if let Some(idx) = self.idle_slot() {
+            self.slots[idx].admit(req);
+            self.slots[idx].prefill_done = primed_prefix_len;
+            self.slots[idx].index_pos = primed_prefix_len;
+            return Some(idx);
+        }
+        // В очередь primed не поддерживаем (snapshot injection привязан к слоту);
+        // caller должен обрабатывать None как cache-miss → обычный submit.
+        None
+    }
+
     fn idle_slot(&self) -> Option<usize> {
         self.slots
             .iter()

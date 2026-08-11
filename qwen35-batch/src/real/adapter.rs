@@ -122,6 +122,19 @@ impl Qwen35BatchAdapter {
         Ok(a)
     }
 
+    /// Prefix-cache инфраструктура: snapshot state последнего prefill'а слота.
+    /// Сервер забирает его в LRU-кэш; при повторном prompt'е — inject + primed admit.
+    pub fn slot_snapshot(&self, slot: usize) -> Option<StateSnapshot> {
+        self.slot_snaps[slot].clone()
+    }
+
+    /// Внедрить snapshot слоту (prefix-cache hit): при следующем prefill_chunk
+    /// с reset_first=false модель восстановит state из этого snapshot'а.
+    pub fn inject_slot_snapshot(&mut self, slot: usize, snap: StateSnapshot) {
+        self.slot_snaps[slot] = Some(snap);
+        self.slot_seeded[slot] = false;
+    }
+
     /// Делегированный доступ к модели (для profiling / debug_capture).
     pub fn model(&self) -> &ModelWeights {
         &self.model
