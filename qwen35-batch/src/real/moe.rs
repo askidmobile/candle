@@ -304,6 +304,23 @@ impl MoeBackend {
 /// Работает для K-quants/Q8_0 экспертов (35B UD-Q4_K_M). IQ2_XXS — нет ядра.
 #[cfg(feature = "cuda")]
 fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) -> Result<Tensor> {
+    // UD-кванты динамические: часть тензоров может быть IQ (нет indexed ядра) —
+    // такие блоки идём через reference (per-tensor fallback, не весь запрос).
+    use candle_core::quantized::GgmlDType;
+    let supported = |qt: &Arc<QTensor>| {
+        matches!(
+            qt.dtype(),
+            GgmlDType::Q8_0
+                | GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+        )
+    };
+    if !(supported(&experts.gate) && supported(&experts.up) && supported(&experts.down)) {
+        return reference_routed_swiglu(xs, experts, route);
+    }
     let (n_tokens, n_embd) = xs.dims2()?;
     let topk = route.experts.first().map(|e| e.len()).unwrap_or(0);
     if n_tokens == 0 || topk == 0 {
