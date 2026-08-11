@@ -71,6 +71,12 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **Dispatch path** (confirmed correct): `QMatMul::forward` → `cuda_fwd` (mod.rs:952-1035 CustomOp1) → for IQ types, fallback to `dequantize + cuBLAS` matmul in `cuda.rs:765`.
 - **Model forward path** (`model_weights.rs:5009-5024`): `forward_inner` → `emb_cpu = tok_embeddings.forward(x)` (returns CPU f32) → `layer_in = emb_cpu.to_device(x.device())`. If `x.device()` = CUDA → `layer_in` on CUDA → all `QMatMul` weights already on CUDA (loaded via `load_heavy` with CUDA device).
 
+### CUDA kernel gotchas (2026-08-11)
+
+- **Race в split-K flash-decode (flash_decode.cu)**: первая версия делила `m_shared`/`l_shared` между warps блока — 4 warp'а писали разные dot в одни скаляры → коррупция attention при kv≥2048 → генерация сыпалась в мусор на длине. Фикс: warp = независимый сплиттер, m/l в регистрах (lane-uniform через `__shfl_xor`), partials ×4 на сплит. **Правило: shared-скаляры между warps с разными данными — запрещены; только per-warp регистры + combine.**
+- **Проверка деградации текстом**: uniq-3gram НЕ ловит цифро-мусор («2222», «( ( (»). Всегда читать хвост генерации глазами на 3K+ токенов.
+- **Build trap**: новый `.cu` в candle-kernels без `rerun-if-changed` → ptx.rs не перегенерируется, kernel не найден. build.rs теперь следит за всеми `src/*.cu`.
+
 ### Tokenizer GGUF gotchas (2026-08-09)
 
 - **GGUF vocab хранит byte-mapped строки** (GPT-2 bytes_to_unicode): пробел = `Ġ`(U+0120), байт 0xF0 = `ð`(U+00F0), 0x9F = `Ł`(U+0141). Emoji разрезан BPE на частичные UTF-8 куски (`ĠðŁ` + `Ĳ±`).
