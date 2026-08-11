@@ -207,8 +207,16 @@ fn dequantize_f32_rowslice(
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", 256),
         GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", 256),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", 256),
+        // K-quants и Q8_0 — для MoE reference rowslice (Q8_0 эксперты).
+        GgmlDType::Q2K => ("dequantize_block_q2_K_f32", 64),
+        GgmlDType::Q3K => ("dequantize_block_q3_K_f32", 64),
+        GgmlDType::Q4K => ("dequantize_block_q4_K_f32", 32),
+        GgmlDType::Q5K => ("dequantize_block_q5_K_f32", 64),
+        GgmlDType::Q6K => ("dequantize_block_q6_K_f32", 64),
+        GgmlDType::Q8_0 => ("dequantize_block_q8_0_f32", 32),
         _ => crate::bail!("unsupported dtype for rowslice dequant: {dtype:?}"),
     };
+    let is_k = !matches!(dtype, GgmlDType::Q8_0);
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
     let dst = unsafe { dev.alloc::<f32>(elem_count)? };
     let cfg = cudarc::driver::LaunchConfig {
@@ -220,6 +228,10 @@ fn dequantize_f32_rowslice(
     let mut builder = func.builder();
     builder.arg(&src_view);
     builder.arg(&dst);
+    if !is_k {
+        // non-k ядра ждут nb32 (число 32-элементных блоков).
+        barg!(builder, (elem_count / 32) as i32);
+    }
     unsafe { builder.launch(cfg) }.w()?;
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
