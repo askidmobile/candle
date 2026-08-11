@@ -5398,8 +5398,25 @@ impl ModelWeights {
                 result?;
             }
             #[cfg(not(target_os = "macos"))]
-            for block in self.blocks.iter_mut() {
-                layer_in = block.forward_prefill(&layer_in, index_pos)?;
+            {
+                let trace = crate::scheduler::trace_on();
+                let mut d_ms = 0f64;
+                let mut a_ms = 0f64;
+                for (bi, block) in self.blocks.iter_mut().enumerate() {
+                    let t0 = std::time::Instant::now();
+                    layer_in = block.forward_prefill(&layer_in, index_pos)?;
+                    if trace {
+                        let el = t0.elapsed().as_secs_f64() * 1000.0;
+                        if block.is_deltanet() { d_ms += el; } else { a_ms += el; }
+                        if el > 50.0 {
+                            eprintln!("[pf] slow block {bi} {} {el:.1}ms",
+                                if block.is_deltanet() { "delta" } else { "attn" });
+                        }
+                    }
+                }
+                if trace {
+                    eprintln!("[pf] chunk blocks: delta={d_ms:.1}ms attn={a_ms:.1}ms");
+                }
             }
             #[cfg(target_os = "macos")]
             if let Some(dev) = &metal_dev {
@@ -5685,8 +5702,25 @@ impl ModelWeights {
                 result?;
             }
             #[cfg(not(target_os = "macos"))]
-            for block in self.blocks.iter_mut() {
-                layer_in = block.forward_prefill(&layer_in, index_pos)?;
+            {
+                let trace = crate::scheduler::trace_on();
+                let mut d_ms = 0f64;
+                let mut a_ms = 0f64;
+                for (bi, block) in self.blocks.iter_mut().enumerate() {
+                    let t0 = std::time::Instant::now();
+                    layer_in = block.forward_prefill(&layer_in, index_pos)?;
+                    if trace {
+                        let el = t0.elapsed().as_secs_f64() * 1000.0;
+                        if block.is_deltanet() { d_ms += el; } else { a_ms += el; }
+                        if el > 50.0 {
+                            eprintln!("[pf] slow block {bi} {} {el:.1}ms",
+                                if block.is_deltanet() { "delta" } else { "attn" });
+                        }
+                    }
+                }
+                if trace {
+                    eprintln!("[pf] chunk blocks: delta={d_ms:.1}ms attn={a_ms:.1}ms");
+                }
             }
             #[cfg(target_os = "macos")]
             if let Some(dev) = &metal_dev {
