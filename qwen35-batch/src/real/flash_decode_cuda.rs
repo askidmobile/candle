@@ -59,7 +59,7 @@ pub fn dispatch_flash_decode(
     };
 
     let mut partials = unsafe {
-        dev.alloc::<f32>(n_head * splits as usize * (2 + hd))?
+        dev.alloc::<f32>(n_head * splits as usize * 4 * (2 + hd))?
     };
     let out = unsafe { dev.alloc::<half::f16>(n_head * hd)? };
 
