@@ -2127,6 +2127,24 @@ impl DeltaNetLayer {
         // ═══════════════════════════════════════════════════════════════════
         #[cfg(feature = "cuda")]
         if let Some(ctx) = &self.cuda_ctx {
+            // Fused prefill: 4 launch'а на всю последовательность (рекуррентность
+            // циклом внутри delta_rule_prefill). Fallback на token-by-token —
+            // env QWEN36_DISABLE_FUSED_PREFILL=1 (откат при регрессии).
+            let disable_fused = std::env::var("QWEN36_DISABLE_FUSED_PREFILL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !disable_fused {
+                let gated_all = delta_rule_cuda::dispatch_delta_rule_prefill(
+                    &ctx.dev,
+                    &ctx.layer_state,
+                    &ctx.params,
+                    &qkv_t,
+                    &z_t,
+                    &beta_t,
+                    &alpha_t,
+                )?;
+                return self.ssm_out.forward(&gated_all);
+            }
             let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
             for t in 0..seq_len {
                 let qkv_tok = qkv_t.narrow(1, t, 1)?; // [1,1,channels]

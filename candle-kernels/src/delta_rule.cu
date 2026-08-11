@@ -306,3 +306,191 @@ extern "C" __global__ void delta_norm_gate_kernel(
     float z_val = z[idx];
     gated_output[idx] = normed * silu_f(z_val);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// PREFILL (fused, single-slot): вся последовательность за 4 launch'а
+// вместо 4 × T (token-by-token). Рекуррентность сохраняется циклом
+// внутри kernel 3 (state в global, горячо в L2).
+// ═══════════════════════════════════════════════════════════════
+
+// P1: causal depthwise conv1d + SiLU по всей последовательности + beta/gate prep.
+// grid = (ceil(channels/256), T), block = (256).
+// Хвост до t<conv_k-1 читается из persistent conv_state.
+extern "C" __global__ void delta_conv1d_prefill(
+    const float* __restrict__ qkv_raw,      // [T * channels]
+    const float* __restrict__ beta_raw,     // [T * n_v_heads]
+    const float* __restrict__ alpha_raw,    // [T * n_v_heads]
+    const float* __restrict__ conv_weights, // [channels * conv_k]
+    const float* __restrict__ dt_bias,      // [n_v_heads]
+    const float* __restrict__ ssm_a,        // [n_v_heads]
+    const float* __restrict__ conv_state,   // [(conv_k-1) * channels] persistent
+    float* __restrict__ qkv_conv_out,       // [T * channels]
+    float* __restrict__ beta_out,           // [T * n_v_heads]
+    float* __restrict__ gate_out,           // [T * n_v_heads]
+    const DeltaParams params,
+    const unsigned int T
+) {
+    const unsigned int t = blockIdx.y;
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int channels = params.channels;
+    const unsigned int conv_k = params.conv_kernel;
+    const unsigned int n_v = params.n_v_heads;
+    if (t >= T) return;
+
+    if (ch < channels) {
+        float sum = 0.0f;
+        for (unsigned int j = 0; j < conv_k; j++) {
+            const int src = (int)t - (int)(conv_k - 1) + (int)j;
+            float x;
+            if (src >= 0) {
+                x = qkv_raw[(unsigned int)src * channels + ch];
+            } else {
+                // хвост persistent conv_state: индексы [0, conv_k-1)
+                x = conv_state[(unsigned int)((int)(conv_k - 1) + src) * channels + ch];
+            }
+            sum += x * conv_weights[ch * conv_k + j];
+        }
+        qkv_conv_out[t * channels + ch] = silu_f(sum);
+    }
+    if (ch < n_v) {
+        const unsigned int idx = t * n_v + ch;
+        beta_out[idx] = sigmoid_f(beta_raw[idx]);
+        gate_out[idx] = softplus_f(alpha_raw[idx] + dt_bias[ch]) * ssm_a[ch];
+    }
+}
+
+// P2: L2 norm Q/K + expand + scale по всей последовательности.
+// grid = (n_v_heads, T), block = (head_k_dim).
+extern "C" __global__ void delta_l2_norm_prefill(
+    const float* __restrict__ qkv_conv, // [T * channels]
+    float* __restrict__ q_out,          // [T * n_v_heads * head_k_dim]
+    float* __restrict__ k_out,          // [T * n_v_heads * head_k_dim]
+    float* __restrict__ v_out,          // [T * n_v_heads * head_v_dim]
+    const DeltaParams params,
+    const unsigned int T
+) {
+    const unsigned int head_v = blockIdx.x;
+    const unsigned int t = blockIdx.y;
+    const unsigned int dim = threadIdx.x;
+    if (t >= T) return;
+    const unsigned int hkd = params.head_k_dim;
+    const unsigned int hvd = params.head_v_dim;
+    const unsigned int key_dim = params.key_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int channels = params.channels;
+    const unsigned int head_k = head_v % params.n_k_heads;
+
+    const unsigned int base = t * channels;
+    __shared__ float sq_q[128];
+    __shared__ float sq_k[128];
+
+    const float q_val = qkv_conv[base + head_k * hkd + dim];
+    const float k_val = qkv_conv[base + key_dim + head_k * hkd + dim];
+    sq_q[dim] = q_val * q_val;
+    sq_k[dim] = k_val * k_val;
+    __syncthreads();
+    for (unsigned int stride = hkd / 2; stride > 0; stride >>= 1) {
+        if (dim < stride) {
+            sq_q[dim] += sq_q[dim + stride];
+            sq_k[dim] += sq_k[dim + stride];
+        }
+        __syncthreads();
+    }
+    const float q_inv = rsqrtf(sq_q[0] + 1e-6f);
+    const float k_inv = rsqrtf(sq_k[0] + 1e-6f);
+
+    q_out[(t * n_v + head_v) * hkd + dim] = q_val * q_inv * params.q_scale;
+    k_out[(t * n_v + head_v) * hkd + dim] = k_val * k_inv;
+    v_out[(t * n_v + head_v) * hvd + dim] = qkv_conv[base + key_dim * 2 + head_v * hvd + dim];
+}
+
+// P3: рекуррентный delta rule по всей последовательности — цикл внутри kernel.
+// grid = (n_v_heads), block = (head_v_dim). state persistent [n_v, hd, hd].
+extern "C" __global__ void delta_rule_prefill(
+    const float* __restrict__ q,     // [T * n_v * hkd]
+    const float* __restrict__ k,     // [T * n_v * hkd]
+    const float* __restrict__ v,     // [T * n_v * hvd]
+    const float* __restrict__ beta,  // [T * n_v]
+    const float* __restrict__ gate,  // [T * n_v]
+    float* __restrict__ ssm_state,   // [n_v * hd * hd] persistent
+    float* __restrict__ output,      // [T * n_v * hvd]
+    const DeltaParams params,
+    const unsigned int T
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int col = threadIdx.x;
+    const unsigned int hd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const unsigned int hkd = params.head_k_dim;
+
+    const unsigned int state_base = head * hd * hd;
+    __shared__ float shared_sk[128];
+    __shared__ float shared_d[128];
+
+    for (unsigned int t = 0; t < T; t++) {
+        const unsigned int kv_base = (t * n_v + head) * hkd;
+        const unsigned int out_base = (t * n_v + head) * hd;
+        const float gate_exp = __expf(gate[t * n_v + head]);
+        const float beta_h = beta[t * n_v + head];
+
+        // 1. decay
+        for (unsigned int row = 0; row < hd; row++) {
+            ssm_state[state_base + row * hd + col] *= gate_exp;
+        }
+        // 2. sk = S^T k
+        float sk_val = 0.0f;
+        for (unsigned int row = 0; row < hd; row++) {
+            sk_val += ssm_state[state_base + row * hd + col] * k[kv_base + row];
+        }
+        shared_sk[col] = sk_val;
+        __syncthreads();
+        // 3. d = (v - sk) * beta
+        shared_d[col] = (v[out_base + col] - shared_sk[col]) * beta_h;
+        __syncthreads();
+        // 4. rank-1 update
+        const float d_col = shared_d[col];
+        for (unsigned int row = 0; row < hd; row++) {
+            ssm_state[state_base + row * hd + col] += k[kv_base + row] * d_col;
+        }
+        // 5. out = S^T q
+        float out_val = 0.0f;
+        for (unsigned int row = 0; row < hd; row++) {
+            out_val += ssm_state[state_base + row * hd + col] * q[kv_base + row];
+        }
+        output[out_base + col] = out_val;
+        __syncthreads();
+    }
+}
+
+// P4: group RMS norm + SiLU(z) gate по всей последовательности.
+// grid = (n_v_heads, T), block = (head_v_dim).
+extern "C" __global__ void delta_norm_gate_prefill(
+    const float* __restrict__ raw_output,  // [T * n_v * hvd]
+    const float* __restrict__ z,           // [T * value_dim]
+    const float* __restrict__ norm_weight, // [hvd]
+    float* __restrict__ gated_output,      // [T * value_dim]
+    const DeltaParams params,
+    const unsigned int T
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int t = blockIdx.y;
+    const unsigned int dim = threadIdx.x;
+    if (t >= T) return;
+    const unsigned int hvd = params.head_v_dim;
+    const unsigned int n_v = params.n_v_heads;
+    const float eps = params.rms_norm_eps;
+
+    const unsigned int idx = (t * n_v + head) * hvd + dim;
+    const unsigned int z_idx = t * params.value_dim + head * hvd + dim;
+
+    __shared__ float sq_vals[128];
+    const float val = raw_output[idx];
+    sq_vals[dim] = val * val;
+    __syncthreads();
+    for (unsigned int stride = hvd / 2; stride > 0; stride >>= 1) {
+        if (dim < stride) sq_vals[dim] += sq_vals[dim + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(sq_vals[0] / (float)hvd + eps);
+    gated_output[z_idx] = val * inv_rms * norm_weight[dim] * silu_f(z[z_idx]);
+}

@@ -314,3 +314,151 @@ pub fn cuda_device_of(t: &Tensor) -> Result<CudaDevice> {
         _ => candle_core::bail!("delta_rule_cuda: ожидался CUDA device"),
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Fused prefill: 4 launch'а на всю последовательность (single-slot).
+// Рекуррентность — циклом внутри delta_rule_prefill (state горячит в L2).
+// Заменяет token-by-token цикл (4 launch × T × 30-48 слоёв).
+// ═══════════════════════════════════════════════════════════════
+pub fn dispatch_delta_rule_prefill(
+    dev: &CudaDevice,
+    state: &DeltaNetCudaState,
+    params: &DeltaParams,
+    qkv_t: &Tensor,   // [1, T, channels]
+    z_t: &Tensor,     // [1, T, value_dim]
+    beta_t: &Tensor,  // [1, T, n_v_heads]
+    alpha_t: &Tensor, // [1, T, n_v_heads]
+) -> Result<Tensor> {
+    let channels = params.channels as usize;
+    let n_v = params.n_v_heads as usize;
+    let hkd = params.head_k_dim as usize;
+    let hvd = params.head_v_dim as usize;
+    let value_dim = params.value_dim as usize;
+    let conv_k = params.conv_kernel as usize;
+
+    let qkv_f = ensure_f32(qkv_t)?.contiguous()?;
+    let z_f = ensure_f32(z_t)?.contiguous()?;
+    let beta_f = ensure_f32(beta_t)?.contiguous()?;
+    let alpha_f = ensure_f32(alpha_t)?.contiguous()?;
+    let (_, t_len, _) = qkv_f.dims3()?;
+    let t_u32 = t_len as u32;
+
+    let (qkv_st, qkv_lay) = qkv_f.storage_and_layout();
+    let (z_st, z_lay) = z_f.storage_and_layout();
+    let (beta_st, beta_lay) = beta_f.storage_and_layout();
+    let (alpha_st, alpha_lay) = alpha_f.storage_and_layout();
+    let qkv_v = cuda_slice_view(&qkv_st, qkv_lay.start_offset())?;
+    let z_v = cuda_slice_view(&z_st, z_lay.start_offset())?;
+    let beta_v = cuda_slice_view(&beta_st, beta_lay.start_offset())?;
+    let alpha_v = cuda_slice_view(&alpha_st, alpha_lay.start_offset())?;
+
+    // Scratch под последовательность (driver pool переиспользует).
+    let mut qkv_conv = unsafe { dev.alloc::<f32>(t_len * channels)? };
+    let beta_a = unsafe { dev.alloc::<f32>(t_len * n_v)? };
+    let gate_a = unsafe { dev.alloc::<f32>(t_len * n_v)? };
+    let q_a = unsafe { dev.alloc::<f32>(t_len * n_v * hkd)? };
+    let k_a = unsafe { dev.alloc::<f32>(t_len * n_v * hkd)? };
+    let v_a = unsafe { dev.alloc::<f32>(t_len * n_v * hvd)? };
+    let raw_out = unsafe { dev.alloc::<f32>(t_len * value_dim)? };
+    let gated = unsafe { dev.alloc::<f32>(t_len * value_dim)? };
+
+    let p = *params;
+
+    // P1: conv1d по всей последовательности.
+    {
+        let func = dev.get_or_load_func("delta_conv1d_prefill", &candle_kernels::DELTA_RULE)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((channels as u32).div_ceil(256), t_u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&qkv_v);
+        b.arg(&beta_v);
+        b.arg(&alpha_v);
+        b.arg(&state.conv_weights);
+        b.arg(&state.dt_bias);
+        b.arg(&state.ssm_a);
+        b.arg(&state.conv_state);
+        b.arg(&qkv_conv);
+        b.arg(&beta_a);
+        b.arg(&gate_a);
+        b.arg(&p);
+        b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // P2: L2 norm + expand + scale.
+    {
+        let func = dev.get_or_load_func("delta_l2_norm_prefill", &candle_kernels::DELTA_RULE)?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v as u32, t_u32, 1),
+            block_dim: (hkd as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&qkv_conv);
+        b.arg(&q_a);
+        b.arg(&k_a);
+        b.arg(&v_a);
+        b.arg(&p);
+        b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // P3: рекуррентный delta rule, цикл внутри kernel.
+    {
+        let func = dev.get_or_load_func("delta_rule_prefill", &candle_kernels::DELTA_RULE)?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v as u32, 1, 1),
+            block_dim: (hvd as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&q_a);
+        b.arg(&k_a);
+        b.arg(&v_a);
+        b.arg(&beta_a);
+        b.arg(&gate_a);
+        b.arg(&state.ssm_state);
+        b.arg(&raw_out);
+        b.arg(&p);
+        b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // P4: group RMS norm + SiLU gate.
+    {
+        let func = dev.get_or_load_func("delta_norm_gate_prefill", &candle_kernels::DELTA_RULE)?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v as u32, t_u32, 1),
+            block_dim: (hvd as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&raw_out);
+        b.arg(&z_v);
+        b.arg(&state.norm_weight);
+        b.arg(&gated);
+        b.arg(&p);
+        b.arg(&t_u32);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // Persistent conv_state ← последние (conv_k-1) СЫРЫХ входов.
+    if t_len >= conv_k - 1 {
+        let src_off = (t_len - (conv_k - 1)) * channels;
+        let src = qkv_v.slice(src_off..src_off + (conv_k - 1) * channels);
+        dev.cuda_stream()
+            .memcpy_dtod(&src, &mut state.conv_state.slice_mut(..))
+            .map_err(candle_core::Error::wrap)?;
+    }
+
+    drop((qkv_st, z_st, beta_st, alpha_st));
+
+    let storage = CudaStorage::wrap_cuda_slice(gated, dev.clone());
+    Ok(Tensor::from((
+        Storage::Cuda(storage),
+        (1usize, t_len, value_dim),
+    )))
+}
