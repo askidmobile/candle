@@ -330,8 +330,8 @@ impl Qwen35MoeBlock {
         // ДИАГНОСТИКА (trace): сверка GPU-маршрута с CPU reference.
         if crate::scheduler::trace_on() {
             let route_ref = self.router.route_topk(xs)?;
-            let gpu_ids: Vec<u32> = ids_t.to_vec2::<u32>()?;
-            let gpu_w: Vec<f32> = w_t.to_vec2::<f32>()?;
+            let gpu_ids: Vec<u32> = ids_t.to_vec2::<u32>()?.concat();
+            let gpu_w: Vec<f32> = w_t.to_vec2::<f32>()?.concat();
             let cpu_ids: Vec<u32> = route_ref
                 .experts
                 .iter()
