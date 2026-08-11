@@ -1874,6 +1874,7 @@ impl DeltaNetLayer {
         }
 
         // ── CPU fallback: per-slot loop через cpu_state_batched (без batched GPU ctx) ──
+        #[cfg(feature = "cuda")]
         if crate::scheduler::trace_on() {
             eprintln!("[fdb] DeltaNet decode: CPU fallback (cuda_ctx_batched={})",
                 self.cuda_ctx_batched.is_some());
