@@ -973,7 +973,21 @@ impl QuantizedEmbedding {
                     }
                 }
                 other => {
-                    candle_core::bail!("QuantizedEmbedding: unsupported dtype {:?}", other);
+                    // BF16 (полные GGUF): 2 байта как и F16, другая раскладка.
+                    if other == GgmlDType::BF16 {
+                        let row_start = tid as usize * self.n_cols * 2;
+                        let src = unsafe {
+                            std::slice::from_raw_parts(
+                                raw[row_start..].as_ptr() as *const half::bf16,
+                                self.n_cols,
+                            )
+                        };
+                        for (dst, &s) in out_slice.iter_mut().zip(src) {
+                            *dst = s.to_f32();
+                        }
+                    } else {
+                        candle_core::bail!("QuantizedEmbedding: unsupported dtype {:?}", other);
+                    }
                 }
             }
         }
