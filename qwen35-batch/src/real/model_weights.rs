@@ -3074,10 +3074,12 @@ impl GatedAttentionLayer {
             let q = self.apply_partial_rotary_emb(&q, pos)?;
             let k = self.apply_partial_rotary_emb(&k, pos)?;
 
-            // KV-cache append (per-slot). Q8_0 квантование (см. Q8KvCache):
-            // память и bandwidth вдвое меньше F16.
-            let (kq, ks) = q8_quantize_rows(&k)?;
-            let (vq, vs) = q8_quantize_rows(&v)?;
+            // KV-cache append (per-slot). Q8_0 квантование, layout HEAD-LAST
+            // [1, cap, n_kv, hd] — flash-attn читает узким срезом без копий.
+            let k_hl = k.transpose(1, 2)?.contiguous()?; // [1, 1, n_kv, hd]
+            let v_hl = v.transpose(1, 2)?.contiguous()?;
+            let (kq, ks) = q8_quantize_rows(&k_hl)?;
+            let (vq, vs) = q8_quantize_rows(&v_hl)?;
 
             let need_init = self.kv_cache_batched[slot].is_none();
             if need_init {
@@ -3085,21 +3087,21 @@ impl GatedAttentionLayer {
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
                 let k_q = Tensor::zeros(
-                    (1, self.n_kv_head, init_cap, self.head_dim),
+                    (1, init_cap, self.n_kv_head, self.head_dim),
                     DType::U8, &device,
                 )?;
                 let k_s = Tensor::zeros(
-                    (1, self.n_kv_head, init_cap, 1),
+                    (1, init_cap, self.n_kv_head, 1),
                     DType::F32, &device,
                 )?;
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
                 let v_q = Tensor::zeros(
-                    (1, self.n_kv_head, init_cap, self.head_dim),
+                    (1, init_cap, self.n_kv_head, self.head_dim),
                     DType::U8, &device,
                 )?;
                 let v_s = Tensor::zeros(
-                    (1, self.n_kv_head, init_cap, 1),
+                    (1, init_cap, self.n_kv_head, 1),
                     DType::F32, &device,
                 )?;
                 self.kv_cache_batched[slot] = Some(Q8KvCache { k_q, k_s, v_q, v_s });
@@ -3109,21 +3111,16 @@ impl GatedAttentionLayer {
 
             let cache_len = self.kv_cache_len_batched[slot];
             let new_len = cache_len + seq_len;
-            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().k_q.dim(2)?;
+            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().k_q.dim(1)?;
 
             if seq_len == 1 && new_len > self.attn_window {
                 // Sliding window eviction (decode): отбрасываем 1 старый, пишем 1 новый.
                 let keep = self.attn_window - 1;
                 let c = self.kv_cache_batched[slot].as_mut().unwrap();
-                for (buf, src) in [(&c.k_q, &kq), (&c.v_q, &vq)] {
-                    let old = buf.narrow(2, 1, keep)?.contiguous()?;
-                    buf.slice_set(&old, 2, 0)?;
-                    buf.slice_set(src, 2, keep)?;
-                }
-                for (buf, src) in [(&c.k_s, &ks), (&c.v_s, &vs)] {
-                    let old = buf.narrow(2, 1, keep)?.contiguous()?;
-                    buf.slice_set(&old, 2, 0)?;
-                    buf.slice_set(src, 2, keep)?;
+                for (buf, src) in [(&c.k_q, &kq), (&c.v_q, &vq), (&c.k_s, &ks), (&c.v_s, &vs)] {
+                    let old = buf.narrow(1, 1, keep)?.contiguous()?;
+                    buf.slice_set(&old, 1, 0)?;
+                    buf.slice_set(src, 1, keep)?;
                 }
                 self.kv_cache_len_batched[slot] = self.attn_window;
             } else if new_len > current_cap {
@@ -3132,7 +3129,7 @@ impl GatedAttentionLayer {
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
                 let mk = |dt: DType, last: usize| -> Result<Tensor> {
-                    Ok(Tensor::zeros((1, self.n_kv_head, new_cap, last), dt, &device)?)
+                    Ok(Tensor::zeros((1, new_cap, self.n_kv_head, last), dt, &device)?)
                 };
                 #[cfg(target_os = "macos")]
                 candle_core::skip_arena_next_alloc();
@@ -3141,14 +3138,14 @@ impl GatedAttentionLayer {
                 let c = self.kv_cache_batched[slot].as_ref().unwrap();
                 if cache_len > 0 {
                     for (dst, src) in [(&new_kq, &c.k_q), (&new_vq, &c.v_q), (&new_ks, &c.k_s), (&new_vs, &c.v_s)] {
-                        let old = src.narrow(2, 0, cache_len)?.contiguous()?;
-                        dst.slice_set(&old, 2, 0)?;
+                        let old = src.narrow(1, 0, cache_len)?.contiguous()?;
+                        dst.slice_set(&old, 1, 0)?;
                     }
                 }
-                new_kq.slice_set(&kq, 2, cache_len)?;
-                new_ks.slice_set(&ks, 2, cache_len)?;
-                new_vq.slice_set(&vq, 2, cache_len)?;
-                new_vs.slice_set(&vs, 2, cache_len)?;
+                new_kq.slice_set(&kq, 1, cache_len)?;
+                new_ks.slice_set(&ks, 1, cache_len)?;
+                new_vq.slice_set(&vq, 1, cache_len)?;
+                new_vs.slice_set(&vs, 1, cache_len)?;
                 self.kv_cache_batched[slot] = Some(Q8KvCache {
                     k_q: new_kq,
                     k_s: new_ks,
@@ -3160,41 +3157,38 @@ impl GatedAttentionLayer {
             } else {
                 // Обычный append.
                 let c = self.kv_cache_batched[slot].as_mut().unwrap();
-                c.k_q.slice_set(&kq, 2, cache_len)?;
-                c.k_s.slice_set(&ks, 2, cache_len)?;
-                c.v_q.slice_set(&vq, 2, cache_len)?;
-                c.v_s.slice_set(&vs, 2, cache_len)?;
+                c.k_q.slice_set(&kq, 1, cache_len)?;
+                c.k_s.slice_set(&ks, 1, cache_len)?;
+                c.v_q.slice_set(&vq, 1, cache_len)?;
+                c.v_s.slice_set(&vs, 1, cache_len)?;
                 self.kv_cache_len_batched[slot] = new_len;
             }
 
             let kv_len = self.kv_cache_len_batched[slot];
             let c = self.kv_cache_batched[slot].as_ref().unwrap();
             let k = q8_dequantize_rows(
-                &c.k_q.narrow(2, 0, kv_len)?.contiguous()?,
-                &c.k_s.narrow(2, 0, kv_len)?.contiguous()?,
-            )?;
+                &c.k_q.narrow(1, 0, kv_len)?.contiguous()?,
+                &c.k_s.narrow(1, 0, kv_len)?.contiguous()?,
+            )?; // [1, kv_len, n_kv, hd] — head-last, flash-ready
             let v = q8_dequantize_rows(
-                &c.v_q.narrow(2, 0, kv_len)?.contiguous()?,
-                &c.v_s.narrow(2, 0, kv_len)?.contiguous()?,
+                &c.v_q.narrow(1, 0, kv_len)?.contiguous()?,
+                &c.v_s.narrow(1, 0, kv_len)?.contiguous()?,
             )?;
 
-            // SDPA (seq_len=1, decode path — идентичен forward_attn).
+            // SDPA (seq_len=1, decode path). k/v — head-last [1, kv, n_kv, hd].
             let y = if q.device().is_metal() || q.device().is_cpu() {
                 let q = q.to_dtype(DType::F16)?.contiguous()?;
+                let k = k.transpose(1, 2)?;
+                let v = v.transpose(1, 2)?;
                 candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?
                     .to_dtype(DType::F32)?
             } else {
                 // CUDA: flash-attn v2 fused kernel (candle-flash-attn, FA2).
-                // Одно ядро вместо matmul+softmax+matmul+GQA-expand копий
-                // (GQA нативно: n_kv_head < n_head поддержан в FA2).
-                // Layout FA2: (batch, seq, heads, hd) — transpose+contiguous
-                // копии маленькие (q) и KV (F16, ~kv×4KB).
+                // k/v уже head-last contiguous — flash читает срез без копий.
                 #[cfg(feature = "cuda")]
                 {
                     let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
-                    let k_f = k.transpose(1, 2)?.contiguous()?;
-                    let v_f = v.transpose(1, 2)?.contiguous()?;
-                    candle_flash_attn::flash_attn(&q_f, &k_f, &v_f, scale as f32, false)?
+                    candle_flash_attn::flash_attn(&q_f, &k, &v, scale as f32, false)?
                         .transpose(1, 2)?
                         .to_dtype(DType::F32)?
                 }
@@ -5047,9 +5041,9 @@ impl ModelWeights {
                     match kv_opt {
                         Some(kv) => {
                             // Deep-clone K/V из snapshot в per-slot batched буфер
-                            // (Q8-квантование, как decode append path).
-                            let k = tensor_deep_clone(&kv.k)?;
-                            let v = tensor_deep_clone(&kv.v)?;
+                            // (Q8-квантование, head-last layout как decode path).
+                            let k = tensor_deep_clone(&kv.k)?.transpose(1, 2)?.contiguous()?;
+                            let v = tensor_deep_clone(&kv.v)?.transpose(1, 2)?.contiguous()?;
                             let (k_q, k_s) = q8_quantize_rows(&k)?;
                             let (v_q, v_s) = q8_quantize_rows(&v)?;
                             a.kv_cache_batched[slot] = Some(Q8KvCache { k_q, k_s, v_q, v_s });
