@@ -294,9 +294,17 @@ macro_rules! prefill_loop_wait {
     ($layer_in:ident, $blocks:expr, $pos:expr, $dev_opt:expr, literal $every:literal) => {{
         let mut _result: candle_core::Result<()> = Ok(());
         'prefill: for (i, block) in $blocks.iter_mut().enumerate() {
+            let __t0 = std::time::Instant::now();
             match block.forward_prefill(&$layer_in, $pos) {
                 Ok(t) => { $layer_in = t; }
                 Err(e) => { _result = Err(e); break 'prefill; }
+            }
+            let __el = __t0.elapsed();
+            if __el.as_millis() > 20 && crate::scheduler::trace_on() {
+                eprintln!(
+                    "[pf] slow block {i} {} {__el:?}",
+                    if matches!(block.layer, HybridLayerType::DeltaNet(_)) { "delta" } else { "attn" }
+                );
             }
             if (i + 1) % $every == 0 {
                 if let Some(dev) = $dev_opt {
