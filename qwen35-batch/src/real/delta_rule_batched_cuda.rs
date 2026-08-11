@@ -75,6 +75,10 @@ pub struct DeltaNetCudaTempBatched {
     pub gate: CudaSlice<f32>,          // [B * n_v_heads]
     pub delta_output: CudaSlice<f32>,  // [B * n_v_heads * head_v_dim]
     pub gated_output: CudaSlice<f32>,  // [B * value_dim] — final gated output (reused)
+    /// Кэш slot_ids на device (пересоздаётся только при смене состава батча).
+    /// Раньше clone_htod делал H2D+alloc на КАЖДЫЙ блок на КАЖДЫЙ шаг —
+    /// ~350µs × 30-48 блоков = доминирующий overhead decode-шага (A100 замер).
+    pub slot_ids_cache: std::cell::RefCell<Option<(std::sync::Arc<CudaSlice<u32>>, Vec<u32>)>>,
     /// B — capacity (slot count), фиксированная при аллокации.
     pub capacity_b: u32,
 }
@@ -235,7 +239,17 @@ pub fn dispatch_delta_rule_batched(
         slot_ids.len(),
         b,
     };
-    let slot_ids_dev = dev.clone_htod(slot_ids)?;
+    let slot_ids_arc = {
+        let mut cache = temp.slot_ids_cache.borrow_mut();
+        let stale = match &*cache {
+            Some((_, ids)) => ids.as_slice() != slot_ids,
+            None => true,
+        };
+        if stale {
+            *cache = Some((std::sync::Arc::new(dev.clone_htod(slot_ids)?), slot_ids.to_vec()));
+        }
+        cache.as_ref().unwrap().0.clone()
+    };
 
     let p = *params;
 
@@ -263,7 +277,7 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&temp.beta); // out
         bb.arg(&temp.gate); // out
         bb.arg(&p);
-        bb.arg(&slot_ids_dev); // slot_ids (indirection)
+        bb.arg(&*slot_ids_arc); // slot_ids (indirection)
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
@@ -309,7 +323,7 @@ pub fn dispatch_delta_rule_batched(
         bb.arg(&state.ssm_state); // read-write persistent
         bb.arg(&temp.delta_output); // out
         bb.arg(&p);
-        bb.arg(&slot_ids_dev); // slot_ids (indirection)
+        bb.arg(&*slot_ids_arc); // slot_ids (indirection)
         unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
