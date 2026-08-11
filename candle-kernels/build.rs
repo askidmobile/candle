@@ -15,12 +15,17 @@ fn main() -> Result<()> {
     // moe_quantized.cu live directly under src/ and must be compiled.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
-    let bindings = KernelBuilder::new()
+    let mut builder = KernelBuilder::new()
         .source_dir("src")
         .exclude(&["moe/*"])
-        .arg("--expt-relaxed-constexpr")
-        .arg("-Xcompiler")
-        .arg("/Zc:preprocessor")
+        .arg("--expt-relaxed-constexpr");
+    // /Zc:preprocessor — только MSVC; на Linux gcc примет флаг за имя файла
+    // и упадёт с "-o with multiple files" (урок сборки на A100 2026-08-11).
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.arg("-Xcompiler").arg("/Zc:preprocessor");
+    }
+    let bindings = builder
         .arg("-std=c++17")
         .arg("-O3")
         .build_ptx()?;
