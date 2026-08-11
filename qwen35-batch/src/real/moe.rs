@@ -269,10 +269,21 @@ impl Qwen35MoeBlock {
         let xs_2d = xs.reshape(((), n_embd))?;
 
         let route = self.router.route_topk(&xs_2d)?;
+        let t0 = std::time::Instant::now();
         let routed = self
             .backend
             .routed_swiglu(&xs_2d, &self.routed, &route, mode)?;
         let shared = self.shared.forward(&xs_2d)?;
+        if crate::scheduler::trace_on() && matches!(self.backend, MoeBackend::Ptx) {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let tot = TOTAL.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed)
+                + t0.elapsed().as_micros() as u64;
+            if n % 40 == 0 {
+                eprintln!("[moe] routed_swiglu avg {:.2}ms over {} calls", tot as f64 / n as f64 / 1000.0, n);
+            }
+        }
         let combined = routed.broadcast_add(&shared)?;
 
         combined.reshape((batch, seq_len, n_embd))
