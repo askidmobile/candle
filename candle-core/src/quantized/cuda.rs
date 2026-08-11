@@ -230,7 +230,8 @@ fn dequantize_f32_rowslice(
     builder.arg(&dst);
     if !is_k {
         // non-k ядра ждут nb32 (число 32-элементных блоков).
-        barg!(builder, (elem_count / 32) as i32);
+        let nb32 = (elem_count / 32) as i32;
+        barg!(builder, nb32);
     }
     unsafe { builder.launch(cfg) }.w()?;
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
