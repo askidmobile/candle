@@ -228,10 +228,10 @@ fn dequantize_f32_rowslice(
     let mut builder = func.builder();
     builder.arg(&src_view);
     builder.arg(&dst);
+    let nb32 = (elem_count / 32) as i32;
     if !is_k {
         // non-k ядра ждут nb32 (число 32-элементных блоков).
-        let nb32 = (elem_count / 32) as i32;
-        barg!(builder, nb32);
+        builder.arg(&nb32);
     }
     unsafe { builder.launch(cfg) }.w()?;
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
