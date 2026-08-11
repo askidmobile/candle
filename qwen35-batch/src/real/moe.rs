@@ -269,7 +269,7 @@ impl Qwen35MoeBlock {
         let xs_2d = xs.reshape(((), n_embd))?;
 
         #[cfg(feature = "cuda")]
-        if matches!(self.backend, MoeBackend::Ptx) && xs.is_cuda() {
+        if matches!(self.backend, MoeBackend::Ptx) && xs.device().is_cuda() {
             let combined = self.forward_ptx_cuda(&xs_2d)?;
             return combined.reshape((batch, seq_len, n_embd));
         }
@@ -581,9 +581,9 @@ fn gpu_softmax_topk(
     }
     drop(l_st);
 
-    let mk = |slice, shape: (usize, usize)| -> Result<Tensor> {
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
-        Ok(Tensor::from((candle_core::Storage::Cuda(storage), shape)))
-    };
-    Ok((mk(ids, (n_tokens, topk))?, mk(weights, (n_tokens, topk))?))
+    let ids_storage = candle_core::CudaStorage::wrap_cuda_slice(ids, dev.clone());
+    let ids_t = Tensor::from((candle_core::Storage::Cuda(ids_storage), (n_tokens, topk)));
+    let w_storage = candle_core::CudaStorage::wrap_cuda_slice(weights, dev.clone());
+    let w_t = Tensor::from((candle_core::Storage::Cuda(w_storage), (n_tokens, topk)));
+    Ok((ids_t, w_t))
 }
