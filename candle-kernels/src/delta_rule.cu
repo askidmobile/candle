@@ -405,7 +405,11 @@ extern "C" __global__ void delta_l2_norm_prefill(
 }
 
 // P3: рекуррентный delta rule по всей последовательности — цикл внутри kernel.
-// grid = (n_v_heads), block = (head_v_dim). state persistent [n_v, hd, hd].
+// STATE В РЕГИСТРАХ (схема llama.cpp gated_delta_net.cu): warp владеет
+// колонкой state, каждый lane держит 4 строки (hd=128/32) в регистрах на
+// весь цикл — нулевой global state traffic между токенами. Глобальный state
+// читается один раз в начале и пишется один раз в конце.
+// grid = (n_v_heads, hd/4), block = (32, 4): col = blockIdx.y*4 + threadIdx.y.
 extern "C" __global__ void delta_rule_prefill(
     const float* __restrict__ q,     // [T * n_v * hkd]
     const float* __restrict__ k,     // [T * n_v * hkd]
@@ -418,47 +422,67 @@ extern "C" __global__ void delta_rule_prefill(
     const unsigned int T
 ) {
     const unsigned int head = blockIdx.x;
-    const unsigned int col = threadIdx.x;
-    const unsigned int hd = params.head_v_dim;
+    const unsigned int col = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int hd = params.head_v_dim;   // 128
     const unsigned int n_v = params.n_v_heads;
     const unsigned int hkd = params.head_k_dim;
+    constexpr unsigned int ROWS = 4;             // hd / warp_size = 128/32
 
     const unsigned int state_base = head * hd * hd;
-    __shared__ float shared_sk[128];
-    __shared__ float shared_d[128];
+
+    // Начальная загрузка state-шарда в регистры (col-я колонка, 4 строки).
+    float s[ROWS];
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS; r++) {
+        const unsigned int row = r * 32 + lane;
+        s[r] = ssm_state[state_base + row * hd + col];
+    }
 
     for (unsigned int t = 0; t < T; t++) {
         const unsigned int kv_base = (t * n_v + head) * hkd;
         const unsigned int out_base = (t * n_v + head) * hd;
-        const float gate_exp = __expf(gate[t * n_v + head]);
+        const float g = __expf(gate[t * n_v + head]);
         const float beta_h = beta[t * n_v + head];
 
-        // 1. decay
-        for (unsigned int row = 0; row < hd; row++) {
-            ssm_state[state_base + row * hd + col] *= gate_exp;
+        float k_reg[ROWS], q_reg[ROWS];
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS; r++) {
+            const unsigned int row = r * 32 + lane;
+            k_reg[r] = k[kv_base + row];
+            q_reg[r] = q[kv_base + row];
         }
-        // 2. sk = S^T k
-        float sk_val = 0.0f;
-        for (unsigned int row = 0; row < hd; row++) {
-            sk_val += ssm_state[state_base + row * hd + col] * k[kv_base + row];
+
+        // kv_col = (S^T k)[col] = Σ_row S[row][col]·k[row]
+        float kv_part = 0.0f;
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS; r++) kv_part += s[r] * k_reg[r];
+        float kv_col = kv_part;
+        for (int o = 16; o > 0; o >>= 1) kv_col += __shfl_down_sync(0xffffffff, kv_col, o);
+        // broadcast в warp
+        kv_col = __shfl_sync(0xffffffff, kv_col, 0);
+
+        // delta = (v[col] - g·kv_col)·beta
+        const float v_col = v[out_base + col];
+        const float delta_col = (v_col - g * kv_col) * beta_h;
+
+        // S = g·S + k·delta^T; attn = (S^T q)[col]
+        float attn_part = 0.0f;
+        #pragma unroll
+        for (unsigned int r = 0; r < ROWS; r++) {
+            s[r] = g * s[r] + k_reg[r] * delta_col;
+            attn_part += s[r] * q_reg[r];
         }
-        shared_sk[col] = sk_val;
-        __syncthreads();
-        // 3. d = (v - sk) * beta
-        shared_d[col] = (v[out_base + col] - shared_sk[col]) * beta_h;
-        __syncthreads();
-        // 4. rank-1 update
-        const float d_col = shared_d[col];
-        for (unsigned int row = 0; row < hd; row++) {
-            ssm_state[state_base + row * hd + col] += k[kv_base + row] * d_col;
-        }
-        // 5. out = S^T q
-        float out_val = 0.0f;
-        for (unsigned int row = 0; row < hd; row++) {
-            out_val += ssm_state[state_base + row * hd + col] * q[kv_base + row];
-        }
-        output[out_base + col] = out_val;
-        __syncthreads();
+        float attn_col = attn_part;
+        for (int o = 16; o > 0; o >>= 1) attn_col += __shfl_down_sync(0xffffffff, attn_col, o);
+        if (lane == 0) output[out_base + col] = attn_col;
+    }
+
+    // Финальная запись state.
+    #pragma unroll
+    for (unsigned int r = 0; r < ROWS; r++) {
+        const unsigned int row = r * 32 + lane;
+        ssm_state[state_base + row * hd + col] = s[r];
     }
 }
 

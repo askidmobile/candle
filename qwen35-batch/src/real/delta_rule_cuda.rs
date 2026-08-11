@@ -406,12 +406,13 @@ pub fn dispatch_delta_rule_prefill(
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
 
-    // P3: рекуррентный delta rule, цикл внутри kernel.
+    // P3: рекуррентный delta rule, state в регистрах (warp-per-column).
+    // grid = (n_v, hd/4), block = (32, 4).
     {
         let func = dev.get_or_load_func("delta_rule_prefill", &candle_kernels::DELTA_RULE)?;
         let cfg = LaunchConfig {
-            grid_dim: (n_v as u32, 1, 1),
-            block_dim: (hvd as u32, 1, 1),
+            grid_dim: (n_v as u32, (hvd / 4) as u32, 1),
+            block_dim: (32, 4, 1),
             shared_mem_bytes: 0,
         };
         let mut b = func.builder();
