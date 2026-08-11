@@ -2829,6 +2829,31 @@ impl GatedAttentionLayer {
                 attn.matmul(&v_exp)?
             }
         } else {
+            // Prefill. CUDA: flash-attn v2 (causal, GQA нативно, F16 входы /
+            // F32 аккумулятор внутри FA2 — это НЕ F16-matmul из T-422,
+            // численно близко к F32). Откат: QWEN36_DISABLE_FLASH_PREFILL=1.
+            // Маска на CPU (Vec<f32> seq×kv на чанк на блок) и F32 matmul
+            // уходят — это была основная цена prefill attention.
+            #[cfg(feature = "cuda")]
+            if q.device().is_cuda()
+                && std::env::var("QWEN36_DISABLE_FLASH_PREFILL").is_err()
+            {
+                let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
+                let k_f = k.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
+                let v_f = v.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
+                let out = candle_flash_attn::flash_attn(&q_f, &k_f, &v_f, scale as f32, true)?;
+                let y = out.transpose(1, 2)?.to_dtype(DType::F32)?;
+                // дальше gate+output projection — как в основном пути
+                let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
+                let y = (y * gate_sigmoid)?;
+                let y = y
+                    .transpose(1, 2)?
+                    .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+                #[cfg(target_os = "macos")]
+                unreachable!();
+                #[cfg(not(target_os = "macos"))]
+                return self.attention_wo.forward(&y);
+            }
             // Prefill: CHUNKED manual matmul attention в F16.
             //
             // ИСТОРИЯ:
