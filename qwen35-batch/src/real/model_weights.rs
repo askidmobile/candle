@@ -3208,14 +3208,26 @@ impl GatedAttentionLayer {
                 candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?
                     .to_dtype(DType::F32)?
             } else {
-                // CUDA: flash-attn v2 fused kernel (candle-flash-attn, FA2).
-                // k/v уже head-last contiguous — flash читает срез без копий.
+                // CUDA: flash. При kv_len >= 2048 — split-K flash-decoding
+                // (FA2 при q=1 занимает только n_head блоков — latency-bound
+                // на длинном KV). Иначе FA2.
                 #[cfg(feature = "cuda")]
                 {
-                    let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
-                    candle_flash_attn::flash_attn(&q_f, &k, &v, scale as f32, false)?
-                        .transpose(1, 2)?
+                    if kv_len >= 2048 {
+                        super::flash_decode_cuda::dispatch_flash_decode(
+                            device.as_cuda_device()?,
+                            &q,
+                            &k,
+                            &v,
+                            scale as f32,
+                        )?
                         .to_dtype(DType::F32)?
+                    } else {
+                        let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
+                        candle_flash_attn::flash_attn(&q_f, &k, &v, scale as f32, false)?
+                            .transpose(1, 2)?
+                            .to_dtype(DType::F32)?
+                    }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {

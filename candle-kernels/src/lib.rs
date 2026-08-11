@@ -12,6 +12,8 @@ pub enum Id {
     DeltaRule,
     /// Phase 2: true batched decode (сть slot B) — Qwen35-batching.
     DeltaRuleBatched,
+    /// Split-K flash-decoding (длинный KV, seqlen_q=1).
+    FlashDecode,
     Fill,
     Indexing,
     /// Phase 3: device-only MoE routing + quantized expert kernels (PTX).
@@ -24,13 +26,14 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 15] = [
+pub const ALL_IDS: [Id; 16] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
     Id::Conv,
     Id::DeltaRule,
     Id::DeltaRuleBatched,
+    Id::FlashDecode,
     Id::Fill,
     Id::Indexing,
     Id::MoeRouter,
@@ -82,6 +85,7 @@ mdl!(BINARY, Binary);
 mdl!(CAST, Cast);
 mdl!(CONV, Conv);
 mdl!(DELTA_RULE, DeltaRule);
+mdl!(FLASH_DECODE, FlashDecode);
 mdl!(DELTA_RULE_BATCHED, DeltaRuleBatched);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
