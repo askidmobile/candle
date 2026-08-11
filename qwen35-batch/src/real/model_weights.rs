@@ -1874,6 +1874,10 @@ impl DeltaNetLayer {
         }
 
         // ── CPU fallback: per-slot loop через cpu_state_batched (без batched GPU ctx) ──
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdb] DeltaNet decode: CPU fallback (cuda_ctx_batched={})",
+                self.cuda_ctx_batched.is_some());
+        }
         //
         // Math per slot идентичен single-token `forward` CPU path (lines ~1593-1727):
         // sigmoid(beta) → softplus(alpha)*ssm_a gate → conv1d_step → L2 norm+expand+Q scale →
