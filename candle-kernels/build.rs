@@ -8,6 +8,14 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
     println!("cargo::rerun-if-changed=src/moe_dequant.cuh");
+    // Явно следим за ВСЕМИ .cu (новый файл без этого не пересобирает ptx.rs —
+    // поймано: FLASH_DECODE отсутствовал в сгенерированном модуле).
+    for entry in std::fs::read_dir("src").unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|s| s.to_str()) == Some("cu") {
+            println!("cargo::rerun-if-changed={}", p.display());
+        }
+    }
 
     // Build for PTX.
     // Exclude the old reference MoE kernels under src/moe/ (they use the CUDA Runtime
