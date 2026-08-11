@@ -827,6 +827,36 @@ impl QTensor {
         crate::tensor::from_storage(storage, self.shape.clone(), none, false).to_device(device)
     }
 
+    /// Fused indexed MoE matmul на CUDA (q8_1 quantization входа + per-expert
+    /// kernel). `self` — packed веса [n_experts, n, k]; input [batch, topk, k]
+    /// F32 CUDA; ids [batch, topk] U32. Возвращает [batch, topk, n].
+    /// Поддержанные dtype: Q8_0, Q2K-Q6K (см. indexed_moe_forward в cuda.rs).
+    #[cfg(feature = "cuda")]
+    pub fn indexed_moe_forward_cuda(&self, input: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let qs = match &self.storage {
+            QStorage::Cuda(c) => c,
+            _ => crate::bail!("indexed_moe_forward_cuda: weights not on CUDA"),
+        };
+        let (in_st, in_l) = input.storage_and_layout();
+        let in_cuda = match &*in_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("indexed_moe_forward_cuda: input not on CUDA"),
+        };
+        let (ids_st, ids_l) = ids.storage_and_layout();
+        let ids_cuda = match &*ids_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("indexed_moe_forward_cuda: ids not on CUDA"),
+        };
+        let (out, out_shape) = qs.indexed_moe_forward(
+            &self.shape,
+            in_cuda,
+            &in_l,
+            ids_cuda,
+            &ids_l,
+        )?;
+        Ok(Tensor::from((crate::Storage::Cuda(out), out_shape)))
+    }
+
     /// Dequantize a row-slice `[row_start, row_end)` of a 2D view `[n, k]` into
     /// a contiguous f32 tensor `[(row_end - row_start), k]` on `device`.
     ///

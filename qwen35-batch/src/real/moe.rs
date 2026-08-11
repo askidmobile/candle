@@ -294,12 +294,53 @@ impl MoeBackend {
     ) -> Result<Tensor> {
         match self {
             Self::Reference => reference_routed_swiglu(xs, experts, route),
-            Self::Ptx => candle_core::bail!(
-                "PTX MoE backend not yet implemented (Phase 3). \
-                 Set QWEN36_MOE_BACKEND=reference for diagnostics."
-            ),
+            Self::Ptx => ptx_routed_swiglu(xs, experts, route),
         }
     }
+}
+
+/// Fused MoE путь (CUDA): indexed_moe_forward ядра — одна группа запусков на
+/// проекцию вместо per-expert dequantize_rowslice (~1000 launches/шаг).
+/// Работает для K-quants/Q8_0 экспертов (35B UD-Q4_K_M). IQ2_XXS — нет ядра.
+#[cfg(feature = "cuda")]
+fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) -> Result<Tensor> {
+    let (n_tokens, n_embd) = xs.dims2()?;
+    let topk = route.experts.first().map(|e| e.len()).unwrap_or(0);
+    if n_tokens == 0 || topk == 0 {
+        return Tensor::zeros((n_tokens, n_embd), DType::F32, xs.device());
+    }
+    let device = xs.device();
+
+    // ids [n_tokens, topk] u32 на device.
+    let ids_flat: Vec<u32> = route
+        .experts
+        .iter()
+        .flat_map(|e| e.iter().map(|&x| x as u32))
+        .collect();
+    let ids_t = Tensor::from_vec(ids_flat, (n_tokens, topk), device)?;
+
+    // xs → [n_tokens, topk, n_embd] contiguous (q8_1 quantize внутри ядра).
+    let x3 = xs
+        .to_dtype(DType::F32)?
+        .unsqueeze(1)?
+        .broadcast_as((n_tokens, topk, n_embd))?
+        .contiguous()?;
+
+    // gate/up: [n_tokens, topk, n_ff]; SwiGLU; down: [n_tokens, topk, n_embd].
+    let gate = experts.gate.indexed_moe_forward_cuda(&x3, &ids_t)?;
+    let up = experts.up.indexed_moe_forward_cuda(&x3, &ids_t)?;
+    let act = gate.silu()?.mul(&up)?.contiguous()?;
+    let down = experts.down.indexed_moe_forward_cuda(&act, &ids_t)?;
+
+    // Взвешивание route weights и редукция по topk → [n_tokens, n_embd].
+    let w_flat: Vec<f32> = route.weights.iter().flatten().copied().collect();
+    let w = Tensor::from_vec(w_flat, (n_tokens, topk, 1), device)?;
+    down.broadcast_mul(&w)?.sum(candle_core::D::Minus2)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn ptx_routed_swiglu(_xs: &Tensor, _experts: &PackedExperts, _route: &RoutePlan) -> Result<Tensor> {
+    candle_core::bail!("PTX MoE backend requires cuda feature")
 }
 
 /// Reference routed expert SwiGLU: dequantize packed experts, batch per-expert.
