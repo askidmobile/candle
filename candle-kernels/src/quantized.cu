@@ -5207,7 +5207,10 @@ __device__ void indexed_moe_forward(
     // Calculate strides
     const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    // Stride по весам — через qk шаблона, НЕ QK_K: для Q8_0 блок = 32 элемента
+    // (QK_K=256 только у K-quants). С QK_K stride был в 8x меньше → чтение
+    // мусора → мусорный вывод MoE на Q8_0 (поймано на Ornith-35B Q8_0).
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
