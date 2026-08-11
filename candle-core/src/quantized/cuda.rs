@@ -630,6 +630,89 @@ fn indexed_moe_forward_fused_q8_1_input(
 }
 
 impl QCudaStorage {
+    /// Dual indexed MoE: gate+up одним запуском (общий q8_1 вход, два выхода).
+    /// w1/w2 — packed [n_experts, n, k] одинакового dtype; input [batch, topk, k] f32;
+    /// ids [batch, topk] u32. Выход: два [batch, topk, n] f32.
+    pub fn indexed_moe_forward_dual(
+        &self,
+        other: &QCudaStorage,
+        self_shape: &crate::Shape,
+        input: &CudaStorage,
+        input_l: &crate::Layout,
+        ids: &CudaStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(CudaStorage, CudaStorage, crate::Shape)> {
+        let dtype = self.dtype();
+        if dtype != other.dtype() {
+            crate::bail!("dual moe: dtype mismatch {:?} vs {:?}", dtype, other.dtype());
+        }
+        let kernel_name = match dtype {
+            GgmlDType::Q8_0 => "indexed_moe_forward_dual_q8_0_q8_1",
+            GgmlDType::Q2K => "indexed_moe_forward_dual_q2k_q8_1",
+            GgmlDType::Q4K => "indexed_moe_forward_dual_q4k_q8_1",
+            GgmlDType::Q6K => "indexed_moe_forward_dual_q6k_q8_1",
+            _ => crate::bail!("unsupported dtype for dual indexed moe {dtype:?}"),
+        };
+        let (n, k) = (self_shape.dims3()?.1, self_shape.dims3()?.2);
+        let batch = input_l.shape().dims()[0];
+        let topk = ids_l.shape().dims()[1];
+        let input_dim1 = input_l.shape().dims()[1];
+
+        // q8_1 quantize входа (один раз на обе проекции).
+        let dev = &self.device;
+        let input_view_all = input.as_cuda_slice::<f32>()?;
+        let input_view = match input_l.contiguous_offsets() {
+            Some((o1, o2)) => input_view_all.slice(o1..o2),
+            None => crate::bail!("dual moe: input not contiguous"),
+        };
+        let total_rows = batch * input_dim1;
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let y_size_in_bytes =
+            k_padded * total_rows * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+        let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+        quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+
+        let ids_storage = ids.as_cuda_slice::<u32>()?;
+        let ids_view = match ids_l.contiguous_offsets() {
+            Some((o1, o2)) => ids_storage.slice(o1..o2),
+            None => ids_storage.slice(0..),
+        };
+
+        let outsize = batch * topk * n;
+        let out1 = unsafe { dev.alloc::<f32>(outsize)? };
+        let out2 = unsafe { dev.alloc::<f32>(outsize)? };
+
+        let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, batch as u32, topk as u32),
+            block_dim: (WARP_SIZE as u32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&self.data.inner);
+        b.arg(&other.data.inner);
+        b.arg(&input_quant);
+        b.arg(&ids_view);
+        b.arg(&out1);
+        b.arg(&out2);
+        barg!(b, n as i32);
+        barg!(b, k as i32);
+        barg!(b, batch as i32);
+        barg!(b, topk as i32);
+        barg!(b, k_padded as i32);
+        barg!(b, input_dim1 as i32);
+        unsafe { b.launch(cfg) }.w()?;
+
+        let shape: crate::Shape = (batch, topk, n).into();
+        Ok((
+            CudaStorage::wrap_cuda_slice(out1, dev.clone()),
+            CudaStorage::wrap_cuda_slice(out2, dev.clone()),
+            shape,
+        ))
+    }
+}
+
+impl QCudaStorage {
     pub fn indexed_moe_forward(
         &self,
         self_shape: &crate::Shape, //[num_experts, n, k]

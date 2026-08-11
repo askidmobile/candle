@@ -857,6 +857,46 @@ impl QTensor {
         Ok(Tensor::from((crate::Storage::Cuda(out), out_shape)))
     }
 
+    /// Dual indexed MoE (gate+up одним запуском, общий вход).
+    /// Возвращает (gate_out, up_out) оба [batch, topk, n].
+    #[cfg(feature = "cuda")]
+    pub fn indexed_moe_forward_dual_cuda(
+        &self,
+        other: &QTensor,
+        input: &Tensor,
+        ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (qs, qs_other) = match (&self.storage, &other.storage) {
+            (QStorage::Cuda(a), QStorage::Cuda(b)) => (a, b),
+            _ => crate::bail!("indexed_moe_forward_dual_cuda: weights not on CUDA"),
+        };
+        if self.shape != other.shape {
+            crate::bail!("dual moe: shape mismatch {:?} vs {:?}", self.shape, other.shape);
+        }
+        let (in_st, in_l) = input.storage_and_layout();
+        let in_cuda = match &*in_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("dual moe: input not CUDA"),
+        };
+        let (ids_st, ids_l) = ids.storage_and_layout();
+        let ids_cuda = match &*ids_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("dual moe: ids not CUDA"),
+        };
+        let (out1, out2, shape) = qs.indexed_moe_forward_dual(
+            qs_other,
+            &self.shape,
+            in_cuda,
+            &in_l,
+            ids_cuda,
+            &ids_l,
+        )?;
+        Ok((
+            Tensor::from((crate::Storage::Cuda(out1), shape.clone())),
+            Tensor::from((crate::Storage::Cuda(out2), shape)),
+        ))
+    }
+
     /// Dequantize a row-slice `[row_start, row_end)` of a 2D view `[n, k]` into
     /// a contiguous f32 tensor `[(row_end - row_start), k]` on `device`.
     ///

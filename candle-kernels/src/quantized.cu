@@ -5353,3 +5353,99 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Dual indexed MoE: ДВЕ проекции (gate+up) одним запуском на один вход.
+// Вход квантуется один раз, оба набора весов читаются в одном ядре —
+// экономия: 1 launch + 1 q8_1-quantize на MoE блок на шаг.
+// ═══════════════════════════════════════════════════════════════
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_dual(
+    const void * __restrict__ w1_all,
+    const void * __restrict__ w2_all,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ out1_all,
+    float * __restrict__ out2_all,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const int current_batch = blockIdx.y;
+    const int current_topk = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) return;
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+
+    const char * x_ptr = (const char *)all_inputs + input_idx * input_task_stride_bytes;
+    const char * w1_ptr = (const char *)w1_all + expert_id * weight_expert_stride_bytes;
+    const char * w2_ptr = (const char *)w2_all + expert_id * weight_expert_stride_bytes;
+    float * out1 = out1_all + task_id * n;
+    float * out2 = out2_all + task_id * n;
+
+    constexpr int nwarps = 4;
+    constexpr int rows_per_cuda_block = 1;
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_cuda_block * blockIdx.x;
+    if (row0 >= n) return;
+
+    const int blocks_per_row_x = k / qk;
+    const int blocks_per_col_y = k_padded / QK8_1;
+    constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+    float tmp1 = 0.0f, tmp2 = 0.0f;
+    const block_q_t * w1 = (const block_q_t *) w1_ptr;
+    const block_q_t * w2 = (const block_q_t *) w2_ptr;
+    const block_q8_1 * x = (const block_q8_1 *) x_ptr;
+
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (tid % (qi / vdr));
+        tmp1 += vec_dot_q_cuda(&w1[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
+        tmp2 += vec_dot_q_cuda(&w2[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
+    }
+    (void)blocks_per_col_y;
+
+    __shared__ float sh1[nwarps - 1][WARP_SIZE];
+    __shared__ float sh2[nwarps - 1][WARP_SIZE];
+    if (threadIdx.y > 0) {
+        sh1[threadIdx.y - 1][threadIdx.x] = tmp1;
+        sh2[threadIdx.y - 1][threadIdx.x] = tmp2;
+    }
+    __syncthreads();
+    if (threadIdx.y == 0) {
+        for (int l = 0; l < nwarps - 1; ++l) {
+            tmp1 += sh1[l][threadIdx.x];
+            tmp2 += sh2[l][threadIdx.x];
+        }
+        tmp1 = warp_reduce_sum(tmp1);
+        tmp2 = warp_reduce_sum(tmp2);
+        if (threadIdx.x == 0) {
+            out1[row0] = tmp1;
+            out2[row0] = tmp2;
+        }
+    }
+}
+
+#define DUAL_MOE_EXTERN(name, QK_, QI_, BLOCK_, VDR_, DOT_) \
+extern "C" __global__ void name( \
+    const void * w1, const void * w2, const void * inp, const unsigned int * ids, \
+    float * out1, float * out2, \
+    const int n, const int k, const int batch, const int topk, const int k_padded, const int input_dim1) { \
+    indexed_moe_forward_dual<QK_, QI_, BLOCK_, VDR_, DOT_>(w1, w2, inp, ids, out1, out2, n, k, batch, topk, k_padded, input_dim1); \
+}
+
+DUAL_MOE_EXTERN(indexed_moe_forward_dual_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+DUAL_MOE_EXTERN(indexed_moe_forward_dual_q4k_q8_1,  QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+DUAL_MOE_EXTERN(indexed_moe_forward_dual_q6k_q8_1,  QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+DUAL_MOE_EXTERN(indexed_moe_forward_dual_q2k_q8_1,  QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)

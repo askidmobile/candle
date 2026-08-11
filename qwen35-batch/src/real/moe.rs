@@ -268,6 +268,12 @@ impl Qwen35MoeBlock {
         let (batch, seq_len, n_embd) = xs.dims3()?;
         let xs_2d = xs.reshape(((), n_embd))?;
 
+        #[cfg(feature = "cuda")]
+        if matches!(self.backend, MoeBackend::Ptx) && xs.is_cuda() {
+            let combined = self.forward_ptx_cuda(&xs_2d)?;
+            return combined.reshape((batch, seq_len, n_embd));
+        }
+
         let route = self.router.route_topk(&xs_2d)?;
         let t0 = std::time::Instant::now();
         let routed = self
@@ -287,6 +293,51 @@ impl Qwen35MoeBlock {
         let combined = routed.broadcast_add(&shared)?;
 
         combined.reshape((batch, seq_len, n_embd))
+    }
+
+    /// Полностью GPU-путь (CUDA): router → GPU softmax+topk kernel →
+    /// dual indexed GEMM (gate+up) → SwiGLU → down → weighted sum.
+    /// Без единого D2H/H2D round-trip (раньше: ~120 синков/шаг на 40 блоков).
+    #[cfg(feature = "cuda")]
+    fn forward_ptx_cuda(&self, xs: &Tensor) -> Result<Tensor> {
+        let (n_tokens, n_embd) = xs.dims2()?;
+        let k = self.router.n_experts_per_tok;
+        let device = xs.device();
+        let cuda_dev = device.as_cuda_device()?;
+
+        // Router на GPU.
+        let logits = self.router.linear.forward(xs)?.to_dtype(DType::F32)?.contiguous()?;
+        let (ids_t, w_t) = gpu_softmax_topk(
+            cuda_dev,
+            &logits,
+            self.router.n_experts,
+            k,
+            self.router.norm_topk_prob,
+        )?;
+
+        // x → [tokens, topk, n_embd] contiguous.
+        let x3 = xs
+            .to_dtype(DType::F32)?
+            .unsqueeze(1)?
+            .broadcast_as((n_tokens, k, n_embd))?
+            .contiguous()?;
+
+        // gate+up одним dual GEMM.
+        let (gate, up) = self
+            .routed
+            .gate
+            .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
+        let act = gate.silu()?.mul(&up)?.contiguous()?;
+        let down = self
+            .routed
+            .down
+            .indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
+
+        // Взвешивание GPU-весами + редукция по topk.
+        let w = w_t.unsqueeze(candle_core::D::Minus1)?; // [tokens, topk, 1]
+        let routed = down.broadcast_mul(&w)?.sum(candle_core::D::Minus2)?;
+        let shared = self.shared.forward(xs)?;
+        routed.broadcast_add(&shared)
     }
 
     /// Config accessor for diagnostics / adapter reporting.
@@ -480,4 +531,59 @@ pub fn f32_qtensor(t: &Tensor) -> Result<Arc<QTensor>> {
     use candle_core::quantized::GgmlDType;
     let qt = QTensor::quantize_onto(t, GgmlDType::F32, &Device::Cpu)?;
     Ok(Arc::new(qt))
+}
+// ─── GPU softmax+topk dispatch (CUDA, moe_router.cu) ─────────────────────────
+
+/// Stable softmax+topk на GPU: logits [n_tokens, n_experts] F32 →
+/// (ids [n_tokens, k] u32, weights [n_tokens, k] f32) — без D2H.
+#[cfg(feature = "cuda")]
+fn gpu_softmax_topk(
+    dev: &candle_core::CudaDevice,
+    logits: &Tensor,
+    n_experts: usize,
+    topk: usize,
+    norm_topk_prob: bool,
+) -> Result<(Tensor, Tensor)> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let (n_tokens, _) = logits.dims2()?;
+    let (l_st, l_lay) = logits.storage_and_layout();
+    let logits_view = match &*l_st {
+        candle_core::Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?.slice(l_lay.start_offset()..),
+        _ => candle_core::bail!("gpu_softmax_topk: logits not CUDA"),
+    };
+
+    let mut ids = unsafe { dev.alloc::<u32>(n_tokens * topk)? };
+    let mut weights = unsafe { dev.alloc::<f32>(n_tokens * topk)? };
+
+    let func = dev.get_or_load_func("moe_softmax_topk_kernel", &candle_kernels::MOE_ROUTER)?;
+    let block = 256u32; // >= n_experts(256), power of 2
+    let shared = (n_experts * 4 + n_experts) as u32; // probs f32 + masked u8
+    let cfg = LaunchConfig {
+        grid_dim: (n_tokens as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    // kernel ждёт int32_t* для ids — transmute view u32→i32.
+    let ids_i32 = unsafe { ids.transmute::<i32>(n_tokens * topk) }
+        .ok_or_else(|| candle_core::Error::Msg("ids transmute".into()))?;
+    let norm_flag: i32 = if norm_topk_prob { 1 } else { 0 };
+    let n_experts_i = n_experts as i32;
+    let topk_i = topk as i32;
+    {
+        let mut b = func.builder();
+        b.arg(&logits_view);
+        b.arg(&ids_i32);
+        b.arg(&mut weights);
+        b.arg(&n_experts_i);
+        b.arg(&topk_i);
+        b.arg(&norm_flag);
+        unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+    drop(l_st);
+
+    let mk = |slice, shape: (usize, usize)| -> Result<Tensor> {
+        let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+        Ok(Tensor::from((candle_core::Storage::Cuda(storage), shape)))
+    };
+    Ok((mk(ids, (n_tokens, topk))?, mk(weights, (n_tokens, topk))?))
 }
