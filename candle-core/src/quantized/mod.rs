@@ -1023,18 +1023,21 @@ thread_local! {
 
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
-        let dequantize = match qtensor.dtype() {
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            _ => DEQUANTIZE_ALL.with(|b| *b),
-        };
-        let t = if dequantize {
-            let tensor = qtensor.dequantize(&qtensor.device())?;
-            Self::Tensor(tensor)
-        } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
-            let tensor = qtensor.dequantize_f16(&qtensor.device())?;
-            Self::TensorF16(tensor)
-        } else {
-            Self::QTensor(qtensor)
+        // F16/BF16 веса → TensorF16 (не F32!): иначе BF16-модель раздувается
+        // в 2x VRAM (27B BF16: 53.8GB → 107GB F32 → OOM на A100 80GB,
+        // поймано 2026-08-11). F32 остаётся F32.
+        let t = match qtensor.dtype() {
+            GgmlDType::F32 => Self::Tensor(qtensor.dequantize(&qtensor.device())?),
+            GgmlDType::F16 | GgmlDType::BF16 => {
+                Self::TensorF16(qtensor.dequantize_f16(&qtensor.device())?)
+            }
+            _ if DEQUANTIZE_ALL.with(|b| *b) => {
+                Self::Tensor(qtensor.dequantize(&qtensor.device())?)
+            }
+            _ if DEQUANTIZE_ALL_F16.with(|b| *b) => {
+                Self::TensorF16(qtensor.dequantize_f16(&qtensor.device())?)
+            }
+            _ => Self::QTensor(qtensor),
         };
         Ok(t)
     }
