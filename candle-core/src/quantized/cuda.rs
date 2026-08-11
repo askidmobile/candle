@@ -259,6 +259,27 @@ fn dequantize_f16(
         GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f16", true, 256, nb),
         GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f16", true, 256, nb),
         GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f16", true, 256, nb),
+        // BF16 — не квант: простой cast bf16→f16 (dequantize_f16 вызывается
+        // из QMatMul::from_arc для F16/BF16 весов; без этого полные BF16
+        // GGUF падали "unsupported dtype", а через F32 — 2x VRAM/OOM).
+        GgmlDType::BF16 => {
+            let view = unsafe { data.inner.transmute::<half::bf16>(elem_count) }
+                .ok_or_else(|| {
+                    crate::Error::Msg("bf16 view: size mismatch".into()).bt()
+                })?;
+            let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+            let func = dev.get_or_load_func("cast_bf16_f16", &candle_kernels::CAST)?;
+            let cfg = cudarc::driver::LaunchConfig::for_num_elems(elem_count as u32);
+            let mut builder = func.builder();
+            barg!(builder, elem_count);
+            barg!(builder, 0usize); // num_dims = 0 (contiguous)
+            let null_info: usize = 0;
+            barg!(builder, null_info); // info = nullptr
+            builder.arg(&view);
+            builder.arg(&dst);
+            unsafe { builder.launch(cfg) }.w()?;
+            return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+        }
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
