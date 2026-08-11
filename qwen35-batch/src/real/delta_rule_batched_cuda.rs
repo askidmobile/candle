@@ -143,6 +143,7 @@ pub fn create_temp_buffers_batched(
         gate: dev.alloc_zeros::<f32>(b * n_v)?,
         delta_output: dev.alloc_zeros::<f32>(b * n_v * hvd)?,
         gated_output: dev.alloc_zeros::<f32>(b * value_dim)?,
+        slot_ids_cache: std::cell::RefCell::new(None),
         capacity_b,
     })
 }
