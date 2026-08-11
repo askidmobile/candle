@@ -127,27 +127,41 @@ extern "C" __global__ void moe_softmax_topk_kernel(
             }
         }
 
-        // Block-level reduction to find global max
-        // Use pair encoding: encode (val, idx) into float via comparison
-        __shared__ float shared_val[32];
-        __shared__ int shared_idx[32];
-
-        if (tid < 32) {
-            shared_val[tid] = best_val;
-            shared_idx[tid] = best_idx;
+        // Block-level reduction to find global max.
+        // Двухступенчато: warp-reduce с tie-break по индексу, затем по warp'ам
+        // через shared. Раньше: shared_val[32] только для tid<32 — части
+        // потоков 32..255 терялись → выбор только среди экспертов 0..31
+        // (сломанный роутинг на 256 экспертах, мусорная генерация).
+        __shared__ float warp_val[32];
+        __shared__ int warp_idx[32];
+        const unsigned int lane = tid % WARP_SIZE;
+        const unsigned int wid = tid / WARP_SIZE;
+        const unsigned int nwarp = (block_dim + WARP_SIZE - 1) / WARP_SIZE;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, best_val, o);
+            int oi = __shfl_xor_sync(0xffffffff, best_idx, o);
+            if (ov > best_val || (ov == best_val && oi >= 0 && (best_idx < 0 || oi < best_idx))) {
+                best_val = ov;
+                best_idx = oi;
+            }
+        }
+        if (lane == 0) {
+            warp_val[wid] = best_val;
+            warp_idx[wid] = best_idx;
         }
         __syncthreads();
 
-        // Sequential reduction by thread 0 (n_experts typically ≤ 128, so 32 lanes is enough)
         if (tid == 0) {
-            for (int i = 1; i < min(block_dim, 32); i++) {
+            float bv = warp_val[0];
+            int bi = warp_idx[0];
+            for (unsigned int i = 1; i < nwarp; i++) {
                 // Strict `>` → lower index wins on tie
-                if (shared_val[i] > shared_val[0]) {
-                    shared_val[0] = shared_val[i];
-                    shared_idx[0] = shared_idx[i];
+                if (warp_val[i] > bv || (warp_val[i] == bv && warp_idx[i] >= 0 && (bi < 0 || warp_idx[i] < bi))) {
+                    bv = warp_val[i];
+                    bi = warp_idx[i];
                 }
             }
-            int sel = shared_idx[0];
+            int sel = bi;
             if (sel >= 0) {
                 masked[sel] = 1;
                 expert_ids[token * topk + k] = sel;
