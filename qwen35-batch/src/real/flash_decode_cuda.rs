@@ -4,7 +4,7 @@
 //!
 //! Порог включения — kv_len >= 2048 (ниже FA2 быстрее/равен).
 
-use candle_core::{CudaDevice, Result, Tensor};
+use candle_core::{CudaDevice, Result, Storage, Tensor};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 #[repr(C)]
