@@ -327,6 +327,27 @@ impl Qwen35MoeBlock {
             .routed
             .gate
             .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
+        // ДИАГНОСТИКА (trace): сверка GPU-маршрута с CPU reference.
+        if crate::scheduler::trace_on() {
+            let route_ref = self.router.route_topk(xs)?;
+            let gpu_ids: Vec<u32> = ids_t.to_vec2::<u32>()?;
+            let gpu_w: Vec<f32> = w_t.to_vec2::<f32>()?;
+            let cpu_ids: Vec<u32> = route_ref
+                .experts
+                .iter()
+                .map(|r| r.iter().map(|&e| e as u32).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+                .concat();
+            if gpu_ids != cpu_ids {
+                eprintln!(
+                    "[moe] ROUTE MISMATCH: gpu {:?} vs cpu {:?}",
+                    &gpu_ids[..gpu_ids.len().min(16)],
+                    &cpu_ids[..cpu_ids.len().min(16)]
+                );
+            } else {
+                eprintln!("[moe] route OK; gpu_w[0..4]={:?}", &gpu_w[..gpu_w.len().min(4)]);
+            }
+        }
         let act = gate.silu()?.mul(&up)?.contiguous()?;
         let down = self
             .routed
