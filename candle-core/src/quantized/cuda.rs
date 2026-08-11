@@ -31,6 +31,12 @@ fn dequant_cache_enabled() -> bool {
 
 static FORCE_DMMV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// QWEN36_FORCE_MMQ=1: MMQ kernels даже для m=1 (decode). Эксперимент.
+fn force_mmq() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN36_FORCE_MMQ").is_some())
+}
+
 pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
@@ -904,6 +910,9 @@ impl QCudaStorage {
         }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
+        } else if force_mmq() {
+            // Эксперимент (шаг 2 perf-плана): MMQ вместо dmmv даже для m=1.
+            0
         } else {
             8
         };
