@@ -779,7 +779,10 @@ impl QCudaStorage {
     fn cached_dequant_f32(&self, elem_count: usize) -> Result<std::sync::Arc<CudaStorage>> {
         let mut g = self.dequant_cache.lock().unwrap();
         if g.is_none() {
-            if std::env::var_os("QWEN36_TRACE").is_some() {
+            if std::env::var("QWEN36_TRACE")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+            {
                 eprintln!(
                     "[cuda] dequant cache fill: dtype={:?} elems={} (~{:.0}MiB f32)",
                     self.dtype,

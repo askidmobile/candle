@@ -82,10 +82,29 @@ pub fn prefill_chunk_size() -> usize {
 
 /// Диагностический trace шагов (QWEN36_TRACE=1) — для расследования зависаний
 /// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
+fn trace_value_on(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 #[inline]
 pub fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN36_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var("QWEN36_TRACE").map(|v| trace_value_on(&v)).unwrap_or(false))
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::trace_value_on;
+
+    #[test]
+    fn trace_accepts_only_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(trace_value_on(value), "{value}");
+        }
+        for value in ["", "0", "false", "no", "off"] {
+            assert!(!trace_value_on(value), "{value}");
+        }
+    }
 }
 
 pub struct BatchScheduler<M: BatchModel> {
