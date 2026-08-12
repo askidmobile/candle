@@ -548,7 +548,7 @@ fn mul_mat_via_q8_1(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn indexed_moe_forward_fused_q8_1_input(
+fn indexed_moe_forward_dispatch(
     weight: &CudaView<u8>,
     w_shape: &crate::Shape, //[num_experts, n, k]
     w_dtype: GgmlDType,
@@ -564,6 +564,43 @@ fn indexed_moe_forward_fused_q8_1_input(
 
     let topk = idx_shape.dims()[1];
     assert!(batch == idx_shape.dims()[0], "batch dim not match!");
+
+    if matches!(
+        w_dtype,
+        GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ3S
+    ) {
+        let kernel_name = match w_dtype {
+            GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_f32",
+            GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_f32",
+            GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_f32",
+            _ => unreachable!(),
+        };
+        let out = unsafe { dev.alloc::<f32>(batch * topk * n)? };
+        let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, batch as u32, topk as u32),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(weight);
+        builder.arg(input);
+        builder.arg(ids);
+        builder.arg(&out);
+        barg!(
+            builder,
+            n as i32,
+            k as i32,
+            batch as i32,
+            topk as i32,
+            input_dim1 as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+        return Ok((
+            CudaStorage::wrap_cuda_slice(out, dev.clone()),
+            (batch, topk, n).into(),
+        ));
+    }
 
     // Quantize input into q8_1.
     let total_rows = batch * input_dim1;
@@ -630,7 +667,8 @@ fn indexed_moe_forward_fused_q8_1_input(
 }
 
 impl QCudaStorage {
-    /// Dual indexed MoE: gate+up одним запуском (общий q8_1 вход, два выхода).
+    /// Dual indexed MoE: gate+up with shared input and two outputs.
+    /// IQ types keep F32 input and use two measured-faster launches; K-quants share Q8_1 input.
     /// w1/w2 — packed [n_experts, n, k] одинакового dtype; input [batch, topk, k] f32;
     /// ids [batch, topk] u32. Выход: два [batch, topk, n] f32.
     pub fn indexed_moe_forward_dual(
@@ -645,6 +683,33 @@ impl QCudaStorage {
         let dtype = self.dtype();
         if dtype != other.dtype() {
             crate::bail!("dual moe: dtype mismatch {:?} vs {:?}", dtype, other.dtype());
+        }
+        if matches!(dtype, GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ3S) {
+            // Two launches beat dual-register pressure on RTX 3060 for current
+            // 2048x512 experts. Input stays F32; neither path allocates Q8_1.
+            let input_storage = input.as_cuda_slice::<f32>()?;
+            let ids_storage = ids.as_cuda_slice::<u32>()?;
+            let first = indexed_moe_forward_dispatch(
+                &self.data.inner.slice(0..),
+                self_shape,
+                dtype,
+                input_storage,
+                input_l.shape(),
+                &ids_storage.slice(0..),
+                ids_l.shape(),
+                &self.device,
+            )?;
+            let second = indexed_moe_forward_dispatch(
+                &other.data.inner.slice(0..),
+                self_shape,
+                dtype,
+                input_storage,
+                input_l.shape(),
+                &ids_storage.slice(0..),
+                ids_l.shape(),
+                &self.device,
+            )?;
+            return Ok((first.0, second.0, first.1));
         }
         let kernel_name = match dtype {
             GgmlDType::Q8_0 => "indexed_moe_forward_dual_q8_0_q8_1",
@@ -723,7 +788,10 @@ impl QCudaStorage {
     ) -> Result<(CudaStorage, crate::Shape)> {
         if matches!(
             self.dtype(),
-            GgmlDType::Q8_0
+            GgmlDType::IQ3S
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ2XXS
+                | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
                 | GgmlDType::Q4K
@@ -732,7 +800,7 @@ impl QCudaStorage {
         ) {
             let input_storage = input.as_cuda_slice::<f32>()?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
-            indexed_moe_forward_fused_q8_1_input(
+            indexed_moe_forward_dispatch(
                 &self.data.inner.slice(0..),
                 self_shape, //[num_experts, n, k]
                 self.dtype(),

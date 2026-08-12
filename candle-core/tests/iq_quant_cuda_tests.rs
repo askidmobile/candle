@@ -1,4 +1,4 @@
-//! Isolated CUDA tests for IQ quant types (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS).
+//! Isolated CUDA tests for IQ quant types (IQ2XXS, IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS).
 //!
 //! These types cannot use `QTensor::quantize` (CPU `from_float` panics for
 //! `RawQuantizedType`). Instead we construct QTensors from raw bytes via
@@ -71,11 +71,7 @@ fn make_iq_qtensor(
     for _ in 0..total_blocks {
         raw.extend_from_slice(&block_template);
     }
-    let storage = QStorage::from_data(
-        std::borrow::Cow::Borrowed(&raw),
-        device,
-        dtype,
-    )?;
+    let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, dtype)?;
     QTensor::new(storage, (n_rows, n_cols))
 }
 
@@ -123,11 +119,7 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
         res.device()
     );
     assert_eq!(res.dtype(), DType::F32, "result dtype for {dtype:?}");
-    assert_eq!(
-        res.shape().dims(),
-        [m, n],
-        "result shape for {dtype:?}"
-    );
+    assert_eq!(res.shape().dims(), [m, n], "result shape for {dtype:?}");
 
     // Reference: dequantize weights to f32 on CPU, matmul.
     let w_cpu = dequantize_to_cpu_f32(&qt)?;
@@ -143,16 +135,18 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
     // tolerance — we mainly care that CUDA dispatch works and produces
     // finite results close to the CUDA-dequantized reference (same kernel
     // path, so should match closely).
-    assert!(
-        diff.is_finite(),
-        "non-finite diff {diff} for {dtype:?}"
-    );
+    assert!(diff.is_finite(), "non-finite diff {diff} for {dtype:?}");
     assert!(
         diff < 1e-2,
         "diff {diff} too large for {dtype:?} (CUDA vs CPU-ref)"
     );
 
     Ok(())
+}
+
+#[test]
+fn iq2xxs_cuda_matmul() -> Result<()> {
+    test_iq_matmul(GgmlDType::IQ2XXS)
 }
 
 #[test]
@@ -196,14 +190,25 @@ fn test_iq_dequantize_finite(dtype: GgmlDType) -> Result<()> {
     let vals = w.flatten_all()?.to_vec1::<f32>()?;
     assert_eq!(vals.len(), n_rows * n_cols, "len for {dtype:?}");
     for (i, &v) in vals.iter().enumerate() {
-        assert!(v.is_finite(), "non-finite dequant value at {i} for {dtype:?}: {v}");
+        assert!(
+            v.is_finite(),
+            "non-finite dequant value at {i} for {dtype:?}: {v}"
+        );
     }
     // Sanity: not all values are identical NaN/sentinel — at least one finite
     // value exists (already checked above) and the min/max are finite.
     let min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    assert!(min.is_finite() && max.is_finite(), "min/max not finite for {dtype:?}: {min} {max}");
+    assert!(
+        min.is_finite() && max.is_finite(),
+        "min/max not finite for {dtype:?}: {min} {max}"
+    );
     Ok(())
+}
+
+#[test]
+fn iq2xxs_cuda_dequantize() -> Result<()> {
+    test_iq_dequantize_finite(GgmlDType::IQ2XXS)
 }
 
 #[test]
@@ -264,9 +269,20 @@ fn test_iq_matmul_multiblock(dtype: GgmlDType) -> Result<()> {
 
     let res_cpu = res.to_device(&Device::Cpu)?;
     let diff = (&res_cpu - &ref_mm)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    assert!(diff.is_finite(), "non-finite multiblock diff {diff} for {dtype:?}");
-    assert!(diff < 1e-2, "multiblock diff {diff} too large for {dtype:?}");
+    assert!(
+        diff.is_finite(),
+        "non-finite multiblock diff {diff} for {dtype:?}"
+    );
+    assert!(
+        diff < 1e-2,
+        "multiblock diff {diff} too large for {dtype:?}"
+    );
     Ok(())
+}
+
+#[test]
+fn iq2xxs_cuda_matmul_multiblock() -> Result<()> {
+    test_iq_matmul_multiblock(GgmlDType::IQ2XXS)
 }
 
 #[test]
@@ -277,4 +293,183 @@ fn iq3xxs_cuda_matmul_multiblock() -> Result<()> {
 #[test]
 fn iq4xs_cuda_matmul_multiblock() -> Result<()> {
     test_iq_matmul_multiblock(GgmlDType::IQ4XS)
+}
+
+fn make_iq_experts(
+    dtype: GgmlDType,
+    n_experts: usize,
+    n: usize,
+    k: usize,
+    seed: u32,
+    device: &Device,
+) -> Result<QTensor> {
+    assert_eq!(k % QK_K, 0);
+    assert!(matches!(
+        dtype,
+        GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ3S
+    ));
+    let blocks = n_experts * n * k / QK_K;
+    let mut raw = vec![0u8; blocks * dtype.type_size()];
+    let mut state = seed;
+    for block in raw.chunks_exact_mut(dtype.type_size()) {
+        let d = f16::from_f32(0.125).to_le_bytes();
+        block[..2].copy_from_slice(&d);
+        for byte in &mut block[2..] {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+    }
+    let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, dtype)?;
+    QTensor::new(storage, (n_experts, n, k))
+}
+
+fn exact_q8_input(batch: usize, topk: usize, k: usize) -> Vec<f32> {
+    let mut values = Vec::with_capacity(batch * topk * k);
+    for task in 0..batch * topk {
+        for pos in 0..k {
+            let in_block = pos % 32;
+            let q = if in_block == 0 {
+                127
+            } else {
+                ((pos * 17 + task * 29) % 255) as i32 - 127
+            };
+            values.push(q as f32);
+        }
+    }
+    values
+}
+
+fn assert_indexed_matches_dequantized(
+    weights: &QTensor,
+    input_data: &[f32],
+    ids_data: &[u32],
+    batch: usize,
+    topk: usize,
+    n: usize,
+    k: usize,
+    output: &Tensor,
+) -> Result<()> {
+    let weights_cpu = weights
+        .dequantize(&weights.device())?
+        .to_device(&Device::Cpu)?
+        .to_vec3::<f32>()?;
+    let output_cpu = output.to_device(&Device::Cpu)?.to_vec3::<f32>()?;
+    for b in 0..batch {
+        for t in 0..topk {
+            let task = b * topk + t;
+            let expert = ids_data[task] as usize;
+            let input = &input_data[task * k..(task + 1) * k];
+            for row in 0..n {
+                let expected: f32 = weights_cpu[expert][row]
+                    .iter()
+                    .zip(input)
+                    .map(|(w, x)| w * x)
+                    .sum();
+                let actual = output_cpu[b][t][row];
+                let tolerance = 0.02 + expected.abs() * 1e-4;
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "indexed {:?} mismatch b={b} topk={t} row={row}: actual={actual} expected={expected} tolerance={tolerance}",
+                    weights.dtype()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn test_iq_indexed_moe(dtype: GgmlDType, batch: usize) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (n_experts, n, k, topk) = (5, 7, 2 * QK_K, 8);
+    let weights = make_iq_experts(dtype, n_experts, n, k, 7, &device)?;
+    let input_data = exact_q8_input(batch, topk, k);
+    let input = Tensor::from_slice(&input_data, (batch, topk, k), &device)?;
+    let ids_data: Vec<u32> = (0..batch * topk)
+        .map(|task| ((task * 3 + 1) % n_experts) as u32)
+        .collect();
+    let ids = Tensor::from_slice(&ids_data, (batch, topk), &device)?;
+
+    let output = weights.indexed_moe_forward_cuda(&input, &ids)?;
+    assert_eq!(output.shape().dims(), [batch, topk, n]);
+    assert_indexed_matches_dequantized(&weights, &input_data, &ids_data, batch, topk, n, k, &output)
+}
+
+#[test]
+fn iq2s_indexed_moe_matches_dequantized_reference() -> Result<()> {
+    test_iq_indexed_moe(GgmlDType::IQ2S, 4)
+}
+
+#[test]
+fn iq2xxs_indexed_moe_matches_dequantized_reference() -> Result<()> {
+    for batch in [1, 4, 5] {
+        test_iq_indexed_moe(GgmlDType::IQ2XXS, batch)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn iq2xxs_indexed_moe_shared_input_batch5_matches_dequantized_reference() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (n_experts, n, k, batch, topk) = (5, 7, 2 * QK_K, 5, 8);
+    let weights = make_iq_experts(GgmlDType::IQ2XXS, n_experts, n, k, 31, &device)?;
+    let full_input = exact_q8_input(batch, topk, k);
+    let input_data: Vec<f32> = (0..batch)
+        .flat_map(|b| full_input[b * topk * k..b * topk * k + k].iter().copied())
+        .collect();
+    let input = Tensor::from_slice(&input_data, (batch, 1, k), &device)?;
+    let ids_data: Vec<u32> = (0..batch * topk)
+        .map(|task| ((task * 3 + 1) % n_experts) as u32)
+        .collect();
+    let ids = Tensor::from_slice(&ids_data, (batch, topk), &device)?;
+    let output = weights.indexed_moe_forward_cuda(&input, &ids)?;
+    let expanded: Vec<f32> = (0..batch)
+        .flat_map(|b| {
+            let row = input_data[b * k..(b + 1) * k].to_vec();
+            (0..topk).flat_map(move |_| row.clone())
+        })
+        .collect();
+    assert_indexed_matches_dequantized(&weights, &expanded, &ids_data, batch, topk, n, k, &output)
+}
+
+#[test]
+fn iq3s_indexed_moe_matches_dequantized_reference() -> Result<()> {
+    test_iq_indexed_moe(GgmlDType::IQ3S, 4)
+}
+
+fn test_iq2_indexed_moe_dual(dtype: GgmlDType) -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (n_experts, n, k, batch, topk) = (3, 5, 2 * QK_K, 2, 8);
+    let gate = make_iq_experts(dtype, n_experts, n, k, 11, &device)?;
+    let up = make_iq_experts(dtype, n_experts, n, k, 19, &device)?;
+    let input_data = exact_q8_input(batch, topk, k);
+    let input = Tensor::from_slice(&input_data, (batch, topk, k), &device)?;
+    let ids_data: Vec<u32> = (0..batch * topk)
+        .map(|task| ((task * 2 + 1) % n_experts) as u32)
+        .collect();
+    let ids = Tensor::from_slice(&ids_data, (batch, topk), &device)?;
+
+    let gate_single = gate.indexed_moe_forward_cuda(&input, &ids)?;
+    let up_single = up.indexed_moe_forward_cuda(&input, &ids)?;
+    let (gate_dual, up_dual) = gate.indexed_moe_forward_dual_cuda(&up, &input, &ids)?;
+    let gate_diff = (&gate_single - &gate_dual)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    let up_diff = (&up_single - &up_dual)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    assert_eq!(gate_diff, 0.0, "gate dual differs from single");
+    assert_eq!(up_diff, 0.0, "up dual differs from single");
+    Ok(())
+}
+
+#[test]
+fn iq2s_indexed_moe_dual_matches_single() -> Result<()> {
+    test_iq2_indexed_moe_dual(GgmlDType::IQ2S)
+}
+
+#[test]
+fn iq2xxs_indexed_moe_dual_matches_single() -> Result<()> {
+    test_iq2_indexed_moe_dual(GgmlDType::IQ2XXS)
 }

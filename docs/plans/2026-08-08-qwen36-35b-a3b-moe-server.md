@@ -229,6 +229,8 @@ Covers: FR-003, FR-004, FR-005, foundation for FR-017 and FR-030.
 
 ### Phase 3 — Dynamic-loaded PTX MoE backend and required quant matrix (60–90 hours)
 
+Status: in progress — target UD-IQ2_XXS routed dtype set (`IQ2_XXS`, `IQ2_S`, `IQ3_S`) has direct F32 sparse kernels and CUDA parity tests. PTX remains diagnostic-only: full-model greedy diverges from reference because sparse F32 reduction order differs from dequantize+cuBLAS; B=1/B=4 throughput passes current reference benchmark but exact parity still blocks promotion.
+
 Files:
 
 - `candle-kernels/src/moe_quantized.cu` — new PTX-compatible routed expert kernels; no CUDA Runtime API calls.
@@ -249,6 +251,23 @@ Tasks:
 5. Precompute/reuse workspace per maximum chunk and four slots. Remove runtime allocation from repeated layer calls.
 6. Add guards for alignment, block divisibility, shape, device, dtype, top-k, and workspace capacity; check launch errors at debug synchronization points.
 7. Retire the production use of `candle-kernels/src/ffi.rs` MoE symbols and document old `candle-kernels/src/moe/` as reference-only until deletion after acceptance.
+
+Progress:
+
+- [x] Add direct packed sparse kernels for target routed dtypes `IQ2_XXS`, `IQ2_S`, and `IQ3_S`; keep activation F32 and avoid full expert dequantization.
+- [x] Add Candle dispatch for single/dual projection calls; IQ gate/up currently uses two measured-faster launches on RTX 3060.
+- [x] Fix GPU top-k normalization: all eight route weights now share one selected-weight sum.
+- [x] Add CUDA projection parity for B=1/B=4, prefill-shaped B=5, shared-input layout, multiple expert IDs/rows/blocks, and single-vs-dual calls.
+- [x] Add GPU router parity against stable CPU top-8 and normalized weights.
+- [x] Run target GGUF smoke and warm benchmarks: B=1 PTX 9.13 vs reference 7.52 tok/s; B=4 PTX 21.09 vs reference 19.67 tok/s.
+- [ ] Establish full-model numerical tolerance/logit parity and exact greedy policy; current exact sequence diverges despite isolated projection tolerance passing.
+- [ ] Add grouped prefill kernels, reusable workspace, remaining required quant matrix, leak/long-prefill checks, and llama.cpp parity.
+
+Deviations:
+
+- deviated: target UD-IQ2_XXS is physically mixed: routed tensors contain 80 `IQ2_XXS`, 37 `IQ2_S`, and 3 `IQ3_S`; implemented exact discovered set instead of filename-only `IQ2_XXS` dispatch.
+- deviated: reused working runtime-loaded `quantized.cu` indexed operation instead of introducing another production launcher through incomplete `moe_quantized.cu`; one backend avoids duplicate ABI and lookup tables.
+- deviated: exact reference/PTX greedy parity remains blocking because F32 accumulation order differs; runtime default remains `reference`.
 
 Independent exit check: each quant passes dequant/reference numerical tests, random routing, empty experts, all tokens selecting one expert, top-8 duplicates guard, decode B=1..4, long prefill, and repeated-workspace leak checks on Windows CUDA 12.4.
 

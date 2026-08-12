@@ -5146,6 +5146,152 @@ extern "C" __global__ void
 }
 
 
+template <typename block_q_t, float (*dequant_value)(const block_q_t *, int)>
+__device__ void indexed_moe_forward_iq_f32(
+    const void * __restrict__ all_weights,
+    const float * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int topk,
+    const int input_dim1) {
+
+    constexpr int max_batch = 4;
+    const int current_batch = blockIdx.y;
+    const int current_topk = blockIdx.z;
+    const int task_id = current_batch * topk + current_topk;
+    const unsigned int expert_id = indices[task_id];
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int blocks_per_row = k / QK_K;
+    const block_q_t * w = (const block_q_t *)all_weights
+        + ((size_t)expert_id * n + row) * blocks_per_row;
+
+    if (gridDim.y == 1 || gridDim.y > max_batch) {
+        const int input_idx = input_dim1 == 1 ? current_batch : task_id;
+        const float * x = all_inputs + (size_t)input_idx * k;
+        float sum = 0.f;
+        for (int pos = threadIdx.x; pos < k; pos += blockDim.x) {
+            sum += dequant_value(w + pos / QK_K, pos % QK_K) * x[pos];
+        }
+        sum = warp_reduce_sum(sum);
+        __shared__ float single_warp_sums[4];
+        if (threadIdx.x % WARP_SIZE == 0) {
+            single_warp_sums[threadIdx.x / WARP_SIZE] = sum;
+        }
+        __syncthreads();
+        if (threadIdx.x < WARP_SIZE) {
+            sum = threadIdx.x < 4 ? single_warp_sums[threadIdx.x] : 0.f;
+            sum = warp_reduce_sum(sum);
+            if (threadIdx.x == 0) all_outputs[(size_t)task_id * n + row] = sum;
+        }
+        return;
+    }
+
+    // Same-rank routes often coincide across decode slots. First matching batch
+    // owns computation; later matching blocks exit. One weight read then feeds
+    // up to four slot accumulators.
+    for (int b = 0; b < current_batch; ++b) {
+        if (indices[b * topk + current_topk] == expert_id) return;
+    }
+    int tasks[max_batch];
+    int task_count = 0;
+    for (int b = current_batch; b < gridDim.y; ++b) {
+        const int candidate = b * topk + current_topk;
+        if (indices[candidate] == expert_id) tasks[task_count++] = candidate;
+    }
+
+    float sums[max_batch] = {0.f, 0.f, 0.f, 0.f};
+    for (int pos = threadIdx.x; pos < k; pos += blockDim.x) {
+        const float value = dequant_value(w + pos / QK_K, pos % QK_K);
+#pragma unroll
+        for (int m = 0; m < max_batch; ++m) {
+            if (m < task_count) {
+                const int input_idx = input_dim1 == 1 ? tasks[m] / topk : tasks[m];
+                sums[m] += value * all_inputs[(size_t)input_idx * k + pos];
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < max_batch; ++m) sums[m] = warp_reduce_sum(sums[m]);
+
+    __shared__ float warp_sums[max_batch][4];
+    if (threadIdx.x % WARP_SIZE == 0) {
+#pragma unroll
+        for (int m = 0; m < max_batch; ++m) {
+            warp_sums[m][threadIdx.x / WARP_SIZE] = sums[m];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < WARP_SIZE) {
+#pragma unroll
+        for (int m = 0; m < max_batch; ++m) {
+            float sum = threadIdx.x < 4 ? warp_sums[m][threadIdx.x] : 0.f;
+            sum = warp_reduce_sum(sum);
+            if (threadIdx.x == 0 && m < task_count) {
+                all_outputs[(size_t)tasks[m] * n + row] = sum;
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ float iq2_s_value(const block_iq2_s * bq2, int pos) {
+    const int ib32 = pos / 32;
+    const int sub_pos = pos % 32;
+    const int il = sub_pos / 16;
+    const int half = (sub_pos % 16) / 8;
+    const int elem = pos % 8;
+    const uint8_t qh = bq2->qh[ib32] >> (4 * il);
+    const int group = 2 * il + half;
+    const int grid_idx = bq2->qs[4 * ib32 + group] | ((qh << (8 - 2 * half)) & 0x300);
+    const uint8_t * grid = (const uint8_t *)(iq2s_grid + grid_idx);
+    const uint8_t signs = bq2->qs[QK_K / 8 + 4 * ib32 + group];
+    const float d = __half2float(bq2->d)
+        * (0.5f + (float)((bq2->scales[ib32] >> (4 * il)) & 0xf)) * 0.25f;
+    return d * (float)grid[elem] * (signs & kmask_iq2xs[elem] ? -1.f : 1.f);
+}
+
+static __device__ __forceinline__ float iq2_xxs_value(const block_iq2_xxs * bq2, int pos) {
+    const int ib32 = pos / 32;
+    const int group = (pos % 32) / 8;
+    const int elem = pos % 8;
+    const uint16_t * q2 = bq2->qs + 4 * ib32;
+    const uint32_t aux32_g = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux32_s = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + ((const uint8_t *)&aux32_g)[group]);
+    const uint8_t signs = ksigns_iq2xs[(aux32_s >> (7 * group)) & 127];
+    const float d = __half2float(bq2->d) * (0.5f + (float)(aux32_s >> 28)) * 0.25f;
+    return d * (float)grid[elem] * (signs & kmask_iq2xs[elem] ? -1.f : 1.f);
+}
+
+static __device__ __forceinline__ float iq3_s_value(const block_iq3_s * bq3, int pos) {
+    const int ib32 = pos / 32;
+    const int group = (pos % 32) / 4;
+    const int elem = pos % 4;
+    const int pair = group % 2;
+    const int grid_idx = bq3->qs[8 * ib32 + group]
+        | (bq3->qh[ib32] & kmask_iq2xs[group] ? 256 : 0);
+    const uint8_t * grid = (const uint8_t *)(iq3s_grid + grid_idx);
+    const uint8_t signs = bq3->signs[4 * ib32 + group / 2];
+    const float d = __half2float(bq3->d)
+        * (1.f + 2.f * (float)((bq3->scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf));
+    return d * (float)grid[elem]
+        * (signs & kmask_iq2xs[elem + 4 * pair] ? -1.f : 1.f);
+}
+
+#define IQ_MOE_F32_EXTERN(name, BLOCK_, VALUE_) \
+extern "C" __global__ void name( \
+    const void * weights, const float * inputs, const unsigned int * ids, float * outputs, \
+    const int n, const int k, const int batch, const int topk, const int input_dim1) { \
+    indexed_moe_forward_iq_f32<BLOCK_, VALUE_>(weights, inputs, ids, outputs, n, k, topk, input_dim1); \
+}
+
+IQ_MOE_F32_EXTERN(indexed_moe_forward_iq2_s_f32, block_iq2_s, iq2_s_value)
+IQ_MOE_F32_EXTERN(indexed_moe_forward_iq2_xxs_f32, block_iq2_xxs, iq2_xxs_value)
+IQ_MOE_F32_EXTERN(indexed_moe_forward_iq3_s_f32, block_iq3_s, iq3_s_value)
+
 /**
  * @brief Performs an indexed, batched matrix-vector multiplication for quantized tensors (for MoE models).
  *

@@ -115,7 +115,9 @@ extern "C" __global__ void moe_softmax_topk_kernel(
 
     // --- Iterative argmax top-k ---
     // Strict `>` → first max wins → tie-break by lower expert index (matches llama.cpp).
-    float weight_sum = 0.0f;
+    __shared__ float selected_weight_sum;
+    if (tid == 0) selected_weight_sum = 0.0f;
+    __syncthreads();
     for (int k = 0; k < topk; k++) {
         // Each thread finds local max among unmasked experts
         float best_val = -INFINITY;
@@ -167,7 +169,7 @@ extern "C" __global__ void moe_softmax_topk_kernel(
                 expert_ids[token * topk + k] = sel;
                 float w = probs[sel];
                 weights[token * topk + k] = w;
-                weight_sum += w;
+                selected_weight_sum += w;
             } else {
                 expert_ids[token * topk + k] = 0;
                 weights[token * topk + k] = 0.0f;
@@ -177,10 +179,8 @@ extern "C" __global__ void moe_softmax_topk_kernel(
     }
 
     // --- Normalize weights if norm_topk_prob ---
-    if (norm_topk_prob && weight_sum > 0.0f) {
-        if (tid < topk) {
-            weights[token * topk + tid] /= weight_sum;
-        }
+    if (norm_topk_prob && selected_weight_sum > 0.0f && tid < topk) {
+        weights[token * topk + tid] /= selected_weight_sum;
     }
 }
 

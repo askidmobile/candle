@@ -284,10 +284,16 @@ impl Qwen35MoeBlock {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let tot = TOTAL.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed)
-                + t0.elapsed().as_micros() as u64;
+            let tot = TOTAL.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            ) + t0.elapsed().as_micros() as u64;
             if n % 40 == 0 {
-                eprintln!("[moe] routed_swiglu avg {:.2}ms over {} calls", tot as f64 / n as f64 / 1000.0, n);
+                eprintln!(
+                    "[moe] routed_swiglu avg {:.2}ms over {} calls",
+                    tot as f64 / n as f64 / 1000.0,
+                    n
+                );
             }
         }
         let combined = routed.broadcast_add(&shared)?;
@@ -306,7 +312,12 @@ impl Qwen35MoeBlock {
         let cuda_dev = device.as_cuda_device()?;
 
         // Router на GPU.
-        let logits = self.router.linear.forward(xs)?.to_dtype(DType::F32)?.contiguous()?;
+        let logits = self
+            .router
+            .linear
+            .forward(xs)?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
         let (ids_t, w_t) = gpu_softmax_topk(
             cuda_dev,
             &logits,
@@ -323,15 +334,12 @@ impl Qwen35MoeBlock {
             .contiguous()?;
 
         // gate+up одним dual GEMM.
-        let (gate, up) = self
-            .routed
-            .gate
-            .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
+        let (gate, up) =
+            self.routed
+                .gate
+                .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
         let act = gate.silu()?.mul(&up)?.contiguous()?;
-        let down = self
-            .routed
-            .down
-            .indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
+        let down = self.routed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
 
         // Взвешивание GPU-весами + редукция по topk.
         let w = w_t.unsqueeze(candle_core::D::Minus1)?; // [tokens, topk, 1]
@@ -363,7 +371,7 @@ impl MoeBackend {
 
 /// Fused MoE путь (CUDA): indexed_moe_forward ядра — одна группа запусков на
 /// проекцию вместо per-expert dequantize_rowslice (~1000 launches/шаг).
-/// Работает для K-quants/Q8_0 экспертов (35B UD-Q4_K_M). IQ2_XXS — нет ядра.
+/// Работает для IQ2_S/IQ2_XXS/IQ3_S и K-quants/Q8_0 экспертов.
 #[cfg(feature = "cuda")]
 fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) -> Result<Tensor> {
     // UD-кванты динамические: часть тензоров может быть IQ (нет indexed ядра) —
@@ -372,7 +380,10 @@ fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) ->
     let supported = |qt: &Arc<QTensor>| {
         matches!(
             qt.dtype(),
-            GgmlDType::Q8_0
+            GgmlDType::IQ3S
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ2XXS
+                | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
                 | GgmlDType::Q4K
@@ -448,7 +459,7 @@ fn reference_routed_swiglu(
     let gate_dims = experts.gate.shape().dims();
     // Packed shape can be [n_experts, n_ff, n_embd] (3D) or a flat [n_experts*n_ff*n_embd].
     let n_ff = match gate_dims {
-        [_, a, _b] => *a,                    // [n_experts, n_ff, n_embd]
+        [_, a, _b] => *a, // [n_experts, n_ff, n_embd]
         _ => candle_core::bail!(
             "reference_routed_swiglu: unexpected gate rank {:?}",
             gate_dims
@@ -471,7 +482,7 @@ fn reference_routed_swiglu(
             down_dims
         ),
     };
-    let gate_k = n_ff * n_embd;      // cols of 2D view [n_experts, n_ff*n_embd]
+    let gate_k = n_ff * n_embd; // cols of 2D view [n_experts, n_ff*n_embd]
 
     // Group tokens by selected expert: expert → [(token_idx, weight)].
     let mut expert_tokens: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_experts];
@@ -586,4 +597,62 @@ fn gpu_softmax_topk(
     let w_storage = candle_core::CudaStorage::wrap_cuda_slice(weights, dev.clone());
     let w_t = Tensor::from((candle_core::Storage::Cuda(w_storage), (n_tokens, topk)));
     Ok((ids_t, w_t))
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_router_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_router_matches_stable_cpu_top8() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let n_tokens = 4usize;
+        let n_experts = 256usize;
+        let topk = 8usize;
+        let logits: Vec<f32> = (0..n_tokens * n_experts)
+            .map(|i| {
+                let token = i / n_experts;
+                let expert = i % n_experts;
+                (((expert * 73 + token * 29) % 997) as f32 - 498.0) / 37.0
+            })
+            .collect();
+        let logits_t = Tensor::from_slice(&logits, (n_tokens, n_experts), &device)?;
+        let (ids, weights) =
+            gpu_softmax_topk(device.as_cuda_device()?, &logits_t, n_experts, topk, true)?;
+        let ids = ids.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let weights = weights.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
+
+        for token in 0..n_tokens {
+            let row = &logits[token * n_experts..(token + 1) * n_experts];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exp: Vec<f32> = row.iter().map(|x| (x - max).exp()).collect();
+            let exp_sum: f32 = exp.iter().sum();
+            let probs: Vec<f32> = exp.iter().map(|x| x / exp_sum).collect();
+            let mut expected_ids: Vec<usize> = (0..n_experts).collect();
+            expected_ids.sort_by(|a, b| {
+                probs[*b]
+                    .partial_cmp(&probs[*a])
+                    .unwrap()
+                    .then_with(|| a.cmp(b))
+            });
+            expected_ids.truncate(topk);
+            let selected_sum: f32 = expected_ids.iter().map(|&e| probs[e]).sum();
+
+            assert_eq!(
+                ids[token],
+                expected_ids.iter().map(|&e| e as u32).collect::<Vec<_>>()
+            );
+            for rank in 0..topk {
+                let expected = probs[expected_ids[rank]] / selected_sum;
+                assert!(
+                    (weights[token][rank] - expected).abs() < 1e-6,
+                    "token={token} rank={rank}: actual={} expected={expected}",
+                    weights[token][rank]
+                );
+            }
+            let sum: f32 = weights[token].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "token={token} sum={sum}");
+        }
+        Ok(())
+    }
 }
