@@ -60,7 +60,8 @@ extern "C" __global__ void flash_decode_partial(
     }
     __syncthreads();
 
-    // Lane-uniform state (каждый lane хранит копию m/l своего warp'а).
+    // m/l — WARP-UNIFORM: одинаковые на всех lanes (shfl broadcast после reduce).
+    // Раньше: lane-uniform → расхождение m/l → поломка softmax → мусор.
     float m_l = -INFINITY;
     float l_l = 0.0f;
     // acc: lane владеет 8 выходными dim своего warp'а (8×32=256).
@@ -80,6 +81,8 @@ extern "C" __global__ void flash_decode_partial(
         for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffff, part, o);
         const float dot = part * params.scale;
 
+        // m/l — warp-uniform (все lanes имеют ОДИНАКОВЫЕ m_l/l_l
+        // т.к. dot warp-uniform, а m_l/l_l инициализированы одинаково).
         const float m_new = fmaxf(m_l, dot);
         const float corr = __expf(m_l - m_new);
         const float p_exp = __expf(dot - m_new);
