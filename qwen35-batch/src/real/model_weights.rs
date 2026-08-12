@@ -1474,7 +1474,7 @@ struct DeltaNetCudaContext {
 /// быть ≤ capacity. B=4 покрывает целевой continuous-batching throughput
 /// (aggregate B=4 > B=1, см. Phase 6 benchmark). GPU cost batched state:
 /// ~B × n_v×head_v_dim² × 4 байт ≈ KB–MB per layer — пренебрежимо vs весов.
-const DECODE_BATCH_CAPACITY: u32 = 8;
+const DECODE_BATCH_CAPACITY: u32 = 4;
 
 /// Metal GPU batched-контекст DeltaNet (Phase 3 true batched decode).
 /// Pipelines + temp — shared (Arc) через все слои (один compile/аллокация);
