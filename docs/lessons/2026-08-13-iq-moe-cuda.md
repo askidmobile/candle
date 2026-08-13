@@ -29,7 +29,9 @@ Windows CUDA 12.4, RTX 3060 12 GB, 128 output tokens, warmed server:
 
 Full-model exact greedy diverges between reference and PTX. CPU-router/PTX-projection probe also diverges, localizing remaining drift to projection/reduction accumulation order rather than routing. Candle teacher-forced comparison found 5/128 argmax divergences, all at reference margins below 0.183.
 
-Pinned llama.cpp commit `8e7f22b67ef4667b4ddd50230771287f328cfb3f` was built on RTX 3060 with MSVC 19.44, CUDA 12.4, NMake, and SM86. An exact-token diagnostic probe fed the same 33 prompt tokens and 128 teacher-forced continuation tokens to all three paths. Results:
+Pinned llama.cpp commit `8e7f22b67ef4667b4ddd50230771287f328cfb3f` was built on RTX 3060 with MSVC 19.44, CUDA 12.4, NMake, and SM86. Visual Studio CMake generator was unsuitable: installed VS CUDA integration forced 13.2 despite `CMAKE_CUDA_COMPILER` pointing at 12.4. NMake respected the requested toolkit. Parallel NMake attempts left orphan compiler processes that locked `.obj` files; stop orphan build processes and resume serially after an interrupted SSH command.
+
+An exact-token diagnostic probe fed the same 33 prompt tokens and 128 teacher-forced continuation tokens to all three paths. Results:
 
 - all three agreed on 123/128 argmax decisions;
 - PTX matched llama.cpp on disputed steps 16 and 45;

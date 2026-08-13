@@ -23,6 +23,7 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **PATH for CUDA**: `set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin;...;%PATH%"` only inside a `.bat`. CUDA is v12.4 on yttri-win (NOT v13.2 — the env var auto-detect picks 13.2 if not overridden).
 - **MSVC for nvcc**: nvcc needs `cl.exe` in PATH. Must `call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64` before `cargo build/test --features cuda`. Without it: `nvcc fatal: Cannot find compiler 'cl.exe' in PATH`.
 - **Build candle with CUDA on yttri-win**: use a `.bat` that sets VsDevCmd + CUDA env then runs cargo. Pattern: `D:\Projects\yttri-build\run_iq_tests.bat`. Do NOT run bare `cargo test --features cuda` over SSH — it lacks MSVC env.
+- **No parent Cargo manifest.** Stray `D:\Projects\yttri-build\Cargo.toml` makes server dependency workspace inheritance fail; keep it renamed outside Cargo discovery.
 - **Run IQ CUDA tests**: `ssh yttri-win "cmd /c \"D:\\Projects\\yttri-build\\run_iq_tests.bat\""`. The bat does `cd /d D:\Projects\yttri-build\candle-fork-qwen35-batch && cargo test --features cuda --package candle-core --test iq_quant_cuda_tests`.
 - Repo on yttri-win: `D:\Projects\yttri-build\candle-fork-qwen35-batch` (separate from `candle-fork` which is the older copy).
 - **Build qwen36-server with CUDA**: `ssh -t yttri-win "cmd /c D:\Projects\yttri-build\build_cuda124.bat"` (28s incremental, foreground). The bat calls VsDevCmd + sets CUDA 12.4 PATH then `cargo build --release --features cuda` inside the qwen36-server dir. Do NOT build without `--features cuda` — the binary falls back to CPU device (see qwen36-server section).
@@ -66,7 +67,7 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 
 ## IQ quant CUDA (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS)
 
-- **2-bit CUDA MoE defaults to PTX after margin-aware parity + 4×8K pass.** Use `QWEN36_MOE_BACKEND=reference` only for diagnostic rollback; exact free greedy is diagnostic. Details: `docs/lessons/2026-08-13-iq-moe-cuda.md`.
+- **2-bit CUDA MoE defaults to PTX after margin-aware parity + 4×8K pass.** Use `QWEN36_MOE_BACKEND=reference` only for diagnostic rollback; exact free greedy is diagnostic. Pinned llama.cpp CUDA build uses NMake because VS generator binds installed CUDA integration 13.2 instead of requested 12.4. Details: `docs/lessons/2026-08-13-iq-moe-cuda.md`.
 - **Isolated CUDA tests**: `candle-core/tests/iq_quant_cuda_tests.rs`. Run via `run_iq_tests.bat` on yttri-win. All 12 tests PASS (matmul dispatches to `cuda_fwd`, dequantize finite, multiblock correct) as of 2026-08-08.
 - **The candle dispatch is CORRECT.** `QMatMul::forward` (mod.rs:1037-1060) → `xs.apply_op1_no_bwd(t)` → `Storage::apply_op1` (storage.rs:205-220) dispatches by INPUT storage → `cuda_fwd` for Cuda, `cpu_fwd` for Cpu. `QStorage::from_data` (mod.rs:87-153) routes IQ types to `cuda::load_quantized_bytes` for CUDA device. Loading path verified correct. The only failure mode is building without the cuda feature (see qwen36-server section above).
 - **Dispatch path** (confirmed correct): `QMatMul::forward` → `cuda_fwd` (mod.rs:952-1035 CustomOp1) → for IQ types, fallback to `dequantize + cuBLAS` matmul in `cuda.rs:765`.
