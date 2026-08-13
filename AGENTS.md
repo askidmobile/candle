@@ -72,7 +72,7 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 
 ### CUDA kernel gotchas (2026-08-11)
 
-- **Race в split-K flash-decode (flash_decode.cu)**: первая версия делила `m_shared`/`l_shared` между warps блока — 4 warp'а писали разные dot в одни скаляры → коррупция attention при kv≥2048 → генерация сыпалась в мусор на длине. Фикс: warp = независимый сплиттер, m/l в регистрах (lane-uniform через `__shfl_xor`), partials ×4 на сплит. **Правило: shared-скаляры между warps с разными данными — запрещены; только per-warp регистры + combine.**
+- **Split-K flash-decode stays diagnostic-only.** First version had a cross-warp `m/l` race and corrupted generation at KV≥2048. Per-warp registers removed the race, but a 2025-state FA2 A/B still first diverges exactly at KV=2048 (nRMSE 0.01248, max abs 0.173) with no speed gain. FA2 is default; `QWEN36_ENABLE_SPLITK_DECODE=1` is explicit diagnostic opt-in.
 - **Проверка деградации текстом**: uniq-3gram НЕ ловит цифро-мусор («2222», «( ( (»). Всегда читать хвост генерации глазами на 3K+ токенов.
 - **Build trap**: новый `.cu` в candle-kernels без `rerun-if-changed` → ptx.rs не перегенерируется, kernel не найден. build.rs теперь следит за всеми `src/*.cu`.
 

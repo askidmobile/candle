@@ -361,6 +361,7 @@ fn dequantize_mul_mat_vec_via_cublas(
     rhs.matmul(&data_f32, (b, m, nrows, ncols), rhs_l, &weight_l)
 }
 
+#[cfg(test)]
 fn dequantize_mul_mat_vec(
     data: &PaddedCudaSlice,
     y: &CudaView<f32>,

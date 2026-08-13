@@ -816,7 +816,8 @@ impl QTensor {
         &self.shape
     }
 
-    /// Внутренний accessor к QStorage (для intra-crate dispatch helpers как `q4k_opt::matmul_q4k_opt_metal`).
+    /// Внутренний accessor к QStorage для Metal Q4K dispatch helpers.
+    #[cfg(target_os = "macos")]
     pub(crate) fn storage(&self) -> &QStorage {
         &self.storage
     }

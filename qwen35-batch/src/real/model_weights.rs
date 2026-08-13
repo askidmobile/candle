@@ -3225,13 +3225,12 @@ impl GatedAttentionLayer {
                 candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?
                     .to_dtype(DType::F32)?
             } else {
-                // CUDA: flash. При kv_len >= 2048 — split-K flash-decoding
-                // (FA2 при q=1 занимает только n_head блоков — latency-bound
-                // на длинном KV). Иначе FA2.
+                // CUDA: FA2 default. Split-K remains diagnostic-only: at
+                // kv_len=2048 it drifts from FA2 without a throughput gain.
                 #[cfg(feature = "cuda")]
                 {
                     let splitk_ok = kv_len >= 2048
-                        && std::env::var("QWEN36_DISABLE_SPLITK_DECODE").is_err();
+                        && std::env::var("QWEN36_ENABLE_SPLITK_DECODE").as_deref() == Ok("1");
                     if splitk_ok {
                         super::flash_decode_cuda::dispatch_flash_decode(
                             device.as_cuda_device()?,

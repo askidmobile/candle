@@ -1,8 +1,5 @@
-//! Split-K flash-decoding dispatch (CUDA). Длинный KV при decode:
-//! FA2 при seqlen_q=1 занимает только n_head блоков (24 для 27B) —
-//! latency-bound. Здесь KV параллелится на S чанков (grid (n_head, S)).
-//!
-//! Порог включения — kv_len >= 2048 (ниже FA2 быстрее/равен).
+//! Diagnostic split-K flash-decoding dispatch (CUDA). Long-KV parity still
+//! differs from FA2, so production requires explicit `QWEN36_ENABLE_SPLITK_DECODE=1`.
 
 use candle_core::{CudaDevice, Result, Storage, Tensor};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};

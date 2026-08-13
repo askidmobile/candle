@@ -162,6 +162,82 @@ fn real_qwen35_batched_logits_equal_single() {
     );
 }
 
+#[test]
+#[ignore = "требует GGUF + GPU; same-slot reset/replay full-logits parity"]
+fn real_qwen35_same_slot_replay_is_bit_exact() {
+    let gguf = gguf_path();
+    assert!(gguf.exists(), "GGUF не найден: {:?}", gguf);
+    let device = accelerator_device();
+    let mut adapter = Qwen35BatchAdapter::load(&gguf, device, 1).expect("load adapter");
+    let prompt = dummy_prompt_ids(42, 25);
+    let steps = 16;
+
+    let mut logits = adapter
+        .prefill_chunk(&PrefillChunk {
+            slot_idx: 0,
+            reset_first: true,
+            tokens: prompt.clone(),
+            start_pos: 0,
+        })
+        .expect("first prefill");
+    let mut expected = Vec::with_capacity(steps);
+    let mut forced = Vec::with_capacity(steps - 1);
+    for step in 0..steps {
+        expected.push(logits);
+        if step + 1 == steps {
+            break;
+        }
+        let token = expected[step]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32;
+        forced.push(token);
+        logits = adapter
+            .decode_batch(&DecodeBatch {
+                items: vec![DecodeItem {
+                    slot_idx: 0,
+                    token,
+                    pos: prompt.len() + step,
+                }],
+            })
+            .expect("first decode")
+            .pop()
+            .unwrap();
+    }
+
+    adapter.reset_slot(0).expect("reset slot");
+    let mut actual = adapter
+        .prefill_chunk(&PrefillChunk {
+            slot_idx: 0,
+            reset_first: true,
+            tokens: prompt.clone(),
+            start_pos: 0,
+        })
+        .expect("second prefill");
+    for step in 0..steps {
+        assert_eq!(
+            actual, expected[step],
+            "full logits differ at replay step {step}"
+        );
+        if step + 1 == steps {
+            break;
+        }
+        actual = adapter
+            .decode_batch(&DecodeBatch {
+                items: vec![DecodeItem {
+                    slot_idx: 0,
+                    token: forced[step],
+                    pos: prompt.len() + step,
+                }],
+            })
+            .expect("second decode")
+            .pop()
+            .unwrap();
+    }
+}
+
 #[derive(Debug)]
 struct BenchResult {
     batch: usize,

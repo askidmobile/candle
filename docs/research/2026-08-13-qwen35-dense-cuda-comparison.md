@@ -152,6 +152,32 @@ Production gain is 2.8% at B=1 and 34.6% at B=4. Candle batch scaling now matche
 
 After optimization, remaining B=4 host attention work is concentrated in per-slot full-cache Q8 dequantization and FA2 dispatch. A fused Q8-cache attention path or a layout that permits batched cache reads is the next evidence-based target. GPU argmax is secondary after the one-transfer logits fix.
 
+## Long-context split-K rollback
+
+A user-visible numerical-list degeneration appeared around 2K context tokens and disappeared temporarily after submitting the same conversation again. The exact boundary matched the custom split-K flash-decode threshold rather than the configured 32K context limit.
+
+An isolated 2025-state teacher-forced A/B used identical model state and tokens. FA2 and split-K logits were bit-exact through step 2014, then first diverged at step 2015 when KV length reached 2048. Full-vector metrics at the first affected state:
+
+| Metric | FA2 vs split-K |
+|---|---:|
+| cosine | 0.9999225 |
+| nRMSE | 0.01248 |
+| max abs | 0.1730 |
+| argmax | equal, reference margin 5.08 |
+
+The high-margin synthetic state kept the same argmax, but stochastic low-margin generation can choose a different token and then permanently diverge through recurrent state. Split-K also provided no measured throughput gain in this run: FA2 49.80 tok/s versus split-K 49.65 tok/s.
+
+FA2 is therefore the production default at every KV length. Split-K requires explicit diagnostic opt-in with `QWEN36_ENABLE_SPLITK_DECODE=1` until a full long-context parity and performance gate passes.
+
+A second server-side defect reset stochastic RNG state every token by cloning the per-slot sampler map before each scheduler step. The sampler now remains installed for the scheduler lifetime and advances shared per-slot RNG state in place. OpenAI Chat also now accepts the sampling fields already sent by the web UI (`top_k`, `min_p`, `presence_penalty`, `repetition_penalty`, and `seed`) instead of silently ignoring them.
+
+Production validation after both fixes:
+
+- two sequential 2300-token outputs crossed KV=2048 with HTTP 200 and no numerical-list degeneration;
+- fixed seed produced bit-exact output hashes across both runs;
+- direct same-slot reset/replay compared 16 full-logit states and remained bit-exact;
+- invalid sampling values are rejected before generation.
+
 ## Correctness status
 
 - 4B: 128/128 teacher-forced argmax equal.
