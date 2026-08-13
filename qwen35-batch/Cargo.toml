@@ -76,3 +76,13 @@ required-features = ["real-model"]
 name = "vocab_probe"
 path = "src/bin/vocab_probe.rs"
 required-features = ["real-model"]
+
+[[bin]]
+name = "qwen35moe_logits"
+path = "src/bin/qwen35moe_logits.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
+name = "qwen35moe_compare"
+path = "src/bin/qwen35moe_compare.rs"
+required-features = ["real-model"]

@@ -260,7 +260,7 @@ Progress:
 - [x] Add CUDA projection parity for B=1/B=4, prefill-shaped B=5, shared-input layout, multiple expert IDs/rows/blocks, and single-vs-dual calls.
 - [x] Add GPU router parity against stable CPU top-8 and normalized weights.
 - [x] Run target GGUF smoke and warm benchmarks: B=1 PTX 9.13 vs reference 7.52 tok/s; B=4 PTX 21.09 vs reference 19.67 tok/s.
-- [ ] Establish full-model numerical tolerance/logit parity and exact greedy policy; current exact sequence diverges despite isolated projection tolerance passing.
+- [ ] Establish full-model numerical tolerance/logit parity and exact greedy policy. Added JSONL logits probe/comparator: stable capital fixture is exact for 2 tokens; teacher-forced Rust fixture has 5/128 low-margin argmax divergences (first at step 16, reference margin 0.0128, cosine 0.999357, nRMSE 0.03695).
 - [ ] Add grouped prefill kernels, reusable workspace, remaining required quant matrix, leak/long-prefill checks, and llama.cpp parity.
 
 Deviations:

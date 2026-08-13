@@ -27,7 +27,7 @@ Windows CUDA 12.4, RTX 3060 12 GB, 128 output tokens, warmed server:
 - CUDA projection tests: 21 passed.
 - GPU router parity test: passed.
 
-Full-model exact greedy still diverges between reference and PTX. CPU-router/PTX-projection probe also diverges, localizing remaining drift to projection/reduction accumulation order rather than routing. Runtime default remains `reference` until stage-level logit tolerance and exact-sequence policy are approved.
+Full-model exact greedy still diverges between reference and PTX. CPU-router/PTX-projection probe also diverges, localizing remaining drift to projection/reduction accumulation order rather than routing. JSONL teacher-forced comparison found 5/128 argmax divergences, all at reference margins below 0.183; first divergence had cosine 0.999357, nRMSE 0.03695, and max absolute logit error 0.618. Runtime default remains `reference` until llama.cpp comparison identifies which accumulation path is closer to the external reference and tolerance policy is approved.
 
 ## References
 
