@@ -24,7 +24,7 @@ Windows CUDA 12.4, RTX 3060 12 GB, 128 output tokens, warmed server:
 
 - B=1: PTX 9.13 tok/s; reference 7.52 tok/s.
 - B=4: PTX 21.09 aggregate tok/s; reference 19.67 aggregate tok/s.
-- CUDA projection tests: 21 passed.
+- Initial target-dtype CUDA projection tests: 21 passed; expanded required-matrix suite later reached 24.
 - GPU router parity test: passed.
 
 Full-model exact greedy diverges between reference and PTX. CPU-router/PTX-projection probe also diverges, localizing remaining drift to projection/reduction accumulation order rather than routing. Candle teacher-forced comparison found 5/128 argmax divergences, all at reference margins below 0.183.
@@ -44,6 +44,25 @@ Exact greedy cannot serve as a binary correctness gate for this 2-bit model: lla
 PTX then passed clean 4×8K stability on committed CUDA build: all four streams returned HTTP 200 and 8140 completion tokens (`52 + 8140 = 8192`), `finish_reason=length`, one `[DONE]`, no malformed JSON, and bit-exact content in 1232.3 seconds. Post-run reuse returned HTTP 200 in 1.71 seconds. GPU shared usage stayed at 76 MiB, committed GPU memory peaked at 11143 MiB, and logs contained no CUDA/error markers.
 
 PTX is now CUDA default only when all routed gate/up/down dtypes have validated kernels. Explicit `QWEN36_MOE_BACKEND=reference` remains diagnostic rollback. Unsupported dtype combinations and invalid backend values fail during model load instead of silently falling back.
+
+## Grouped prefill and physical quant matrix
+
+Header-only manifests for required files showed suffixes still do not identify routed tensors:
+
+- `UD-IQ2_M`: gate/up `IQ2_XXS`; down `IQ3_XXS` or `IQ4_XS`.
+- `UD-IQ3_XXS`: gate/up `IQ2_S`; down `IQ3_XXS` or `IQ4_XS`.
+- `UD-Q2_K_XL`: gate/up `IQ2_XS` (one layer `IQ3_XXS`); down `IQ3_XXS` or `IQ4_XS`.
+- `UD-Q4_K_M`: gate/up `Q4_K`; down `Q5_K` or `Q6_K`.
+
+Add direct F32 sparse decoders for `IQ2_XS`, `IQ3_XXS`, and `IQ4_XS`; existing kernels cover rest. CUDA projection suite now passes 24 tests, including shared input, B=5/B=33, route-tile boundary, empty experts, and all 264 routes selecting one expert.
+
+Materializing `[tokens, topk, hidden]` input cost about 16 MiB at 256-token chunks. Indexed kernels already support shared `[tokens, 1, hidden]`; using it cuts input workspace to about 2 MiB. Alone this changed 5779-token latency by only +0.58%, so it is memory fix, not speed claim.
+
+Synchronized profiling measured FFN at 9.59 of 15.92 seconds (60.3%) for a 163-token prefill. Grouped kernel therefore had measured value. It launches `[output_row, expert]`, scans route IDs in 256-pair tiles, stores matching task IDs in 1 KiB static shared memory, and computes up to eight matching routes per packed weight load. It avoids global sort/count/offset buffers and leaves B=1..4 decode kernel unchanged.
+
+5779-token prefill median improved from 330.282 to 133.007 seconds (2.48×; about 17.5 to 43.5 prompt tok/s). Six repeated runs stayed at 132.44–133.31 seconds; steady dedicated/shared/committed GPU memory spread was zero and shared usage stayed 76 MiB. Reusable per-layer output workspace was rejected: up to roughly 1.2 GiB across 40 layers would violate 12 GB envelope, while grouped path needs no global scratch.
+
+Grouped path passed unchanged 128-state llama.cpp gate and repeat 4×8K: 4×8140 completion tokens in 1232.21 seconds, bit-exact streams, committed peak 11142.9 MiB, shared 76 MiB, free floor 513 MiB, zero CUDA/error markers, post-run reuse 1.09 seconds.
 
 ## References
 

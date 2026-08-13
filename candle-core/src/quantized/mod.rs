@@ -830,7 +830,7 @@ impl QTensor {
     /// Fused indexed MoE matmul на CUDA (q8_1 quantization входа + per-expert
     /// kernel). `self` — packed веса [n_experts, n, k]; input [batch, topk, k]
     /// F32 CUDA; ids [batch, topk] U32. Возвращает [batch, topk, n].
-    /// Поддержанные dtype: IQ2S, IQ2XXS, IQ3S, Q8_0, Q2K-Q6K (см. indexed_moe_forward в cuda.rs).
+    /// Поддержанные dtype: IQ2S/IQ2XS/IQ2XXS, IQ3S/IQ3XXS, IQ4XS, Q8_0, Q2K-Q6K.
     #[cfg(feature = "cuda")]
     pub fn indexed_moe_forward_cuda(&self, input: &Tensor, ids: &Tensor) -> Result<Tensor> {
         let qs = match &self.storage {

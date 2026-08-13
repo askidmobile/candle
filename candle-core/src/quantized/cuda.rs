@@ -558,27 +558,56 @@ fn indexed_moe_forward_dispatch(
     idx_shape: &crate::Shape, //[batch, topk]
     dev: &CudaDevice,
 ) -> Result<(CudaStorage, crate::Shape)> {
-    let (_, n, k) = w_shape.dims3()?;
-    let batch = in_shape.dims()[0];
-    let input_dim1 = in_shape.dims()[1];
-
-    let topk = idx_shape.dims()[1];
-    assert!(batch == idx_shape.dims()[0], "batch dim not match!");
+    let (n_experts, n, k) = w_shape.dims3()?;
+    let (batch, input_dim1, input_k) = in_shape.dims3()?;
+    let (ids_batch, topk) = idx_shape.dims2()?;
+    if batch != ids_batch {
+        crate::bail!("indexed moe batch mismatch: input={batch}, ids={ids_batch}")
+    }
+    if input_dim1 != 1 && input_dim1 != topk {
+        crate::bail!("indexed moe input dim1 must be 1 or topk={topk}, got {input_dim1}")
+    }
+    if input_k != k {
+        crate::bail!("indexed moe input width mismatch: weights={k}, input={input_k}")
+    }
+    if batch == 0 || topk == 0 || n_experts == 0 {
+        crate::bail!(
+            "indexed moe dimensions must be nonzero: experts={n_experts}, batch={batch}, topk={topk}"
+        )
+    }
 
     if matches!(
         w_dtype,
-        GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ3S
+        GgmlDType::IQ2S
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ4XS
     ) {
         let kernel_name = match w_dtype {
             GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_f32",
+            GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_f32",
             GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_f32",
             GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_f32",
+            GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_f32",
+            GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_f32",
             _ => unreachable!(),
         };
         let out = unsafe { dev.alloc::<f32>(batch * topk * n)? };
-        let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+        let grouped = batch > 4;
+        let kernel_name = if grouped {
+            format!("{kernel_name}_grouped")
+        } else {
+            kernel_name.to_owned()
+        };
+        let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (n as u32, batch as u32, topk as u32),
+            grid_dim: if grouped {
+                (n as u32, n_experts as u32, 1)
+            } else {
+                (n as u32, batch as u32, topk as u32)
+            },
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -684,7 +713,15 @@ impl QCudaStorage {
         if dtype != other.dtype() {
             crate::bail!("dual moe: dtype mismatch {:?} vs {:?}", dtype, other.dtype());
         }
-        if matches!(dtype, GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ3S) {
+        if matches!(
+            dtype,
+            GgmlDType::IQ2S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
+        ) {
             // Two launches beat dual-register pressure on RTX 3060 for current
             // 2048x512 experts. Input stays F32; neither path allocates Q8_1.
             let input_storage = input.as_cuda_slice::<f32>()?;
@@ -790,7 +827,10 @@ impl QCudaStorage {
             self.dtype(),
             GgmlDType::IQ3S
                 | GgmlDType::IQ2S
+                | GgmlDType::IQ2XS
                 | GgmlDType::IQ2XXS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
                 | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K

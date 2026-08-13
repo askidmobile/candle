@@ -43,11 +43,6 @@ fn make_zero_block_bytes(dtype: GgmlDType) -> Vec<u8> {
     bytes
 }
 
-/// Number of blocks needed for `n_elems` elements.
-fn n_blocks(n_elems: usize, dtype: GgmlDType) -> usize {
-    n_elems / dtype.block_size()
-}
-
 /// Build a QTensor on the given device from zeroed blocks (d=1.0).
 ///
 /// `n_rows` x `n_cols` where n_cols must be a multiple of QK_K.
@@ -306,7 +301,12 @@ fn make_iq_experts(
     assert_eq!(k % QK_K, 0);
     assert!(matches!(
         dtype,
-        GgmlDType::IQ2S | GgmlDType::IQ2XXS | GgmlDType::IQ3S
+        GgmlDType::IQ2S
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ4XS
     ));
     let blocks = n_experts * n * k / QK_K;
     let mut raw = vec![0u8; blocks * dtype.type_size()];
@@ -395,23 +395,35 @@ fn test_iq_indexed_moe(dtype: GgmlDType, batch: usize) -> Result<()> {
 }
 
 #[test]
+fn grouped_iq2xxs_all_routes_one_expert_matches_reference() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (n_experts, n, k, batch, topk) = (5, 7, 2 * QK_K, 33, 8);
+    let weights = make_iq_experts(GgmlDType::IQ2XXS, n_experts, n, k, 43, &device)?;
+    let input_data = exact_q8_input(batch, topk, k);
+    let input = Tensor::from_slice(&input_data, (batch, topk, k), &device)?;
+    let ids_data = vec![2u32; batch * topk];
+    let ids = Tensor::from_slice(&ids_data, (batch, topk), &device)?;
+    let output = weights.indexed_moe_forward_cuda(&input, &ids)?;
+    assert_indexed_matches_dequantized(&weights, &input_data, &ids_data, batch, topk, n, k, &output)
+}
+
+#[test]
 fn iq2s_indexed_moe_matches_dequantized_reference() -> Result<()> {
     test_iq_indexed_moe(GgmlDType::IQ2S, 4)
 }
 
 #[test]
 fn iq2xxs_indexed_moe_matches_dequantized_reference() -> Result<()> {
-    for batch in [1, 4, 5] {
+    for batch in [1, 4, 5, 33] {
         test_iq_indexed_moe(GgmlDType::IQ2XXS, batch)?;
     }
     Ok(())
 }
 
-#[test]
-fn iq2xxs_indexed_moe_shared_input_batch5_matches_dequantized_reference() -> Result<()> {
+fn test_iq_indexed_moe_shared_input(dtype: GgmlDType, batch: usize) -> Result<()> {
     let device = Device::new_cuda(0)?;
-    let (n_experts, n, k, batch, topk) = (5, 7, 2 * QK_K, 5, 8);
-    let weights = make_iq_experts(GgmlDType::IQ2XXS, n_experts, n, k, 31, &device)?;
+    let (n_experts, n, k, topk) = (5, 7, 2 * QK_K, 8);
+    let weights = make_iq_experts(dtype, n_experts, n, k, 31, &device)?;
     let full_input = exact_q8_input(batch, topk, k);
     let input_data: Vec<f32> = (0..batch)
         .flat_map(|b| full_input[b * topk * k..b * topk * k + k].iter().copied())
@@ -432,17 +444,46 @@ fn iq2xxs_indexed_moe_shared_input_batch5_matches_dequantized_reference() -> Res
 }
 
 #[test]
+fn matrix_indexed_moe_shared_input_matches_dequantized_reference() -> Result<()> {
+    for dtype in [
+        GgmlDType::IQ2XS,
+        GgmlDType::IQ2XXS,
+        GgmlDType::IQ3XXS,
+        GgmlDType::IQ4XS,
+    ] {
+        test_iq_indexed_moe_shared_input(dtype, 5)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn iq3s_indexed_moe_matches_dequantized_reference() -> Result<()> {
     test_iq_indexed_moe(GgmlDType::IQ3S, 4)
 }
 
-fn test_iq2_indexed_moe_dual(dtype: GgmlDType) -> Result<()> {
+#[test]
+fn remaining_matrix_indexed_moe_matches_dequantized_reference() -> Result<()> {
+    for dtype in [GgmlDType::IQ2XS, GgmlDType::IQ3XXS, GgmlDType::IQ4XS] {
+        test_iq_indexed_moe(dtype, 5)?;
+    }
+    Ok(())
+}
+
+fn test_iq_indexed_moe_dual(dtype: GgmlDType, batch: usize, shared_input: bool) -> Result<()> {
     let device = Device::new_cuda(0)?;
-    let (n_experts, n, k, batch, topk) = (3, 5, 2 * QK_K, 2, 8);
+    let (n_experts, n, k, topk) = (3, 5, 2 * QK_K, 8);
     let gate = make_iq_experts(dtype, n_experts, n, k, 11, &device)?;
     let up = make_iq_experts(dtype, n_experts, n, k, 19, &device)?;
-    let input_data = exact_q8_input(batch, topk, k);
-    let input = Tensor::from_slice(&input_data, (batch, topk, k), &device)?;
+    let full_input = exact_q8_input(batch, topk, k);
+    let input_data: Vec<f32> = if shared_input {
+        (0..batch)
+            .flat_map(|b| full_input[b * topk * k..b * topk * k + k].iter().copied())
+            .collect()
+    } else {
+        full_input
+    };
+    let input_dim1 = if shared_input { 1 } else { topk };
+    let input = Tensor::from_slice(&input_data, (batch, input_dim1, k), &device)?;
     let ids_data: Vec<u32> = (0..batch * topk)
         .map(|task| ((task * 2 + 1) % n_experts) as u32)
         .collect();
@@ -466,10 +507,22 @@ fn test_iq2_indexed_moe_dual(dtype: GgmlDType) -> Result<()> {
 
 #[test]
 fn iq2s_indexed_moe_dual_matches_single() -> Result<()> {
-    test_iq2_indexed_moe_dual(GgmlDType::IQ2S)
+    test_iq_indexed_moe_dual(GgmlDType::IQ2S, 2, false)
 }
 
 #[test]
 fn iq2xxs_indexed_moe_dual_matches_single() -> Result<()> {
-    test_iq2_indexed_moe_dual(GgmlDType::IQ2XXS)
+    for batch in [1, 4, 5] {
+        test_iq_indexed_moe_dual(GgmlDType::IQ2XXS, batch, false)?;
+        test_iq_indexed_moe_dual(GgmlDType::IQ2XXS, batch, true)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn remaining_matrix_indexed_moe_dual_matches_single() -> Result<()> {
+    for dtype in [GgmlDType::IQ2XS, GgmlDType::IQ3XXS, GgmlDType::IQ4XS] {
+        test_iq_indexed_moe_dual(dtype, 5, true)?;
+    }
+    Ok(())
 }

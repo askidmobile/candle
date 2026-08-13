@@ -229,7 +229,7 @@ Covers: FR-003, FR-004, FR-005, foundation for FR-017 and FR-030.
 
 ### Phase 3 — Dynamic-loaded PTX MoE backend and required quant matrix (60–90 hours)
 
-Status: in progress — target UD-IQ2_XXS routed dtype set (`IQ2_XXS`, `IQ2_S`, `IQ3_S`) has direct F32 sparse kernels and CUDA parity tests. PTX passes calibrated llama.cpp-relative teacher-forced logit gate, B=1/B=4 throughput, and 4×8K stability. CUDA default is now PTX for validated routed dtypes; `reference` remains explicit diagnostic rollback.
+Status: in progress — target UD-IQ2_XXS and required five-file physical routed dtype matrix have direct F32 sparse kernels and CUDA parity tests. Grouped prefill is enabled for B>4 without global sort/workspace, while validated decode B=1..4 stays unchanged. PTX passes calibrated llama.cpp-relative teacher-forced logit gate, B=1/B=4 throughput, repeated long-prefill leak checks, and 4×8K stability. CUDA default is PTX for validated routed dtypes; `reference` remains explicit diagnostic rollback.
 
 Files:
 
@@ -264,15 +264,21 @@ Progress:
 - [x] Run external llama.cpp parity: all three agree on 123/128 teacher-forced states; PTX matches llama.cpp on 2/5 disputed decisions and reference on 3/5. Free greedy exact prefix is PTX 43 tokens vs reference 16. PTX disputed-state nRMSE range 0.0272–0.0661; max abs ≤1.205.
 - [x] Pass PTX 4×8K on RTX 3060: 4/4 HTTP 200, 8140 completion tokens each, total 8192, `finish_reason=length`, one `[DONE]`, no malformed JSON, bit-exact content, 1232.3 s elapsed, post-run reuse HTTP 200 in 1.71 s. GPU shared stayed 76 MiB; committed peak 11143 MiB; no CUDA/error markers.
 - [x] Promote PTX as CUDA default only for routed dtype combinations supported by gate/up dual and down kernels; explicit `QWEN36_MOE_BACKEND=reference` remains rollback, invalid values and unsupported PTX dtypes fail at load.
-- [ ] Add grouped prefill kernels, reusable workspace, remaining required quant matrix, and leak/long-prefill checks.
+- [x] Add grouped prefill for B>4: expert-grid kernel scans route tiles on device, uses 1 KiB static shared task storage, reuses each packed weight across up to eight matching routes, and needs no global sort/count/offset workspace.
+- [x] Remove 8× prefill input materialization: indexed kernels consume shared `[tokens, 1, hidden]`; 256-token input workspace falls from about 16 MiB to 2 MiB.
+- [x] Add required matrix kernels based on physical routed tensors: `IQ2_XS`, `IQ3_XXS`, and `IQ4_XS`; existing `IQ2_XXS`, `IQ2_S`, `IQ3_S`, and K-quant kernels complete the five-file matrix.
+- [x] Pass CUDA projection suite (24/24), llama.cpp teacher-forced gate, six repeated 5779-token prefill cycles with zero steady memory spread, and grouped-path 4×8K regression.
+- [ ] Run full-model correctness/performance/stability matrix for remaining GGUF files on RTX 4090.
 
 Deviations:
 
 - deviated: target UD-IQ2_XXS is physically mixed: routed tensors contain 80 `IQ2_XXS`, 37 `IQ2_S`, and 3 `IQ3_S`; implemented exact discovered set instead of filename-only `IQ2_XXS` dispatch.
 - deviated: reused working runtime-loaded `quantized.cu` indexed operation instead of introducing another production launcher through incomplete `moe_quantized.cu`; one backend avoids duplicate ABI and lookup tables.
 - deviated: exact greedy parity is no longer a correctness gate for this 2-bit backend. Pinned llama.cpp itself selects a mix of PTX and dequantize+cuBLAS low-margin decisions; teacher-forced numerical tolerance plus external margin is the promotion gate. PTX became CUDA default after 4×8K stability passed.
+- deviated: reusable global route workspace was deleted from the design. Grouped prefill needs only static shared memory; a per-layer output workspace could retain roughly 1.2 GiB across 40 blocks and violate the RTX 3060 envelope. CUDA stream-ordered allocation handles short-lived output tensors.
+- deviated: suffix-level quant names were replaced by header-derived physical manifests. Required files route through `IQ2_XXS/IQ2_S/IQ2_XS/IQ3_S/IQ3_XXS/IQ4_XS` plus existing `Q4_K/Q5_K/Q6_K`.
 
-Independent exit check: each quant passes dequant/reference numerical tests, random routing, empty experts, all tokens selecting one expert, top-8 duplicates guard, decode B=1..4, long prefill, and repeated-workspace leak checks on Windows CUDA 12.4.
+Independent exit check: kernel-level dequant/reference tests pass for every required physical dtype, including random routing, empty experts, all routes selecting one expert, decode B=1..4, prefill B=5/B=33, shared input, and route-tile boundary. Target IQ2_XXS passes long prefill, repeated leak, llama.cpp logits, and 4×8K gates on Windows CUDA 12.4. Remaining full-file checks stay blocked on RTX 4090/model availability.
 
 Covers: FR-004, FR-006, FR-010, FR-011, FR-020, FR-030.
 
@@ -501,7 +507,7 @@ A phase cannot pass on a fallback backend when the phase claims PTX production r
 - Host offload transfer cost breaks the 10% gate: benchmark placement alternatives early, overlap staged transfers, retain hot layers/state in VRAM, and treat the gate as blocking rather than hiding the cost.
 - IQ sparse kernels drift from llama.cpp: share block definitions/tables with Candle quantized kernels, establish reference tests per block and expert GEMM, then use stage-level JSONL localization.
 - Top-k tie/order differences cause token divergence: implement stable deterministic ordering matching the pinned llama.cpp revision and test ties explicitly.
-- Prefill kernel workspace or routing sort scales poorly at long context: bounded chunks, device-resident radix/top-k routing, reusable workspace, and memory-plan-aware chunk size prevent unbounded allocation.
+- Prefill route grouping scales poorly at long context: bounded chunks plus expert-grid route tiles avoid global sort workspace and keep scratch bounded.
 - Snapshot copies exceed host memory: stable identity, byte-budgeted LRU, state handles/copy-on-write, and accounting for every retained copy.
 - Existing scheduler/server bind different slot indices: phase 5 makes scheduler admission authoritative and adds lifecycle invariants.
 - Absolute path dependencies make Windows builds irreproducible: exact git commit pin for acceptance and local Cargo patch only for development.

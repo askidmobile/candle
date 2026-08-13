@@ -53,8 +53,11 @@ pub(crate) fn select_backend(
         && matches!(
             gate,
             GgmlDType::IQ2S
+                | GgmlDType::IQ2XS
                 | GgmlDType::IQ2XXS
                 | GgmlDType::IQ3S
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
                 | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q4K
@@ -63,8 +66,11 @@ pub(crate) fn select_backend(
     let down_supported = matches!(
         down,
         GgmlDType::IQ2S
+            | GgmlDType::IQ2XS
             | GgmlDType::IQ2XXS
             | GgmlDType::IQ3S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ4XS
             | GgmlDType::Q8_0
             | GgmlDType::Q2K
             | GgmlDType::Q3K
@@ -105,6 +111,23 @@ mod backend_tests {
             select_backend(None, false, GATE, GATE, DOWN).unwrap(),
             MoeBackend::Reference
         );
+    }
+
+    #[test]
+    fn required_quant_matrix_is_supported() {
+        for (gate, down) in [
+            (GgmlDType::IQ2XXS, GgmlDType::IQ3XXS),
+            (GgmlDType::IQ2S, GgmlDType::IQ4XS),
+            (GgmlDType::IQ2XS, GgmlDType::IQ3XXS),
+            (GgmlDType::IQ3XXS, GgmlDType::IQ4XS),
+            (GgmlDType::Q4K, GgmlDType::Q5K),
+            (GgmlDType::Q4K, GgmlDType::Q6K),
+        ] {
+            assert_eq!(
+                select_backend(Some("ptx"), true, gate, gate, down).unwrap(),
+                MoeBackend::Ptx
+            );
+        }
     }
 
     #[test]
@@ -390,7 +413,6 @@ impl Qwen35MoeBlock {
     /// Без единого D2H/H2D round-trip (раньше: ~120 синков/шаг на 40 блоков).
     #[cfg(feature = "cuda")]
     fn forward_ptx_cuda(&self, xs: &Tensor) -> Result<Tensor> {
-        let (n_tokens, n_embd) = xs.dims2()?;
         let k = self.router.n_experts_per_tok;
         let device = xs.device();
         let cuda_dev = device.as_cuda_device()?;
@@ -410,12 +432,9 @@ impl Qwen35MoeBlock {
             self.router.norm_topk_prob,
         )?;
 
-        // x → [tokens, topk, n_embd] contiguous.
-        let x3 = xs
-            .to_dtype(DType::F32)?
-            .unsqueeze(1)?
-            .broadcast_as((n_tokens, k, n_embd))?
-            .contiguous()?;
+        // Shared input [tokens, 1, n_embd]. Indexed kernels reuse each token row
+        // across top-k routes; materializing [tokens, k, n_embd] wastes 8x memory.
+        let x3 = xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?;
 
         // gate+up одним dual GEMM.
         let (gate, up) =
@@ -455,7 +474,7 @@ impl MoeBackend {
 
 /// Fused MoE путь (CUDA): indexed_moe_forward ядра — одна группа запусков на
 /// проекцию вместо per-expert dequantize_rowslice (~1000 launches/шаг).
-/// Работает для IQ2_S/IQ2_XXS/IQ3_S и K-quants/Q8_0 экспертов.
+/// Работает для routed IQ2/IQ3/IQ4_XS и K-quants/Q8_0 экспертов.
 #[cfg(feature = "cuda")]
 fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) -> Result<Tensor> {
     // Legacy route-plan PTX path; production CUDA path validates routed dtypes at load.
@@ -464,7 +483,10 @@ fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) ->
             qt.dtype(),
             GgmlDType::IQ3S
                 | GgmlDType::IQ2S
+                | GgmlDType::IQ2XS
                 | GgmlDType::IQ2XXS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
                 | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K

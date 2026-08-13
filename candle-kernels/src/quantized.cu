@@ -5266,6 +5266,38 @@ static __device__ __forceinline__ float iq2_xxs_value(const block_iq2_xxs * bq2,
     return d * (float)grid[elem] * (signs & kmask_iq2xs[elem] ? -1.f : 1.f);
 }
 
+static __device__ __forceinline__ float iq2_xs_value(const block_iq2_xs * bq2, int pos) {
+    const int ib32 = pos / 32;
+    const int sub_pos = pos % 32;
+    const int il = sub_pos / 16;
+    const int half = (sub_pos % 16) / 8;
+    const int elem = pos % 8;
+    const uint16_t q2 = bq2->qs[4 * ib32 + 2 * il + half];
+    const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (q2 & 511));
+    const uint8_t signs = ksigns_iq2xs[q2 >> 9];
+    const float d = __half2float(bq2->d)
+        * (0.5f + (float)((bq2->scales[ib32] >> (4 * il)) & 0xf)) * 0.25f;
+    return d * (float)grid[elem] * (signs & kmask_iq2xs[elem] ? -1.f : 1.f);
+}
+
+static __device__ __forceinline__ float iq3_xxs_value(const block_iq3_xxs * bq3, int pos) {
+    const int ib32 = pos / 32;
+    const int sub_pos = pos % 32;
+    const int il = sub_pos / 16;
+    const int j = sub_pos % 16;
+    const int half = j / 8;
+    const int pair = (j % 8) / 4;
+    const int elem = j % 4;
+    const uint8_t * q3 = bq3->qs + 8 * ib32;
+    const uint16_t * gas = (const uint16_t *)(bq3->qs + QK_K / 4) + 2 * ib32;
+    const uint32_t aux32 = (uint32_t)gas[0] | ((uint32_t)gas[1] << 16);
+    const uint8_t * grid = (const uint8_t *)(iq3xxs_grid + q3[4 * il + 2 * half + pair]);
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> (14 * il + 7 * half)) & 127];
+    const float d = __half2float(bq3->d) * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+    return d * (float)grid[elem]
+        * (signs & kmask_iq2xs[elem + 4 * pair] ? -1.f : 1.f);
+}
+
 static __device__ __forceinline__ float iq3_s_value(const block_iq3_s * bq3, int pos) {
     const int ib32 = pos / 32;
     const int group = (pos % 32) / 4;
@@ -5281,16 +5313,119 @@ static __device__ __forceinline__ float iq3_s_value(const block_iq3_s * bq3, int
         * (signs & kmask_iq2xs[elem + 4 * pair] ? -1.f : 1.f);
 }
 
+static __device__ __forceinline__ float iq4_xs_value(const block_iq4_xs * bq4, int pos) {
+    const int ib32 = pos / 32;
+    const int sub_pos = pos % 32;
+    const int il = sub_pos / 16;
+    const int j = sub_pos % 16;
+    const int qi = j / 4;
+    const int byte_in_aux = j % 4;
+    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4 * ib32;
+    const int ls = ((bq4->scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0xf)
+        | (((bq4->scales_h >> (2 * ib32)) & 3) << 4);
+    const uint32_t aux32 = (q4[qi] >> (4 * il)) & 0x0f0f0f0f;
+    const uint8_t nibble = ((const uint8_t *)&aux32)[byte_in_aux];
+    return __half2float(bq4->d) * (float)(ls - 32) * kvalues_iq4nl_f[nibble];
+}
+
+template <typename block_q_t, float (*dequant_value)(const block_q_t *, int)>
+__device__ void indexed_moe_forward_iq_f32_grouped(
+    const void * __restrict__ all_weights,
+    const float * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int input_dim1) {
+
+    constexpr int route_tile = 256;
+    constexpr int task_group = 8;
+    const int row = blockIdx.x;
+    const int expert_id = blockIdx.y;
+    const int total_tasks = batch * topk;
+    if (row >= n) return;
+
+    const int blocks_per_row = k / QK_K;
+    const block_q_t * w = (const block_q_t *)all_weights
+        + ((size_t)expert_id * n + row) * blocks_per_row;
+
+    __shared__ int tasks[route_tile];
+    __shared__ int task_count;
+    __shared__ float warp_sums[task_group][4];
+
+    for (int base = 0; base < total_tasks; base += route_tile) {
+        if (threadIdx.x == 0) task_count = 0;
+        __syncthreads();
+
+        for (int task = base + threadIdx.x;
+             task < min(base + route_tile, total_tasks);
+             task += blockDim.x) {
+            if (indices[task] == (unsigned int)expert_id) {
+                tasks[atomicAdd(&task_count, 1)] = task;
+            }
+        }
+        __syncthreads();
+
+        for (int group_start = 0; group_start < task_count; group_start += task_group) {
+            float sums[task_group] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int pos = threadIdx.x; pos < k; pos += blockDim.x) {
+                const float value = dequant_value(w + pos / QK_K, pos % QK_K);
+#pragma unroll
+                for (int m = 0; m < task_group; ++m) {
+                    if (group_start + m < task_count) {
+                        const int task = tasks[group_start + m];
+                        const int input_idx = input_dim1 == 1 ? task / topk : task;
+                        sums[m] += value * all_inputs[(size_t)input_idx * k + pos];
+                    }
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < task_group; ++m) sums[m] = warp_reduce_sum(sums[m]);
+
+            if (threadIdx.x % WARP_SIZE == 0) {
+#pragma unroll
+                for (int m = 0; m < task_group; ++m) {
+                    warp_sums[m][threadIdx.x / WARP_SIZE] = sums[m];
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x < WARP_SIZE) {
+#pragma unroll
+                for (int m = 0; m < task_group; ++m) {
+                    float sum = threadIdx.x < 4 ? warp_sums[m][threadIdx.x] : 0.f;
+                    sum = warp_reduce_sum(sum);
+                    if (threadIdx.x == 0 && group_start + m < task_count) {
+                        const int task = tasks[group_start + m];
+                        all_outputs[(size_t)task * n + row] = sum;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 #define IQ_MOE_F32_EXTERN(name, BLOCK_, VALUE_) \
 extern "C" __global__ void name( \
     const void * weights, const float * inputs, const unsigned int * ids, float * outputs, \
     const int n, const int k, const int batch, const int topk, const int input_dim1) { \
     indexed_moe_forward_iq_f32<BLOCK_, VALUE_>(weights, inputs, ids, outputs, n, k, topk, input_dim1); \
+} \
+extern "C" __global__ void name##_grouped( \
+    const void * weights, const float * inputs, const unsigned int * ids, float * outputs, \
+    const int n, const int k, const int batch, const int topk, const int input_dim1) { \
+    indexed_moe_forward_iq_f32_grouped<BLOCK_, VALUE_>( \
+        weights, inputs, ids, outputs, n, k, batch, topk, input_dim1); \
 }
 
 IQ_MOE_F32_EXTERN(indexed_moe_forward_iq2_s_f32, block_iq2_s, iq2_s_value)
+IQ_MOE_F32_EXTERN(indexed_moe_forward_iq2_xs_f32, block_iq2_xs, iq2_xs_value)
 IQ_MOE_F32_EXTERN(indexed_moe_forward_iq2_xxs_f32, block_iq2_xxs, iq2_xxs_value)
 IQ_MOE_F32_EXTERN(indexed_moe_forward_iq3_s_f32, block_iq3_s, iq3_s_value)
+IQ_MOE_F32_EXTERN(indexed_moe_forward_iq3_xxs_f32, block_iq3_xxs, iq3_xxs_value)
+IQ_MOE_F32_EXTERN(indexed_moe_forward_iq4_xs_f32, block_iq4_xs, iq4_xs_value)
 
 /**
  * @brief Performs an indexed, batched matrix-vector multiplication for quantized tensors (for MoE models).

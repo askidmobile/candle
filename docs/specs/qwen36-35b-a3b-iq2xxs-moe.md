@@ -93,10 +93,10 @@ The packed layout is `[expert, output_row, input_blocks]`, with `QK_K=256` and t
 
 Two execution shapes are required:
 
-- Decode/small M: direct sparse quantized matvec/matmul over the selected token/expert pairs, minimizing launch and sorting overhead.
-- Prefill/batched M: sort/group token/expert pairs, derive expert offsets on device, and process expert segments in tiles so weight blocks are reused across tokens routed to the same expert.
+- Decode/small M: direct sparse quantized matvec/matmul over selected token/expert pairs, minimizing launch overhead.
+- Prefill/batched M: launch an expert grid, scan bounded route tiles on device, and process matching routes in groups so one packed weight read feeds multiple token accumulators. No global route sort or offset workspace is required.
 
-Gate and up projections emit `[token, top_k, 512]` intermediates. After SiLU multiplication, down projection applies the corresponding top-k weight and accumulates/scatters to `[token, 2048]`. Scratch buffers for routes, offsets, intermediate activations, and output are reusable and sized from the current token count/top-k, not expert-count times dense weights.
+Gate and up projections emit `[token, top_k, 512]` intermediates. After SiLU multiplication, down projection applies corresponding top-k weight and accumulates/scatters to `[token, 2048]`. Input stays shared as `[token, 1, hidden]`; kernels reuse it across top-k routes. Grouped kernel uses bounded static shared task storage. Short-lived outputs remain stream-ordered CUDA allocations; no persistent per-layer workspace may consume RTX 3060 headroom.
 
 Kernel launch APIs return errors for unsupported dtype/shape rather than silently producing an uninitialized output. CUDA launch errors are checked at the backend boundary and surfaced with projection, layer, dtype, and shape context.
 
@@ -112,7 +112,7 @@ Prompt-cache snapshots remain valid because MoE is stateless. Cache keys/identit
 
 - Keep packed `IQ2_XXS` routed experts quantized on CUDA.
 - Do not retain full dequantized expert matrices between calls.
-- Reuse routing and activation scratch buffers and cap them by configured prefill chunk and decode batch sizes.
+- Avoid global routing scratch: grouped prefill uses bounded static shared task tiles. Keep short-lived activation/output allocation stream-ordered; do not retain one large workspace per layer.
 - Measure free/used VRAM before load, after load, after first prefill, and during steady decode.
 - Fail model initialization with an actionable memory estimate when required weights plus reserved runtime headroom cannot fit.
 - Treat managed-memory paging or CPU expert offload as a degraded mode, never as evidence that the 12 GB CUDA target passed.
