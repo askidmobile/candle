@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use qwen35_batch::model::{DecodeBatch, DecodeItem, PrefillChunk};
 use qwen35_batch::real::tokenizer::{self, ChatMsg};
 use qwen35_batch::real::Qwen35BatchAdapter;
 use qwen35_batch::scheduler::BatchScheduler;
@@ -90,7 +91,6 @@ fn real_qwen35_load_and_single_forward() {
     let vocab = adapter.vocab_size();
     eprintln!("[real] loaded, vocab={vocab}, eos={}", adapter.eos());
 
-    use qwen35_batch::model::PrefillChunk;
     let prompt = dummy_prompt_ids(42, 8);
     let logits = adapter
         .prefill_chunk(&PrefillChunk {
@@ -102,6 +102,64 @@ fn real_qwen35_load_and_single_forward() {
         .expect("prefill");
     assert_eq!(logits.len(), vocab, "logits size != vocab");
     eprintln!("[real] prefill logits len={} OK", logits.len());
+}
+
+#[test]
+#[ignore = "требует GGUF + GPU; full-logits B=1 vs B=3"]
+fn real_qwen35_batched_logits_equal_single() {
+    let gguf = gguf_path();
+    assert!(gguf.exists(), "GGUF не найден: {:?}", gguf);
+    let device = accelerator_device();
+    let mut adapter = Qwen35BatchAdapter::load(&gguf, device, 4).expect("load adapter");
+    let prompt = dummy_prompt_ids(42, 8);
+    let mut first_logits = None;
+    for slot_idx in 0..4 {
+        let logits = adapter
+            .prefill_chunk(&PrefillChunk {
+                slot_idx,
+                reset_first: true,
+                tokens: prompt.clone(),
+                start_pos: 0,
+            })
+            .expect("prefill");
+        if let Some(first) = &first_logits {
+            assert_eq!(&logits, first, "prefill logits differ for slot {slot_idx}");
+        } else {
+            first_logits = Some(logits);
+        }
+    }
+    let token = first_logits
+        .unwrap()
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0 as u32;
+    let decode = |slots: &[usize]| DecodeBatch {
+        items: slots
+            .iter()
+            .map(|&slot_idx| DecodeItem {
+                slot_idx,
+                token,
+                pos: prompt.len(),
+            })
+            .collect(),
+    };
+    let single = adapter
+        .decode_batch(&decode(&[0]))
+        .expect("B=1 decode")
+        .pop()
+        .unwrap();
+    let batched = adapter
+        .decode_batch(&decode(&[1, 2, 3]))
+        .expect("B=3 decode");
+    for (index, logits) in batched.iter().enumerate() {
+        assert_eq!(logits, &single, "B=3 row {index} differs from B=1 logits");
+    }
+    eprintln!(
+        "[logits-parity] B=1 vs B=3: {} logits BIT-EXACT",
+        single.len()
+    );
 }
 
 #[derive(Debug)]

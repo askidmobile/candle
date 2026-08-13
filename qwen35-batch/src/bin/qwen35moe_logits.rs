@@ -98,8 +98,7 @@ fn read_forced_tokens(path: &Path) -> Result<Vec<u32>> {
                 .context("forced-token record missing ids")?
                 .iter()
                 .map(|id| {
-                    id.as_u64()
-                        .map(|id| id as u32)
+                    u32::try_from(id.as_u64().context("forced token is not an integer")?)
                         .context("forced token is not u32")
                 })
                 .collect();
@@ -162,6 +161,13 @@ fn main() -> Result<()> {
     };
     let prompt = tokenizer::build_chatml_text(&messages);
     let prompt_tokens = tokenizer::encode_no_think(&tokenizer, &prompt)?;
+    let vocab_size = tokenizer.get_vocab_size(true);
+    if let Some(token) = forced_tokens
+        .as_ref()
+        .and_then(|tokens| tokens.iter().find(|&&token| token as usize >= vocab_size))
+    {
+        bail!("forced token {token} is outside vocab size {vocab_size}")
+    }
     let backend = std::env::var("QWEN36_MOE_BACKEND").unwrap_or_else(|_| "auto".into());
     println!(
         "{}",

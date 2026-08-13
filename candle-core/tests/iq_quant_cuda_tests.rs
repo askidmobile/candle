@@ -526,3 +526,55 @@ fn remaining_matrix_indexed_moe_dual_matches_single() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn iq_dual_indexed_moe_honors_view_offsets() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (n_experts, n, k, batch, topk) = (3, 5, 2 * QK_K, 5, 8);
+    let gate = make_iq_experts(GgmlDType::IQ2XXS, n_experts, n, k, 11, &device)?;
+    let up = make_iq_experts(GgmlDType::IQ2XXS, n_experts, n, k, 19, &device)?;
+
+    let full_input_data = exact_q8_input(batch + 2, topk, k);
+    let input_data = full_input_data[topk * k..(batch + 1) * topk * k].to_vec();
+    let input =
+        Tensor::from_slice(&full_input_data, (batch + 2, topk, k), &device)?.narrow(0, 1, batch)?;
+
+    let full_ids_data: Vec<u32> = (0..(batch + 2) * topk)
+        .map(|task| ((task * 2 + 1) % n_experts) as u32)
+        .collect();
+    let ids_data = full_ids_data[topk..(batch + 1) * topk].to_vec();
+    let ids =
+        Tensor::from_slice(&full_ids_data, (batch + 2, topk), &device)?.narrow(0, 1, batch)?;
+
+    let (gate_out, up_out) = gate.indexed_moe_forward_dual_cuda(&up, &input, &ids)?;
+    assert_indexed_matches_dequantized(
+        &gate,
+        &input_data,
+        &ids_data,
+        batch,
+        topk,
+        n,
+        k,
+        &gate_out,
+    )?;
+    assert_indexed_matches_dequantized(&up, &input_data, &ids_data, batch, topk, n, k, &up_out)
+}
+
+#[test]
+fn iq_indexed_moe_rejects_noncontiguous_input() -> Result<()> {
+    let device = Device::new_cuda(0)?;
+    let (n_experts, n, k, batch, topk) = (3, 5, 2 * QK_K, 2, 8);
+    let weights = make_iq_experts(GgmlDType::IQ2XXS, n_experts, n, k, 11, &device)?;
+    let input_data = exact_q8_input(batch, topk, k);
+    let input = Tensor::from_slice(&input_data, (batch, k, topk), &device)?.transpose(1, 2)?;
+    let ids = Tensor::zeros((batch, topk), DType::U32, &device)?;
+    let error = match weights.indexed_moe_forward_cuda(&input, &ids) {
+        Ok(_) => panic!("non-contiguous input unexpectedly accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("input not contiguous"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}

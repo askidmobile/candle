@@ -15,23 +15,110 @@ const GATE_MAX_REFERENCE_MARGIN_FOR_ARGMAX_DRIFT: f64 = 0.30;
 fn read_records(path: &str) -> Result<(BTreeMap<usize, Value>, Value)> {
     let file = File::open(path).with_context(|| format!("open {path}"))?;
     let mut logits = BTreeMap::new();
-    let mut tokens = Value::Null;
-    for line in BufReader::new(file).lines() {
+    let mut tokens = None;
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
+        let line = line.trim();
         if !line.starts_with('{') {
             continue;
         }
-        let record: Value = serde_json::from_str(&line)?;
+        let record: Value = serde_json::from_str(line)
+            .with_context(|| format!("{path}: invalid JSON at line {}", line_index + 1))?;
         match record["type"].as_str() {
             Some("logits") => {
-                logits.insert(
-                    record["step"].as_u64().context("missing logits step")? as usize,
-                    record,
-                );
+                let step = usize::try_from(
+                    record["step"]
+                        .as_u64()
+                        .with_context(|| format!("{path}: missing logits step"))?,
+                )
+                .with_context(|| format!("{path}: logits step does not fit usize"))?;
+                u32::try_from(
+                    record["argmax"]
+                        .as_u64()
+                        .with_context(|| format!("{path}: step {step} missing numeric argmax"))?,
+                )
+                .with_context(|| format!("{path}: step {step} argmax is not u32"))?;
+                let margin = record["margin"]
+                    .as_f64()
+                    .with_context(|| format!("{path}: step {step} missing numeric margin"))?;
+                if !margin.is_finite() {
+                    bail!("{path}: step {step} margin is not finite")
+                }
+                record["finite"]
+                    .as_u64()
+                    .with_context(|| format!("{path}: step {step} missing finite count"))?;
+                if let Some(values) = record.get("values") {
+                    let values = values.as_array().with_context(|| {
+                        format!("{path}: step {step} values must be a numeric array")
+                    })?;
+                    if values.is_empty() {
+                        bail!("{path}: step {step} values array is empty")
+                    }
+                    for (value_index, value) in values.iter().enumerate() {
+                        let value = value.as_f64().with_context(|| {
+                            format!("{path}: step {step} value {value_index} is not numeric")
+                        })?;
+                        if !value.is_finite() {
+                            bail!("{path}: step {step} value {value_index} is not finite")
+                        }
+                    }
+                }
+                if logits.insert(step, record).is_some() {
+                    bail!("{path}: duplicate logits step {step}")
+                }
             }
-            Some("tokens") => tokens = record,
+            Some("tokens") => {
+                if tokens.is_some() {
+                    bail!("{path}: duplicate tokens record")
+                }
+                let ids = record["ids"]
+                    .as_array()
+                    .with_context(|| format!("{path}: tokens record missing ids"))?;
+                if ids.is_empty() {
+                    bail!("{path}: tokens ids array is empty")
+                }
+                for (index, id) in ids.iter().enumerate() {
+                    u32::try_from(id.as_u64().with_context(|| {
+                        format!("{path}: token id {index} is not an unsigned integer")
+                    })?)
+                    .with_context(|| format!("{path}: token id {index} is not u32"))?;
+                }
+                if let Some(fed_ids) = record.get("fed_ids") {
+                    let fed_ids = fed_ids
+                        .as_array()
+                        .with_context(|| format!("{path}: tokens fed_ids must be an array"))?;
+                    if fed_ids.len() != ids.len() {
+                        bail!(
+                            "{path}: ids/fed_ids count mismatch: ids={}, fed_ids={}",
+                            ids.len(),
+                            fed_ids.len()
+                        )
+                    }
+                    for (index, id) in fed_ids.iter().enumerate() {
+                        u32::try_from(id.as_u64().with_context(|| {
+                            format!("{path}: fed token id {index} is not an unsigned integer")
+                        })?)
+                        .with_context(|| format!("{path}: fed token id {index} is not u32"))?;
+                    }
+                }
+                tokens = Some(record);
+            }
             _ => {}
         }
+    }
+    if logits.is_empty() {
+        bail!("{path}: no logits records")
+    }
+    let tokens = tokens.with_context(|| format!("{path}: no tokens record"))?;
+    let token_count = tokens["ids"]
+        .as_array()
+        .expect("validated tokens ids")
+        .len();
+    if token_count != logits.len() {
+        bail!(
+            "{path}: token/logits count mismatch: tokens={token_count}, logits={}",
+            logits.len()
+        )
     }
     Ok((logits, tokens))
 }
@@ -56,6 +143,13 @@ fn main() -> Result<()> {
     }
     let (reference, reference_tokens) = read_records(&reference_path)?;
     let (candidate, candidate_tokens) = read_records(&candidate_path)?;
+    if !reference.keys().eq(candidate.keys()) {
+        bail!(
+            "logits step sets differ: reference={:?}, candidate={:?}",
+            reference.keys().collect::<Vec<_>>(),
+            candidate.keys().collect::<Vec<_>>()
+        )
+    }
     if gate {
         if reference.len() != GATE_STEPS || candidate.len() != GATE_STEPS {
             bail!(
@@ -69,6 +163,22 @@ fn main() -> Result<()> {
                 bail!("gate missing logits step {step}")
             }
         }
+        let reference_fed = reference_tokens["fed_ids"]
+            .as_array()
+            .context("reference tokens record missing fed_ids")?;
+        let candidate_fed = candidate_tokens["fed_ids"]
+            .as_array()
+            .context("candidate tokens record missing fed_ids")?;
+        if reference_fed.len() != GATE_STEPS || candidate_fed.len() != GATE_STEPS {
+            bail!(
+                "gate needs exactly {GATE_STEPS} fed token ids, got reference={} candidate={}",
+                reference_fed.len(),
+                candidate_fed.len()
+            )
+        }
+        if reference_fed != candidate_fed {
+            bail!("gate teacher-forced token streams differ")
+        }
     }
     let mut first_argmax_divergence = None;
     let mut first_gate_failure = None;
@@ -77,53 +187,48 @@ fn main() -> Result<()> {
     let mut argmax_divergences = 0usize;
 
     for (step, r) in &reference {
-        let Some(c) = candidate.get(step) else {
-            continue;
-        };
+        let c = candidate.get(step).expect("checked identical step sets");
         compared += 1;
-        let metrics = match (r["values"].as_array(), c["values"].as_array()) {
+        let metrics = match (r.get("values"), c.get("values")) {
             (Some(rv), Some(cv)) => {
+                let rv = rv.as_array().expect("validated reference values");
+                let cv = cv.as_array().expect("validated candidate values");
                 if rv.len() != cv.len() {
                     bail!("step {step}: value length {} != {}", rv.len(), cv.len())
                 }
-                if gate {
-                    let expected = r["finite"]
-                        .as_u64()
-                        .context("full-logit record missing finite count")?
-                        as usize;
-                    if rv.len() != expected || c["finite"] != r["finite"] {
-                        bail!(
-                            "step {step}: full-logit length/count mismatch: values={}, reference finite={}, candidate finite={}",
-                            rv.len(),
-                            r["finite"],
-                            c["finite"]
-                        )
-                    }
+                let reference_finite = r["finite"].as_u64().expect("validated finite") as usize;
+                let candidate_finite = c["finite"].as_u64().expect("validated finite") as usize;
+                if rv.len() != reference_finite || cv.len() != candidate_finite {
+                    bail!(
+                        "step {step}: full-logit length/count mismatch: reference values={}, finite={reference_finite}; candidate values={}, finite={candidate_finite}",
+                        rv.len(),
+                        cv.len()
+                    )
                 }
                 let mut dot = 0.0f64;
                 let mut ref_sq = 0.0f64;
                 let mut candidate_sq = 0.0f64;
                 let mut diff_sq = 0.0f64;
                 let mut max_abs = 0.0f64;
-                for (r, c) in rv.iter().zip(cv) {
-                    let (Some(r), Some(c)) = (r.as_f64(), c.as_f64()) else {
-                        continue;
-                    };
-                    dot += r * c;
-                    ref_sq += r * r;
-                    candidate_sq += c * c;
-                    let diff = c - r;
+                for (reference_value, candidate_value) in rv.iter().zip(cv) {
+                    let reference_value = reference_value.as_f64().expect("validated value");
+                    let candidate_value = candidate_value.as_f64().expect("validated value");
+                    dot += reference_value * candidate_value;
+                    ref_sq += reference_value * reference_value;
+                    candidate_sq += candidate_value * candidate_value;
+                    let diff = candidate_value - reference_value;
                     diff_sq += diff * diff;
                     max_abs = max_abs.max(diff.abs());
                 }
                 let cosine = dot / (ref_sq.sqrt() * candidate_sq.sqrt());
                 let nrmse = (diff_sq / ref_sq).sqrt();
+                if !cosine.is_finite() || !nrmse.is_finite() || !max_abs.is_finite() {
+                    bail!("step {step}: non-finite comparison metrics")
+                }
                 full_vectors_compared.push(*step);
                 if gate
                     && first_gate_failure.is_none()
-                    && (!cosine.is_finite()
-                        || !nrmse.is_finite()
-                        || cosine < GATE_MIN_COSINE
+                    && (cosine < GATE_MIN_COSINE
                         || nrmse > GATE_MAX_NRMSE
                         || max_abs > GATE_MAX_ABS)
                 {
@@ -137,7 +242,8 @@ fn main() -> Result<()> {
                     "max_abs": max_abs,
                 })
             }
-            _ => Value::Null,
+            (None, None) => Value::Null,
+            _ => bail!("step {step}: full-logit vector missing from one input"),
         };
         let argmax_equal = r["argmax"] == c["argmax"];
         if !argmax_equal {

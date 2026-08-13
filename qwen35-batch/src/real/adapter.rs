@@ -22,7 +22,7 @@ use std::path::Path;
 
 use crate::model::{BatchModel, DecodeBatch, PrefillChunk};
 use crate::real::model_profile::ModelProfile;
-use crate::real::model_weights::{ModelWeights, StateSnapshot};
+use crate::real::model_weights::{ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY};
 
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
 pub struct Qwen35BatchAdapter {
@@ -43,6 +43,11 @@ pub struct Qwen35BatchAdapter {
 impl Qwen35BatchAdapter {
     /// Загрузить модель из GGUF (zero-copy на Metal) и подготовить N слотов.
     pub fn load(gguf_path: &Path, device: Device, num_slots: usize) -> Result<Self> {
+        if num_slots > DECODE_BATCH_CAPACITY as usize {
+            return Err(anyhow!(
+                "num_slots {num_slots} exceeds decode capacity {DECODE_BATCH_CAPACITY}"
+            ));
+        }
         use candle_core::quantized::gguf_file;
         use std::fs::File;
         use std::sync::Arc;
@@ -234,8 +239,7 @@ impl BatchModel for Qwen35BatchAdapter {
         for it in &batch.items {
             let sidx = it.slot_idx;
             if !self.slot_seeded[sidx] {
-                let snap = self
-                    .slot_snaps[sidx]
+                let snap = self.slot_snaps[sidx]
                     .as_ref()
                     .ok_or_else(|| anyhow!("decode_batch: slot {sidx} без snapshot"))?;
                 self.model
@@ -264,16 +268,21 @@ impl BatchModel for Qwen35BatchAdapter {
             .model
             .forward_decode_batch(&ids, &positions, &slots)
             .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
-        // logits: [B, vocab]. Split per slot.
-        let logits_f32 = logits.to_dtype(DType::F32)?;
-        let mut out = Vec::with_capacity(b);
-        for i in 0..b {
-            let row = logits_f32.get(i)?;
-            let row_vec = row
-                .to_vec1()
-                .map_err(|e| anyhow!("decode_batch logits row {i} to_vec1: {e}"))?;
-            out.push(row_vec);
+        // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
+        // serialized four CUDA synchronizations/copies for B=4.
+        let flat = logits
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()
+            .map_err(|e| anyhow!("decode_batch logits to_vec1: {e}"))?;
+        let vocab = self.vocab_size();
+        if flat.len() != b * vocab {
+            return Err(anyhow!(
+                "decode_batch logits length {} != batch {b} * vocab {vocab}",
+                flat.len()
+            ));
         }
+        let out = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
 
         // Обновить per-slot snapshot из batched state после decode (для последующего
         // prefill-продолжения и для повторного seed, если слот покинет batch и вернётся).
@@ -316,5 +325,30 @@ impl Qwen35BatchAdapter {
         } else {
             151943
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_rejects_excess_slots_before_opening_gguf() {
+        let missing = Path::new("this-model-must-not-exist.gguf");
+        let error = match Qwen35BatchAdapter::load(
+            missing,
+            Device::Cpu,
+            DECODE_BATCH_CAPACITY as usize + 1,
+        ) {
+            Ok(_) => panic!("excess slots unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "num_slots {} exceeds decode capacity {DECODE_BATCH_CAPACITY}",
+                DECODE_BATCH_CAPACITY + 1
+            )
+        );
     }
 }

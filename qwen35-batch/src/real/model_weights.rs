@@ -1474,7 +1474,7 @@ struct DeltaNetCudaContext {
 /// быть ≤ capacity. B=4 покрывает целевой continuous-batching throughput
 /// (aggregate B=4 > B=1, см. Phase 6 benchmark). GPU cost batched state:
 /// ~B × n_v×head_v_dim² × 4 байт ≈ KB–MB per layer — пренебрежимо vs весов.
-const DECODE_BATCH_CAPACITY: u32 = 4;
+pub(crate) const DECODE_BATCH_CAPACITY: u32 = 4;
 
 /// Metal GPU batched-контекст DeltaNet (Phase 3 true batched decode).
 /// Pipelines + temp — shared (Arc) через все слои (один compile/аллокация);
@@ -3079,33 +3079,50 @@ impl GatedAttentionLayer {
         ))?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+        // Positions usually match, so RoPE runs once over B. Batch shrink/admission
+        // can diverge positions; retain per-slot fallback for that case. Q8 is
+        // per-row, so K/V quantize once over [B, 1, n_kv, hd].
+        let mut q_slots = Vec::with_capacity(b_sz);
+        let shared_position = positions
+            .first()
+            .copied()
+            .filter(|&first| positions.iter().all(|&pos| pos == first));
+        let k_hl = if let Some(position) = shared_position {
+            let q_rope = self.apply_partial_rotary_emb(&q_all, position)?;
+            for bidx in 0..b_sz {
+                q_slots.push(q_rope.narrow(0, bidx, 1)?);
+            }
+            self.apply_partial_rotary_emb(&k_all, position)?
+                .transpose(1, 2)?
+                .contiguous()?
+        } else {
+            let mut k_slots = Vec::with_capacity(b_sz);
+            for (bidx, &position) in positions.iter().enumerate() {
+                let q = q_all.narrow(0, bidx, 1)?.contiguous()?;
+                let k = k_all.narrow(0, bidx, 1)?.contiguous()?;
+                q_slots.push(self.apply_partial_rotary_emb(&q, position)?);
+                k_slots.push(
+                    self.apply_partial_rotary_emb(&k, position)?
+                        .transpose(1, 2)?
+                        .contiguous()?,
+                );
+            }
+            Tensor::cat(&k_slots, 0)?
+        };
+        let v_hl = v_all.transpose(1, 2)?.contiguous()?;
+        let (kq_all, ks_all) = q8_quantize_rows(&k_hl)?;
+        let (vq_all, vs_all) = q8_quantize_rows(&v_hl)?;
+
         let mut slot_outs: Vec<Tensor> = Vec::with_capacity(b_sz);
-
-        // 3-7. Per-slot RoPE + KV-cache + SDPA (math идентичен forward_attn decode).
-        //
-        // `bidx` = batch position (индексирует входные тензоры q/k/v и positions);
-        // `slot` = реальный slot_idx из `slots[bidx]` (индексирует persistent KV cache).
-        // После сжатия батча (ранний EOS) persistent KV должен адресоваться по
-        // slot_idx, иначе слот 0 прочитал бы чужой cache.
-        for bidx in 0..b_sz {
-            let slot = slots[bidx] as usize;
-            let pos = positions[bidx];
-            // Per-batch narrow: [1, n_head, 1, hd]
-            let q = q_all.narrow(0, bidx, 1)?.contiguous()?;
-            let k = k_all.narrow(0, bidx, 1)?.contiguous()?;
-            let v = v_all.narrow(0, bidx, 1)?.contiguous()?;
-
-            // Partial RoPE per slot (index_pos = pos).
-            let q = self.apply_partial_rotary_emb(&q, pos)?;
-            let k = self.apply_partial_rotary_emb(&k, pos)?;
-
-            // KV-cache append (per-slot). Q8_0 квантование, layout HEAD-LAST
-            // [1, cap, n_kv, hd] — flash-attn читает узким срезом без копий.
-            let k_hl = k.transpose(1, 2)?.contiguous()?; // [1, 1, n_kv, hd]
-            let v_hl = v.transpose(1, 2)?.contiguous()?;
-            let (kq, ks) = q8_quantize_rows(&k_hl)?;
-            let (vq, vs) = q8_quantize_rows(&v_hl)?;
-
+        // `bidx` indexes current batch tensors; `slot` indexes persistent KV.
+        for (bidx, &slot) in slots.iter().enumerate() {
+            let slot = slot as usize;
+            let q = &q_slots[bidx];
+            let kq = kq_all.narrow(0, bidx, 1)?;
+            let ks = ks_all.narrow(0, bidx, 1)?;
+            let vq = vq_all.narrow(0, bidx, 1)?;
+            let vs = vs_all.narrow(0, bidx, 1)?;
             let need_init = self.kv_cache_batched[slot].is_none();
             if need_init {
                 let init_cap = 512.min(self.attn_window);

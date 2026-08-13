@@ -27,4 +27,6 @@ Gate thresholds, calibrated on RTX 3060 / CUDA 12.4 / target UD-IQ2_XXS GGUF:
 - cosine `>= 0.997`, nRMSE `<= 0.07`, max absolute error `<= 1.3`;
 - at most 5 argmax differences, each with external-reference margin `<= 0.30`.
 
+Comparator input is fail-closed: both files need nonempty identical step sets, exactly one nonempty `tokens.ids` record matching logits count, numeric finite margins, and numeric finite full-logit values when `values` is present. Gate mode also requires identical 128-token `fed_ids` teacher-forcing streams. Duplicate steps/tokens, truncated runs, one-sided full vectors, mismatched teacher forcing, and invalid values return nonzero.
+
 Exact greedy sequence remains diagnostic. Low-margin decisions vary among llama.cpp, Candle dequantize+cuBLAS, and sparse PTX despite close logits.

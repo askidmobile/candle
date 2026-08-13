@@ -547,12 +547,29 @@ fn mul_mat_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+fn contiguous_view<'a, T>(
+    storage: &'a CudaSlice<T>,
+    layout: &crate::Layout,
+    name: &str,
+) -> Result<CudaView<'a, T>> {
+    let (start, end) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg(format!("indexed moe: {name} not contiguous")).bt())?;
+    if end > storage.len() {
+        crate::bail!(
+            "indexed moe: {name} layout range {start}..{end} exceeds storage length {}",
+            storage.len()
+        )
+    }
+    Ok(storage.slice(start..end))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn indexed_moe_forward_dispatch(
     weight: &CudaView<u8>,
     w_shape: &crate::Shape, //[num_experts, n, k]
     w_dtype: GgmlDType,
-    input: &CudaSlice<f32>,
+    input: &CudaView<f32>,
     in_shape: &crate::Shape, //[batch, topk or 1, k]
     ids: &CudaView<u32>,
     idx_shape: &crate::Shape, //[batch, topk]
@@ -644,8 +661,7 @@ fn indexed_moe_forward_dispatch(
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
     let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
 
-    let input_view = input.slice(0..);
-    quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+    quantize_q8_1(input, &mut input_quant, k, total_rows, dev)?;
 
     // output buffer
     let outsize = batch * topk * n;
@@ -713,6 +729,10 @@ impl QCudaStorage {
         if dtype != other.dtype() {
             crate::bail!("dual moe: dtype mismatch {:?} vs {:?}", dtype, other.dtype());
         }
+        let input_storage = input.as_cuda_slice::<f32>()?;
+        let input_view = contiguous_view(input_storage, input_l, "input")?;
+        let ids_storage = ids.as_cuda_slice::<u32>()?;
+        let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
         if matches!(
             dtype,
             GgmlDType::IQ2S
@@ -724,15 +744,13 @@ impl QCudaStorage {
         ) {
             // Two launches beat dual-register pressure on RTX 3060 for current
             // 2048x512 experts. Input stays F32; neither path allocates Q8_1.
-            let input_storage = input.as_cuda_slice::<f32>()?;
-            let ids_storage = ids.as_cuda_slice::<u32>()?;
             let first = indexed_moe_forward_dispatch(
                 &self.data.inner.slice(0..),
                 self_shape,
                 dtype,
-                input_storage,
+                &input_view,
                 input_l.shape(),
-                &ids_storage.slice(0..),
+                &ids_view,
                 ids_l.shape(),
                 &self.device,
             )?;
@@ -740,9 +758,9 @@ impl QCudaStorage {
                 &other.data.inner.slice(0..),
                 self_shape,
                 dtype,
-                input_storage,
+                &input_view,
                 input_l.shape(),
-                &ids_storage.slice(0..),
+                &ids_view,
                 ids_l.shape(),
                 &self.device,
             )?;
@@ -762,23 +780,12 @@ impl QCudaStorage {
 
         // q8_1 quantize входа (один раз на обе проекции).
         let dev = &self.device;
-        let input_view_all = input.as_cuda_slice::<f32>()?;
-        let input_view = match input_l.contiguous_offsets() {
-            Some((o1, o2)) => input_view_all.slice(o1..o2),
-            None => crate::bail!("dual moe: input not contiguous"),
-        };
         let total_rows = batch * input_dim1;
         let k_padded = pad(k, MATRIX_ROW_PADDING);
         let y_size_in_bytes =
             k_padded * total_rows * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
         let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
         quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
-
-        let ids_storage = ids.as_cuda_slice::<u32>()?;
-        let ids_view = match ids_l.contiguous_offsets() {
-            Some((o1, o2)) => ids_storage.slice(o1..o2),
-            None => ids_storage.slice(0..),
-        };
 
         let outsize = batch * topk * n;
         let out1 = unsafe { dev.alloc::<f32>(outsize)? };
@@ -839,14 +846,16 @@ impl QCudaStorage {
                 | GgmlDType::Q6K
         ) {
             let input_storage = input.as_cuda_slice::<f32>()?;
+            let input_view = contiguous_view(input_storage, input_l, "input")?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
+            let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
             indexed_moe_forward_dispatch(
                 &self.data.inner.slice(0..),
                 self_shape, //[num_experts, n, k]
                 self.dtype(),
-                input_storage,
+                &input_view,
                 input_l.shape(), //[batch, topk or 1, k]
-                &ids_storage.slice(0..),
+                &ids_view,
                 ids_l.shape(), //[batch, topk]
                 &self.device,
             )

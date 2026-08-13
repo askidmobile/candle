@@ -60,6 +60,7 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - **Dense 4B long prefill:** 2191 tokens = 1375.7 tok/s whole, 1224.4 tok/s with server chunk 512; full/512/2048 final logits bit-exact. Yttri CUDA baseline 434–439 tok/s is older. Details: `docs/research/2026-08-13-qwen35-dense-cuda-comparison.md`.
 - **Benchmark isolation is mandatory.** One GPU process and one loaded adapter; run ignored tests with `--exact --test-threads=1`. Duplicate model loads trigger WDDM paging and invalidate speed/VRAM results.
 - **Tiled dequantize matmul** (`2fdd7a1e`) limits IQ fallback transient; default `PREFILL_CHUNK=512` remains for 35B VRAM and decode fairness.
+- **Decode utilization dips need phase timing.** Split host enqueue, explicit GPU sync, D2H, sampling, and drain before blaming transfers; details: `docs/research/2026-08-13-qwen35-dense-cuda-comparison.md`.
 
 ## IQ quant CUDA (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS)
 
