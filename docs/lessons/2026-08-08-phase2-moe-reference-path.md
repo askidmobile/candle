@@ -27,7 +27,7 @@ Qwen3.6 MoE block with three components:
 - All 3 forward paths updated: `forward`, `forward_prefill`, `forward_decode_batch` call `self.ff.forward(&normed)` / `forward_prefill` / `forward_decode_batch`.
 - `build_model_common` architecture-aware: `is_moe = metadata["general.architecture"] == "qwen35moe"`. Prefix = `qwen35moe` vs `qwen35`. All metadata/tensor reads use prefix. Arena sizing uses `max(routed, shared)` intermediate for MoE.
 - MoE tensor loading: router from `ffn_gate_inp.weight` (dequant → F32 Linear), packed from `ffn_gate_exps/up_exps/down_exps.weight` (Arc<QTensor>), shared from `ffn_gate_inp_shexp` + `ffn_gate_shexp/up_shexp/down_shexp`.
-- `QWEN36_MOE_BACKEND=ptx|reference` env, default Reference. PTX bails (Phase 3).
+- Historical Phase 2 state: `QWEN36_MOE_BACKEND=ptx|reference` defaulted to Reference and PTX bailed. Superseded by Phase 3: supported CUDA routed dtypes default to PTX; `reference` is explicit rollback. See `2026-08-13-iq-moe-cuda.md`.
 - `debug_capture_single_matmul` updated: `match &block0.ff { Dense(m) => m, Moe(_) => bail! }`.
 
 ### tests/qwen35moe_reference.rs (667 lines, 11 tests)

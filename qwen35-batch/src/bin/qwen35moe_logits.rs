@@ -161,7 +161,7 @@ fn main() -> Result<()> {
     };
     let prompt = tokenizer::build_chatml_text(&messages);
     let prompt_tokens = tokenizer::encode_no_think(&tokenizer, &prompt)?;
-    let backend = std::env::var("QWEN36_MOE_BACKEND").unwrap_or_else(|_| "reference".into());
+    let backend = std::env::var("QWEN36_MOE_BACKEND").unwrap_or_else(|_| "auto".into());
     println!(
         "{}",
         json!({

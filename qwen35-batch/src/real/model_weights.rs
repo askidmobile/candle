@@ -4314,6 +4314,7 @@ impl ModelWeights {
         };
 
         // ── Загрузка слоёв ──
+        let requested_moe_backend = std::env::var("QWEN36_MOE_BACKEND").ok();
         let mut blocks = Vec::with_capacity(block_count);
         let load_start = std::time::Instant::now();
 
@@ -4339,7 +4340,7 @@ impl ModelWeights {
             let ff = if is_moe {
                 // ── MoE: router + packed routed experts + sigmoid-gated shared ──
                 use super::moe::{
-                    MoeBackend, MoeRouter, PackedExperts, Qwen35MoeBlock, Qwen35MoeConfig,
+                    select_backend, MoeRouter, PackedExperts, Qwen35MoeBlock, Qwen35MoeConfig,
                     SharedExpert,
                 };
 
@@ -4390,14 +4391,13 @@ impl ModelWeights {
                     shared_intermediate: moe_shared_intermediate,
                     norm_topk_prob: moe_norm_topk,
                 };
-                // Backend: Reference for Phase 2. PTX is Phase 3.
-                let backend = match std::env::var("QWEN36_MOE_BACKEND")
-                    .unwrap_or_default()
-                    .as_str()
-                {
-                    "ptx" => MoeBackend::Ptx,
-                    _ => MoeBackend::Reference,
-                };
+                let backend = select_backend(
+                    requested_moe_backend.as_deref(),
+                    device.is_cuda(),
+                    routed.gate.dtype(),
+                    routed.up.dtype(),
+                    routed.down.dtype(),
+                )?;
                 FeedForward::Moe(Qwen35MoeBlock::new(cfg, router, routed, shared, backend))
             } else {
                 // ── Dense SwiGLU MLP ──

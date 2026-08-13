@@ -39,7 +39,9 @@ Pinned llama.cpp commit `8e7f22b67ef4667b4ddd50230771287f328cfb3f` was built on 
 
 Exact greedy cannot serve as a binary correctness gate for this 2-bit model: llama.cpp itself selects a mix of the two Candle accumulation outcomes near tied logits. Gate fixed teacher-forced states instead: 128 contiguous steps, full logits at 16/45/50/92/111, cosine at least 0.997, nRMSE at most 0.07, max absolute error at most 1.3, and no more than five argmax differences with external margin at most 0.30. Keep free greedy as a drift diagnostic.
 
-Runtime default remains `reference` until PTX passes 4×8K stability; external logit parity no longer blocks that stability run.
+PTX then passed clean 4×8K stability on committed CUDA build: all four streams returned HTTP 200 and 8140 completion tokens (`52 + 8140 = 8192`), `finish_reason=length`, one `[DONE]`, no malformed JSON, and bit-exact content in 1232.3 seconds. Post-run reuse returned HTTP 200 in 1.71 seconds. GPU shared usage stayed at 76 MiB, committed GPU memory peaked at 11143 MiB, and logs contained no CUDA/error markers.
+
+PTX is now CUDA default only when all routed gate/up/down dtypes have validated kernels. Explicit `QWEN36_MOE_BACKEND=reference` remains diagnostic rollback. Unsupported dtype combinations and invalid backend values fail during model load instead of silently falling back.
 
 ## References
 

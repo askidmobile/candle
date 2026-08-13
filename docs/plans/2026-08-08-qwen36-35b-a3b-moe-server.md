@@ -229,7 +229,7 @@ Covers: FR-003, FR-004, FR-005, foundation for FR-017 and FR-030.
 
 ### Phase 3 — Dynamic-loaded PTX MoE backend and required quant matrix (60–90 hours)
 
-Status: in progress — target UD-IQ2_XXS routed dtype set (`IQ2_XXS`, `IQ2_S`, `IQ3_S`) has direct F32 sparse kernels and CUDA parity tests. PTX passes calibrated llama.cpp-relative teacher-forced logit gate and B=1/B=4 throughput; runtime default remains `reference` until 4×8K PTX stability passes.
+Status: in progress — target UD-IQ2_XXS routed dtype set (`IQ2_XXS`, `IQ2_S`, `IQ3_S`) has direct F32 sparse kernels and CUDA parity tests. PTX passes calibrated llama.cpp-relative teacher-forced logit gate, B=1/B=4 throughput, and 4×8K stability. CUDA default is now PTX for validated routed dtypes; `reference` remains explicit diagnostic rollback.
 
 Files:
 
@@ -262,13 +262,15 @@ Progress:
 - [x] Run target GGUF smoke and warm benchmarks: B=1 PTX 9.13 vs reference 7.52 tok/s; B=4 PTX 21.09 vs reference 19.67 tok/s.
 - [x] Establish llama.cpp-relative full-model logit policy. Pinned llama.cpp and Candle evaluate 128 identical teacher-forced states; full vectors at steps 16/45/50/92/111 must meet cosine ≥0.997, nRMSE ≤0.07, max abs ≤1.3. Up to 5 argmax differences are allowed only when external-reference margin ≤0.30. Exact greedy is diagnostic because both Candle backends differ from llama.cpp on low-margin decisions.
 - [x] Run external llama.cpp parity: all three agree on 123/128 teacher-forced states; PTX matches llama.cpp on 2/5 disputed decisions and reference on 3/5. Free greedy exact prefix is PTX 43 tokens vs reference 16. PTX disputed-state nRMSE range 0.0272–0.0661; max abs ≤1.205.
+- [x] Pass PTX 4×8K on RTX 3060: 4/4 HTTP 200, 8140 completion tokens each, total 8192, `finish_reason=length`, one `[DONE]`, no malformed JSON, bit-exact content, 1232.3 s elapsed, post-run reuse HTTP 200 in 1.71 s. GPU shared stayed 76 MiB; committed peak 11143 MiB; no CUDA/error markers.
+- [x] Promote PTX as CUDA default only for routed dtype combinations supported by gate/up dual and down kernels; explicit `QWEN36_MOE_BACKEND=reference` remains rollback, invalid values and unsupported PTX dtypes fail at load.
 - [ ] Add grouped prefill kernels, reusable workspace, remaining required quant matrix, and leak/long-prefill checks.
 
 Deviations:
 
 - deviated: target UD-IQ2_XXS is physically mixed: routed tensors contain 80 `IQ2_XXS`, 37 `IQ2_S`, and 3 `IQ3_S`; implemented exact discovered set instead of filename-only `IQ2_XXS` dispatch.
 - deviated: reused working runtime-loaded `quantized.cu` indexed operation instead of introducing another production launcher through incomplete `moe_quantized.cu`; one backend avoids duplicate ABI and lookup tables.
-- deviated: exact greedy parity is no longer a correctness gate for this 2-bit backend. Pinned llama.cpp itself selects a mix of PTX and dequantize+cuBLAS low-margin decisions; teacher-forced numerical tolerance plus external margin is the promotion gate. Runtime default remains `reference` pending PTX 4×8K stability.
+- deviated: exact greedy parity is no longer a correctness gate for this 2-bit backend. Pinned llama.cpp itself selects a mix of PTX and dequantize+cuBLAS low-margin decisions; teacher-forced numerical tolerance plus external margin is the promotion gate. PTX became CUDA default after 4×8K stability passed.
 
 Independent exit check: each quant passes dequant/reference numerical tests, random routing, empty experts, all tokens selecting one expert, top-8 duplicates guard, decode B=1..4, long prefill, and repeated-workspace leak checks on Windows CUDA 12.4.
 

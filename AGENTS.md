@@ -66,7 +66,7 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 
 ## IQ quant CUDA (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS)
 
-- **2-bit full-model parity is margin-aware.** Use pinned llama.cpp + 128 teacher-forced states and `qwen35moe_compare --gate`; exact free greedy is diagnostic. Details: `docs/lessons/2026-08-13-iq-moe-cuda.md`.
+- **2-bit CUDA MoE defaults to PTX after margin-aware parity + 4×8K pass.** Use `QWEN36_MOE_BACKEND=reference` only for diagnostic rollback; exact free greedy is diagnostic. Details: `docs/lessons/2026-08-13-iq-moe-cuda.md`.
 - **Isolated CUDA tests**: `candle-core/tests/iq_quant_cuda_tests.rs`. Run via `run_iq_tests.bat` on yttri-win. All 12 tests PASS (matmul dispatches to `cuda_fwd`, dequantize finite, multiblock correct) as of 2026-08-08.
 - **The candle dispatch is CORRECT.** `QMatMul::forward` (mod.rs:1037-1060) → `xs.apply_op1_no_bwd(t)` → `Storage::apply_op1` (storage.rs:205-220) dispatches by INPUT storage → `cuda_fwd` for Cuda, `cpu_fwd` for Cpu. `QStorage::from_data` (mod.rs:87-153) routes IQ types to `cuda::load_quantized_bytes` for CUDA device. Loading path verified correct. The only failure mode is building without the cuda feature (see qwen36-server section above).
 - **Dispatch path** (confirmed correct): `QMatMul::forward` → `cuda_fwd` (mod.rs:952-1035 CustomOp1) → for IQ types, fallback to `dequantize + cuBLAS` matmul in `cuda.rs:765`.

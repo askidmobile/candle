@@ -1,10 +1,9 @@
-//! Qwen3.6 35B-A3B MoE block — Phase 2 reference path.
+//! Qwen3.6 35B-A3B MoE block.
 //!
 //! Router (top-k), packed routed experts, sigmoid-gated shared expert.
 //! Reference backend dequantizes selected experts — diagnostics/parity only.
-//! PTX backend is Phase 3.
 
-use candle_core::quantized::{QMatMul, QTensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{ops::softmax_last_dim, Linear};
 use std::sync::Arc;
@@ -27,8 +26,93 @@ pub enum ForwardMode {
 pub enum MoeBackend {
     /// CPU/Metal reference: dequantizes selected experts. Diagnostics/parity only.
     Reference,
-    /// CUDA PTX sparse GEMM (Phase 3).
+    /// CUDA PTX sparse GEMM.
     Ptx,
+}
+
+pub(crate) fn select_backend(
+    requested: Option<&str>,
+    is_cuda: bool,
+    gate: GgmlDType,
+    up: GgmlDType,
+    down: GgmlDType,
+) -> Result<MoeBackend> {
+    match requested {
+        Some("reference") => return Ok(MoeBackend::Reference),
+        Some("ptx") => {}
+        Some(value) => {
+            candle_core::bail!("invalid QWEN36_MOE_BACKEND={value:?}; expected ptx or reference")
+        }
+        None if !is_cuda => return Ok(MoeBackend::Reference),
+        None => {}
+    }
+    if !is_cuda {
+        candle_core::bail!("QWEN36_MOE_BACKEND=ptx requires CUDA")
+    }
+    let dual_supported = gate == up
+        && matches!(
+            gate,
+            GgmlDType::IQ2S
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ3S
+                | GgmlDType::Q8_0
+                | GgmlDType::Q2K
+                | GgmlDType::Q4K
+                | GgmlDType::Q6K
+        );
+    let down_supported = matches!(
+        down,
+        GgmlDType::IQ2S
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+    );
+    if !dual_supported || !down_supported {
+        candle_core::bail!(
+            "PTX MoE does not support routed dtypes gate={gate:?} up={up:?} down={down:?}"
+        )
+    }
+    Ok(MoeBackend::Ptx)
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+
+    const GATE: GgmlDType = GgmlDType::IQ2XXS;
+    const DOWN: GgmlDType = GgmlDType::IQ2S;
+
+    #[test]
+    fn cuda_defaults_to_ptx_for_supported_dtypes() {
+        assert_eq!(
+            select_backend(None, true, GATE, GATE, DOWN).unwrap(),
+            MoeBackend::Ptx
+        );
+    }
+
+    #[test]
+    fn reference_override_and_non_cuda_default_work() {
+        assert_eq!(
+            select_backend(Some("reference"), true, GATE, GATE, DOWN).unwrap(),
+            MoeBackend::Reference
+        );
+        assert_eq!(
+            select_backend(None, false, GATE, GATE, DOWN).unwrap(),
+            MoeBackend::Reference
+        );
+    }
+
+    #[test]
+    fn explicit_ptx_rejects_non_cuda_or_unsupported_dtypes() {
+        assert!(select_backend(Some("ptx"), false, GATE, GATE, DOWN).is_err());
+        assert!(select_backend(Some("ptx"), true, GATE, GgmlDType::IQ2S, DOWN).is_err());
+        assert!(select_backend(Some("unknown"), true, GATE, GATE, DOWN).is_err());
+    }
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -374,9 +458,7 @@ impl MoeBackend {
 /// Работает для IQ2_S/IQ2_XXS/IQ3_S и K-quants/Q8_0 экспертов.
 #[cfg(feature = "cuda")]
 fn ptx_routed_swiglu(xs: &Tensor, experts: &PackedExperts, route: &RoutePlan) -> Result<Tensor> {
-    // UD-кванты динамические: часть тензоров может быть IQ (нет indexed ядра) —
-    // такие блоки идём через reference (per-tensor fallback, не весь запрос).
-    use candle_core::quantized::GgmlDType;
+    // Legacy route-plan PTX path; production CUDA path validates routed dtypes at load.
     let supported = |qt: &Arc<QTensor>| {
         matches!(
             qt.dtype(),
