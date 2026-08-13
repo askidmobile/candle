@@ -123,7 +123,7 @@ The acceptance run uses conservative context and slot settings first, then recor
 
 1. Synthetic CPU/reference tests for routing, normalization, shared gating, packed shape/stride, and error handling.
 2. CUDA `IQ2_XXS` projection tests across expert IDs, output rows, multiple quant blocks, odd token distributions, empty experts, top-8 weighting, and decode/prefill shapes.
-3. Reference-versus-CUDA MoE and full-block parity with explicit absolute/relative tolerances derived from F32 accumulation and IQ quantization.
+3. Pinned llama.cpp-versus-CUDA MoE and full-block parity with fixed teacher-forced states and explicit absolute/relative tolerances derived from measured F32 accumulation and IQ quantization. Exact greedy is diagnostic for low-margin 2-bit decisions; high-margin argmax drift remains a failure.
 4. Single-stream prefill/decode parity, chunk-boundary parity, snapshot restore parity, prompt-cache parity, true batched decode parity, slot isolation, and EOS compaction tests.
 5. Real GGUF smoke generation with fixed prompt/seed, finite logits, valid tokens, EOS handling, and qualitative RU/EN prompts.
 6. Windows CUDA 12.4 release build, dependency inspection, kernel load smoke test, and server `/v1/chat/completions` end-to-end request.

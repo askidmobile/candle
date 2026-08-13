@@ -67,6 +67,11 @@ name = "qwen35moe_reference"
 path = "tests/qwen35moe_reference.rs"
 required-features = ["real-model"]
 
+[[test]]
+name = "logits_compare_cli"
+path = "tests/logits_compare_cli.rs"
+required-features = ["real-model"]
+
 [[bin]]
 name = "qwen36_inspect"
 path = "src/bin/qwen36_inspect.rs"

@@ -5,6 +5,7 @@ use qwen35_batch::real::{tokenizer, Qwen35BatchAdapter};
 use qwen35_batch::BatchModel;
 use serde_json::json;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -183,11 +184,28 @@ fn main() -> Result<()> {
         start_pos: 0,
     })?;
 
-    let full_step = std::env::var("QWEN36_LOGITS_FULL_STEP")
-        .ok()
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .context("QWEN36_LOGITS_FULL_STEP must be an integer")?;
+    let mut full_steps = BTreeSet::new();
+    if let Ok(value) = std::env::var("QWEN36_LOGITS_FULL_STEP") {
+        full_steps.insert(
+            value
+                .parse::<usize>()
+                .context("QWEN36_LOGITS_FULL_STEP must be an integer")?,
+        );
+    }
+    if let Ok(value) = std::env::var("QWEN36_LOGITS_FULL_STEPS") {
+        for step in value.split(',') {
+            if step.is_empty() {
+                bail!("QWEN36_LOGITS_FULL_STEPS contains an empty step")
+            }
+            full_steps.insert(
+                step.parse::<usize>()
+                    .context("QWEN36_LOGITS_FULL_STEPS must be comma-separated integers")?,
+            );
+        }
+    }
+    if let Some(step) = full_steps.iter().find(|&&step| step >= steps) {
+        bail!("full logits step {step} is outside requested {steps} steps")
+    }
     let include_all_values = std::env::var_os("QWEN36_LOGITS_FULL").is_some();
     let mut predicted = Vec::with_capacity(steps);
     let mut fed = Vec::with_capacity(steps);
@@ -195,7 +213,11 @@ fn main() -> Result<()> {
         let prediction = argmax(&logits);
         println!(
             "{}",
-            record(step, &logits, include_all_values || full_step == Some(step))
+            record(
+                step,
+                &logits,
+                include_all_values || full_steps.contains(&step)
+            )
         );
         let token = forced_tokens
             .as_ref()

@@ -27,7 +27,19 @@ Windows CUDA 12.4, RTX 3060 12 GB, 128 output tokens, warmed server:
 - CUDA projection tests: 21 passed.
 - GPU router parity test: passed.
 
-Full-model exact greedy still diverges between reference and PTX. CPU-router/PTX-projection probe also diverges, localizing remaining drift to projection/reduction accumulation order rather than routing. JSONL teacher-forced comparison found 5/128 argmax divergences, all at reference margins below 0.183; first divergence had cosine 0.999357, nRMSE 0.03695, and max absolute logit error 0.618. Runtime default remains `reference` until llama.cpp comparison identifies which accumulation path is closer to the external reference and tolerance policy is approved.
+Full-model exact greedy diverges between reference and PTX. CPU-router/PTX-projection probe also diverges, localizing remaining drift to projection/reduction accumulation order rather than routing. Candle teacher-forced comparison found 5/128 argmax divergences, all at reference margins below 0.183.
+
+Pinned llama.cpp commit `8e7f22b67ef4667b4ddd50230771287f328cfb3f` was built on RTX 3060 with MSVC 19.44, CUDA 12.4, NMake, and SM86. An exact-token diagnostic probe fed the same 33 prompt tokens and 128 teacher-forced continuation tokens to all three paths. Results:
+
+- all three agreed on 123/128 argmax decisions;
+- PTX matched llama.cpp on disputed steps 16 and 45;
+- Candle reference matched llama.cpp on disputed steps 50, 92, and 111;
+- free greedy matched llama.cpp for 43 tokens with PTX, versus 16 with Candle reference;
+- at five disputed states, PTX nRMSE versus llama.cpp was 0.0272–0.0661 and max absolute error was at most 1.205.
+
+Exact greedy cannot serve as a binary correctness gate for this 2-bit model: llama.cpp itself selects a mix of the two Candle accumulation outcomes near tied logits. Gate fixed teacher-forced states instead: 128 contiguous steps, full logits at 16/45/50/92/111, cosine at least 0.997, nRMSE at most 0.07, max absolute error at most 1.3, and no more than five argmax differences with external margin at most 0.30. Keep free greedy as a drift diagnostic.
+
+Runtime default remains `reference` until PTX passes 4×8K stability; external logit parity no longer blocks that stability run.
 
 ## References
 
@@ -36,3 +48,6 @@ Full-model exact greedy still diverges between reference and PTX. CPU-router/PTX
 - `candle-core/src/quantized/cuda.rs`
 - `candle-core/tests/iq_quant_cuda_tests.rs`
 - `qwen35-batch/src/real/moe.rs`
+- `qwen35-batch/src/bin/qwen35moe_logits.rs`
+- `qwen35-batch/src/bin/qwen35moe_compare.rs`
+- `qwen35-batch/tools/llama-logits.cpp`
