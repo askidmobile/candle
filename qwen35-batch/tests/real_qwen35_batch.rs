@@ -8,14 +8,12 @@
 //! ```
 //!
 //! Проверяем:
-//! 1. B=1 batched-path == single-stream greedy (бит-точность — time-multiplexed
-//!    restore/snapshot изолирует state; тот же forward-путь, те же веса).
+//! 1. B=1 batched-path == single-stream greedy.
 //! 2. B=2/4: aggregate tok/s vs sequential, per-request tok/s.
 //! 3. Greedy parity B=4 vs B=1 (batched vs sequential).
 //!
-//! Путь: `Qwen35BatchAdapter` (time-multiplexed через snapshot/restore) под
-//! `BatchScheduler`. Это НЕ true batched decode (Metal-ядра DeltaNet без batch-оси),
-//! а measurement архитектурного штрафа Candle за multi-slot — см. adapter.rs.
+//! Путь: `Qwen35BatchAdapter` с true batched decode под `BatchScheduler`; одна
+//! копия весов, per-slot DeltaNet/KV state — см. adapter.rs.
 
 #![cfg(feature = "real-model")]
 
@@ -38,7 +36,9 @@ fn model_dir() -> PathBuf {
 }
 
 fn gguf_path() -> PathBuf {
-    model_dir().join("Qwen3.5-4B-Q4_K_M.gguf")
+    std::env::var("QWEN35_TEST_GGUF")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| model_dir().join("Qwen3.5-4B-Q4_K_M.gguf"))
 }
 
 fn accelerator_device() -> candle_core::Device {
@@ -159,43 +159,39 @@ fn current_vram_mb() -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-fn run_bench(
-    gguf: &std::path::Path,
-    device: &candle_core::Device,
+fn run_bench_loaded(
+    sched: &mut BatchScheduler<Qwen35BatchAdapter>,
     prompts: &[Vec<u32>],
     max_new: usize,
     batch: usize,
+    vram_before_load_mb: f64,
 ) -> BenchResult {
-    // Критично: загрузка модели находится ВНЕ таймера. Старый baseline создавал
-    // fresh adapter внутри цикла по prompt'ам и ошибочно засчитывал 4 загрузки
-    // 2.7-ГБ GGUF в sequential wall time, получая фиктивные 2.13× для B=4.
-    let vram_before_mb = current_vram_mb();
-    let adapter = Qwen35BatchAdapter::load(gguf, device.clone(), batch)
-        .unwrap_or_else(|e| panic!("load adapter B={batch}: {e}"));
-    let vocab = adapter.vocab_size();
-    let mut sched = BatchScheduler::new(adapter, batch, u32::MAX, vocab);
-
+    let before = sched.stats().clone();
     let t0 = Instant::now();
-    let outputs = sched
-        .run_with_collection(prompts.to_vec(), max_new)
-        .unwrap_or_else(|e| panic!("run B={batch}: {e}"));
+    let mut outputs = Vec::with_capacity(prompts.len());
+    for chunk in prompts.chunks(batch) {
+        outputs.extend(
+            sched
+                .run_with_collection(chunk.to_vec(), max_new)
+                .unwrap_or_else(|e| panic!("run B={batch}: {e}")),
+        );
+    }
     let wall_ns = t0.elapsed().as_nanos();
-    let stats = sched.stats().clone();
+    let after = sched.stats();
     let rss_mb = current_rss_mb();
     let vram_mb = current_vram_mb();
-    let vram_delta_mb = vram_mb - vram_before_mb;
 
     BenchResult {
         batch,
         outputs,
         wall_ns,
-        prefill_ns: stats.prefill_ns,
-        decode_ns: stats.decode_ns,
-        decode_steps: stats.decode_steps,
-        max_concurrent: stats.max_concurrent_decode,
+        prefill_ns: after.prefill_ns - before.prefill_ns,
+        decode_ns: after.decode_ns - before.decode_ns,
+        decode_steps: after.decode_steps - before.decode_steps,
+        max_concurrent: batch.min(prompts.len()),
         rss_mb,
         vram_mb,
-        vram_delta_mb,
+        vram_delta_mb: vram_mb - vram_before_load_mb,
     }
 }
 
@@ -224,23 +220,20 @@ fn real_qwen35_batched_equals_sequential_parity_shrink() {
         (dummy_prompt_ids(137, 5), 3), // короткий → раннее завершение → shrink
     ];
 
-    // --- Batched: оба промпта в одном 2-slot scheduler'е (batch shrink в decode) ---
-    let adapter_b = Qwen35BatchAdapter::load(&gguf, device.clone(), 2)
-        .expect("load batched");
-    let vocab = adapter_b.vocab_size();
-    let mut sched_b = BatchScheduler::new(adapter_b, 2, u32::MAX, vocab);
-    let batched = sched_b
+    // Одна загрузка весов на весь тест. Старый harness держал B=2 adapter и
+    // загружал дополнительные B=1 adapters; параллельный запуск второго ignored
+    // test создавал до трёх копий GGUF и вызывал WDDM paging.
+    let adapter = Qwen35BatchAdapter::load(&gguf, device, 2).expect("load adapter");
+    let vocab = adapter.vocab_size();
+    let mut sched = BatchScheduler::new(adapter, 2, u32::MAX, vocab);
+    let batched = sched
         .run_with_per_request_max(prompts.clone())
         .expect("batched");
 
-    // --- Sequential: каждый промпт в свой single-slot scheduler (B=1) ---
+    // Sequential reference на том же adapter: по одному активному prompt.
     let mut seq = Vec::with_capacity(prompts.len());
     for (p, m) in prompts {
-        let adapter = Qwen35BatchAdapter::load(&gguf, device.clone(), 1)
-            .expect("load seq");
-        let mut s = BatchScheduler::new(adapter, 1, u32::MAX, vocab);
-        let mut o = s.run_with_per_request_max(vec![(p, m)]).expect("seq");
-        seq.append(&mut o);
+        seq.extend(sched.run_with_per_request_max(vec![(p, m)]).expect("seq"));
     }
 
     assert_eq!(batched.len(), seq.len());
@@ -251,15 +244,13 @@ fn real_qwen35_batched_equals_sequential_parity_shrink() {
             i, b, s
         );
     }
-    eprintln!(
-        "[shrink-parity] длинный(B=2→1) и короткий совпали с sequential: BIT-EXACT OK"
-    );
+    eprintln!("[shrink-parity] длинный(B=2→1) и короткий совпали с sequential: BIT-EXACT OK");
     eprintln!("  длинный слот: {} токенов", batched[0].len());
     eprintln!("  короткий слот: {} токенов", batched[1].len());
     eprintln!(
         "  batch shrunk: {} decode_steps (B=2 + B=1 после shrink), max_concurrent={}",
-        sched_b.stats().decode_steps,
-        sched_b.stats().max_concurrent_decode
+        sched.stats().decode_steps,
+        sched.stats().max_concurrent_decode
     );
 }
 
@@ -279,11 +270,21 @@ fn real_qwen35_batched_equals_sequential_parity() {
     let total_tokens = max_new * prompts.len();
     let decode_only_tokens = (max_new - 1) * prompts.len();
 
-    // B=1 — честный sequential reference: одна модель, один слот, очередь из 4
-    // запросов. Затем B=2/B=4, каждый с одной загрузкой вне измеряемого участка.
+    // Одна загрузка модели, capacity=4. B меняется только размером одновременно
+    // поданной группы; packed weights и CUDA context не дублируются.
+    let vram_before_load_mb = current_vram_mb();
+    let adapter = Qwen35BatchAdapter::load(&gguf, device, 4).expect("load adapter");
+    let vocab = adapter.vocab_size();
+    let mut sched = BatchScheduler::new(adapter, 4, u32::MAX, vocab);
     let mut results = Vec::new();
     for batch in [1usize, 2, 4] {
-        results.push(run_bench(&gguf, &device, &prompts, max_new, batch));
+        results.push(run_bench_loaded(
+            &mut sched,
+            &prompts,
+            max_new,
+            batch,
+            vram_before_load_mb,
+        ));
     }
 
     let reference = &results[0].outputs;
@@ -295,6 +296,26 @@ fn real_qwen35_batched_equals_sequential_parity() {
         );
     }
     eprintln!("[parity] B=1/2/4 greedy outputs: BIT-EXACT OK");
+
+    // Memory guard: один loaded adapter обязан держать одну копию GGUF.
+    // Короткий B=1→B=4 matrix может добавить только small state/KV scratch,
+    // не ещё один packed-weight set. Предыдущий harness запускал два ignored
+    // tests параллельно и создавал несколько adapters, что уходило в WDDM paging.
+    let model_mib = std::fs::metadata(&gguf).expect("GGUF metadata").len() as f64 / 1048576.0;
+    let deltas: Vec<f64> = results.iter().map(|r| r.vram_delta_mb).collect();
+    if deltas.iter().all(|v| v.is_finite()) {
+        let min_delta = deltas.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_delta = deltas.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            max_delta <= model_mib + 1024.0,
+            "VRAM delta {max_delta:.1} MiB exceeds GGUF {model_mib:.1} MiB + 1024 MiB; duplicate model allocation likely"
+        );
+        assert!(
+            max_delta - min_delta <= 256.0,
+            "VRAM grew {:.1} MiB across short B=1→B=4 matrix; expected <=256 MiB",
+            max_delta - min_delta
+        );
+    }
 
     let baseline_tps = total_tokens as f64 / (results[0].wall_ns as f64 / 1e9);
     eprintln!(
@@ -388,9 +409,19 @@ fn real_qwen35_long_throughput_b1234() {
         prompts.iter().map(|p| p.len()).collect::<Vec<_>>()
     );
 
+    let vram_before_load_mb = current_vram_mb();
+    let adapter = Qwen35BatchAdapter::load(&gguf, device, 4).expect("load adapter");
+    let vocab = adapter.vocab_size();
+    let mut sched = BatchScheduler::new(adapter, 4, u32::MAX, vocab);
     let mut results = Vec::new();
     for batch in [1usize, 2, 3, 4] {
-        results.push(run_bench(&gguf, &device, &prompts, MAX_NEW, batch));
+        results.push(run_bench_loaded(
+            &mut sched,
+            &prompts,
+            MAX_NEW,
+            batch,
+            vram_before_load_mb,
+        ));
     }
 
     // Печатаем первый (полный) ответ из B=1 — для оценки качества текста.
@@ -399,12 +430,16 @@ fn real_qwen35_long_throughput_b1234() {
         let raw = tokenizer::decode_text(&tokenizer, ids).expect("decode first answer");
         tokenizer::strip_thinking(&raw)
     };
-    eprintln!("\n[long-bench] пример ответа (case 0, Rust Arc/Mutex vs RwLock, B=1):\n{first_text}");
-    eprintln!("[long-bench] длина ответа: {} токенов\n", results[0].outputs[0].len());
+    eprintln!(
+        "\n[long-bench] пример ответа (case 0, Rust Arc/Mutex vs RwLock, B=1):\n{first_text}"
+    );
+    eprintln!(
+        "[long-bench] длина ответа: {} токенов\n",
+        results[0].outputs[0].len()
+    );
 
     let baseline_tps = total_tokens as f64 / (results[0].wall_ns as f64 / 1e9);
-    let baseline_decode_tps =
-        decode_only_tokens as f64 / (results[0].decode_ns as f64 / 1e9);
+    let baseline_decode_tps = decode_only_tokens as f64 / (results[0].decode_ns as f64 / 1e9);
     eprintln!("[long-bench] B | wall_ms | aggregate_tok/s | per_request_tok/s | decode_only_tok/s | vs_B1_agg | vs_B1_decode | peak_concurrent | RSS_MB");
     for r in &results {
         let aggregate_tps = total_tokens as f64 / (r.wall_ns as f64 / 1e9);

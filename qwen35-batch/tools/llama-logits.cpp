@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -164,6 +165,7 @@ int main(int argc, char ** argv) {
 
     auto model_params = llama_model_default_params();
     model_params.n_gpu_layers = -1;
+    const auto load_started = std::chrono::steady_clock::now();
     llama_model * model = llama_model_load_from_file(argv[1], model_params);
     if (model == nullptr) {
         std::fprintf(stderr, "cannot load model: %s\n", argv[1]);
@@ -187,12 +189,14 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
+    const auto model_load = std::chrono::steady_clock::now() - load_started;
 
     std::printf("{\"type\":\"run\",\"schema\":\"qwen35moe-logits-v1\",\"backend\":\"llama.cpp@8e7f22b\",\"prompt_tokens\":");
     print_ids(prompt);
     std::printf(",\"steps\":%d}\n", steps);
 
     llama_batch batch = llama_batch_get_one(prompt.data(), static_cast<int32_t>(prompt.size()));
+    const auto prefill_started = std::chrono::steady_clock::now();
     int rc = llama_decode(ctx, batch);
     if (rc != 0) {
         std::fprintf(stderr, "prompt decode failed: %d\n", rc);
@@ -201,11 +205,15 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
+    llama_synchronize(ctx);
+    const auto prefill_time = std::chrono::steady_clock::now() - prefill_started;
 
     std::vector<llama_token> predicted;
     std::vector<llama_token> fed;
     predicted.reserve(steps);
     fed.reserve(steps);
+    std::chrono::steady_clock::duration decode_time{};
+    int decode_calls = 0;
     for (int step = 0; step < steps; ++step) {
         float * logits = llama_get_logits_ith(ctx, -1);
         if (logits == nullptr) {
@@ -224,6 +232,7 @@ int main(int argc, char ** argv) {
             break;
         }
         batch = llama_batch_get_one(&token, 1);
+        const auto decode_started = std::chrono::steady_clock::now();
         rc = llama_decode(ctx, batch);
         if (rc != 0) {
             std::fprintf(stderr, "token decode failed at step %d: %d\n", step, rc);
@@ -232,6 +241,9 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+        llama_synchronize(ctx);
+        decode_time += std::chrono::steady_clock::now() - decode_started;
+        ++decode_calls;
     }
 
     std::printf("{\"type\":\"tokens\",\"ids\":");
@@ -239,6 +251,21 @@ int main(int argc, char ** argv) {
     std::printf(",\"fed_ids\":");
     print_ids(fed);
     std::printf("}\n");
+    const double load_ms = std::chrono::duration<double, std::milli>(model_load).count();
+    const double prefill_ms = std::chrono::duration<double, std::milli>(prefill_time).count();
+    const double decode_ms = std::chrono::duration<double, std::milli>(decode_time).count();
+    const double decode_tokens_per_s = decode_calls == 0 ? 0.0 : decode_calls * 1000.0 / decode_ms;
+    std::printf(
+        "{\"type\":\"performance\",\"model_load_ms\":%.6f,\"prefill_ms\":%.6f,"
+        "\"prompt_tokens\":%zu,\"prefill_tokens_per_s\":%.6f,\"decode_ms\":%.6f,"
+        "\"decode_calls\":%d,\"decode_tokens_per_s\":%.6f}\n",
+        load_ms,
+        prefill_ms,
+        prompt.size(),
+        prompt.size() * 1000.0 / prefill_ms,
+        decode_ms,
+        decode_calls,
+        decode_tokens_per_s);
 
     llama_free(ctx);
     llama_model_free(model);

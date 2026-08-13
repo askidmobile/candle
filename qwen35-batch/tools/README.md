@@ -18,6 +18,8 @@ llama-logits.exe <model.gguf> prompt-tokens.txt forced-tokens.txt 128 16,45,50,9
 
 Use `-` instead of `forced-tokens.txt` for greedy diagnosis. Copy `prompt_tokens` and `fed_ids` from Candle JSONL into whitespace-separated text files.
 
+Both probes append a `performance` JSON record with ready-to-prefill load time, prefill time/throughput, and teacher-forced decode time/throughput. llama.cpp calls `llama_synchronize()` inside measured regions; enqueue-only CUDA timing is invalid. Runs with one requested step report zero decode calls and `decode_tokens_per_s=0.0`.
+
 Gate thresholds, calibrated on RTX 3060 / CUDA 12.4 / target UD-IQ2_XXS GGUF:
 
 - 128 contiguous teacher-forced steps required;

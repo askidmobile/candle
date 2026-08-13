@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0;
@@ -176,13 +177,17 @@ fn main() -> Result<()> {
         })
     );
 
+    let load_started = Instant::now();
     let mut adapter = Qwen35BatchAdapter::load(&model, device, 1)?;
+    let model_load = load_started.elapsed();
+    let prefill_started = Instant::now();
     let mut logits = adapter.prefill_chunk(&PrefillChunk {
         slot_idx: 0,
         reset_first: true,
         tokens: prompt_tokens.clone(),
         start_pos: 0,
     })?;
+    let prefill = prefill_started.elapsed();
 
     let mut full_steps = BTreeSet::new();
     if let Ok(value) = std::env::var("QWEN36_LOGITS_FULL_STEP") {
@@ -209,6 +214,8 @@ fn main() -> Result<()> {
     let include_all_values = std::env::var_os("QWEN36_LOGITS_FULL").is_some();
     let mut predicted = Vec::with_capacity(steps);
     let mut fed = Vec::with_capacity(steps);
+    let mut decode_time = Duration::ZERO;
+    let mut decode_calls = 0usize;
     for step in 0..steps {
         let prediction = argmax(&logits);
         println!(
@@ -228,6 +235,7 @@ fn main() -> Result<()> {
         if token == adapter.eos() || step + 1 == steps {
             break;
         }
+        let decode_started = Instant::now();
         logits = adapter
             .decode_batch(&DecodeBatch {
                 items: vec![DecodeItem {
@@ -238,6 +246,8 @@ fn main() -> Result<()> {
             })?
             .pop()
             .context("decode returned no logits")?;
+        decode_time += decode_started.elapsed();
+        decode_calls += 1;
     }
     println!(
         "{}",
@@ -246,6 +256,23 @@ fn main() -> Result<()> {
             "ids": predicted,
             "fed_ids": fed,
             "text": tokenizer::decode_text(&tokenizer, &predicted)?,
+        })
+    );
+    println!(
+        "{}",
+        json!({
+            "type": "performance",
+            "model_load_ms": model_load.as_secs_f64() * 1000.0,
+            "prefill_ms": prefill.as_secs_f64() * 1000.0,
+            "prompt_tokens": prompt_tokens.len(),
+            "prefill_tokens_per_s": prompt_tokens.len() as f64 / prefill.as_secs_f64(),
+            "decode_ms": decode_time.as_secs_f64() * 1000.0,
+            "decode_calls": decode_calls,
+            "decode_tokens_per_s": if decode_calls == 0 {
+                0.0
+            } else {
+                decode_calls as f64 / decode_time.as_secs_f64()
+            },
         })
     );
     Ok(())

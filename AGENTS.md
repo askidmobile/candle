@@ -54,16 +54,12 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - Single-slot decode (`forward_attn` seq_len=1) оставлен F32 — там drift-комментарий не оспорен, сервер использует batched путь.
 - **PREFILL_CHUNK=512** (scheduler.rs, env QWEN36_PREFILL_CHUNK): цельный prefill создаёт scores N×N×F32×heads (~2GB на 5.6K промпт) → CUDA OOM на 12GB. Чанкинг обязателен. Заодно decode других слотов interleave'ится с prefill.
 
-## Prefill performance (2026-08-08)
+## Prefill performance (updated 2026-08-13)
 
-- **Prefill НЕ виснет — медленный.** 3000-токенный промпт: 15 чанков × ~39s = ~583s (600s timeout). Время растёт линейно (11s → 43s → 83s → ...).
-- **Chunked prefill** (engine.rs:240-276, `PREFILL_CHUNK=256`): prompt разбит на чанки по 256 токенов, `model.forward` вызывается для каждого. KV cache накапливается.
-- **DeltaNet `forward_prefill` CUDA path** (model_weights.rs:2081-2103): token-by-token loop по seq_len, 4 kernel launches + sync alloc на токен × 32 слоя = 4096 GPU syncs/chunk. CPU fallback (model_weights.rs:2105-2322) медленнее (33s vs 18s/chunk). Оставляем CUDA.
-- **Attention `forward_attn` prefill** (model_weights.rs:2710-2851): chunked F32 manual matmul, scores [256 × kv_len] растут O(n²) с KV cache. На 3000 токенов kv_len=3000 → scores 256×3000×4=3MB, но matmul cuBLAS дороже с ростом.
-- **Tiled dequantize matmul** (cuda.rs:175-213, 923-964): commit `2fdd7a1e`. Снижает dequant buffer peak с 357MB до 35.7MB. IQ tests 12/12 pass.
-- **Короткие промпты (<500 токенов):** ~2 чанка × ~11s = ~22s — приемлемо для live chat.
-- **Длинные промпты (>2000 токенов):** >300s — оптимизация fused batch DeltaNet kernel (как Metal GDN на macOS) отдельная задача.
-- **eprintln timing markers** в engine.rs prefill loop: `[prefill] chunk start={} end={} elapsed={:.1}ms`. Использовать для диагностики. qwen36-server не имеет логгера — `log::debug!`/`log::info!` не выводятся. Только `eprintln!` попадает в stdout/redirect-лог.
+- **CUDA prefill already fused.** DeltaNet token loop runs inside sequence kernels with recurrent state held in registers (`0b3b5e2f`, `048463cc`); attention defaults to FlashAttention 2 with F32 accumulation (`ec13b1e4`). Do not restore old Rust-side per-token path.
+- **Dense 4B long prefill:** 2191 tokens = 1375.7 tok/s whole, 1224.4 tok/s with server chunk 512; full/512/2048 final logits bit-exact. Yttri CUDA baseline 434–439 tok/s is older. Details: `docs/research/2026-08-13-qwen35-dense-cuda-comparison.md`.
+- **Benchmark isolation is mandatory.** One GPU process and one loaded adapter; run ignored tests with `--exact --test-threads=1`. Duplicate model loads trigger WDDM paging and invalidate speed/VRAM results.
+- **Tiled dequantize matmul** (`2fdd7a1e`) limits IQ fallback transient; default `PREFILL_CHUNK=512` remains for 35B VRAM and decode fairness.
 
 ## IQ quant CUDA (IQ3XXS, IQ2S, IQ3S, IQ2XS, IQ4XS)
 
