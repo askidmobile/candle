@@ -7600,7 +7600,7 @@ void kernel_mul_mm_id_impl(
         constant    int64_t & ne0,
                     int64_t   ne1,
                     int64_t   ne0ne1,
-        threadgroup   uchar * shared_memory,
+        threadgroup   uchar * shared_memory [[threadgroup(0)]],
         uint3                 tgpig[[threadgroup_position_in_grid]],
         uint                  tiitg[[thread_index_in_threadgroup]],
         uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -8361,7 +8361,7 @@ kernel void kernel_mul_mm_q4_K_f32_v4(
 // Expected gain after math fill-in: ALU 482 -> ~400 (-16%).
 // Risk: numerical drift due to reordered FP accumulation.
 // ════════════════════════════════════════════════════════════════════════════════
-// kernel_mul_mm_q4_K_f32_opt_groupscale -- group-level scale rewriting.
+kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
     device const  uchar * src0                                                [[buffer(0)]],
     device const  half  * scales_repacked                                     [[buffer(1)]],
     device const  uchar * src1                                                [[buffer(2)]],
