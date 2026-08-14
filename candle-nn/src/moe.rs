@@ -39,7 +39,7 @@ mod cuda {
         let mut builder = count_func.builder();
         builder.arg(expert_ids);
         builder.arg(&expert_counts);
-        builder.arg(size_m as i32);
+        let size_m_i = size_m as i32; builder.arg(&size_m_i);
         unsafe { builder.launch(count_cfg) }.w()?;
 
         // 2. Prefix sum to get expert offsets (supports up to 65536 experts via chunked scan)
@@ -54,7 +54,7 @@ mod cuda {
         let mut builder = scan_func.builder();
         builder.arg(&expert_counts);
         builder.arg(&expert_offsets);
-        builder.arg(num_experts as i32);
+        let num_experts_i = num_experts as i32; builder.arg(&num_experts_i);
         unsafe { builder.launch(scan_cfg) }.w()?;
 
         Ok(expert_offsets)
@@ -164,11 +164,11 @@ mod cuda {
                 builder.arg(&0u64);
             }
             builder.arg(&output_slice);
-            builder.arg(num_experts as i32);
-            builder.arg(topk as i32);
-            builder.arg(size_m as i32);
-            builder.arg(size_n as i32);
-            builder.arg(size_k as i32);
+            let num_experts_i = num_experts as i32; builder.arg(&num_experts_i);
+            let topk_i = topk as i32; builder.arg(&topk_i);
+            let size_m_i = size_m as i32; builder.arg(&size_m_i);
+            let size_n_i = size_n as i32; builder.arg(&size_n_i);
+            let size_k_i = size_k as i32; builder.arg(&size_k_i);
 
             unsafe { builder.launch(cfg) }.w()?;
 
@@ -302,11 +302,11 @@ mod cuda {
                 builder.arg(&0u64);
             }
             builder.arg(&output_slice);
-            builder.arg(num_experts as i32);
-            builder.arg(topk as i32);
-            builder.arg(size_m as i32);
-            builder.arg(size_n as i32);
-            builder.arg(size_k as i32);
+            let num_experts_i = num_experts as i32; builder.arg(&num_experts_i);
+            let topk_i = topk as i32; builder.arg(&topk_i);
+            let size_m_i = size_m as i32; builder.arg(&size_m_i);
+            let size_n_i = size_n as i32; builder.arg(&size_n_i);
+            let size_k_i = size_k as i32; builder.arg(&size_k_i);
 
             unsafe { builder.launch(cfg) }.w()?;
         } else {
@@ -333,8 +333,8 @@ mod cuda {
             let mut quant_builder = quant_func.builder();
             quant_builder.arg(input_slice);
             quant_builder.arg(&mut y_q8_1);
-            quant_builder.arg(size_k as i32);
-            quant_builder.arg(k_padded as i32);
+            quant_let size_k_i = size_k as i32; builder.arg(&size_k_i);
+            let k_padded_i = k_padded as i32; quant_builder.arg(&k_padded_i);
             unsafe { quant_builder.launch(quant_cfg) }.w()?;
 
             let kernel_name = format!("moe_gemm_gguf_{quant_name}");
@@ -366,12 +366,12 @@ mod cuda {
                 builder.arg(&0u64);
             }
             builder.arg(&output_slice);
-            builder.arg(num_experts as i32);
-            builder.arg(topk as i32);
-            builder.arg(size_m as i32);
-            builder.arg(size_n as i32);
-            builder.arg(size_k as i32);
-            builder.arg(k_padded as i32);
+            let num_experts_i = num_experts as i32; builder.arg(&num_experts_i);
+            let topk_i = topk as i32; builder.arg(&topk_i);
+            let size_m_i = size_m as i32; builder.arg(&size_m_i);
+            let size_n_i = size_n as i32; builder.arg(&size_n_i);
+            let size_k_i = size_k as i32; builder.arg(&size_k_i);
+            let k_padded_i = k_padded as i32; builder.arg(&k_padded_i);
 
             unsafe { builder.launch(cfg) }.w()?;
         }
