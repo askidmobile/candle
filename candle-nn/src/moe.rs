@@ -7,42 +7,22 @@
 // (PTX-рантайм, dynamic-loading-совместимый, см. candle-core/src/quantized/cuda.rs).
 // Quantized GGUF MoE: см. FusedMoeGGUF в candle-transformers/src/fused_moe.rs.
 //
-// `moe_gemm`/`moe_gemm_gguf` здесь — явные bail-заглушки. Они нужны, потому что
-// candle-transformers::fused_moe всё ещё ссылается на них link-time для dense
-// FusedMoe и FusedMoeGGUF. Пока dense MoE не переведён на рабочий путь, любой
-// вызов честно сообщает об отсутствии реализации вместо падения на линке.
+// Dense MoE (`moe_gemm`) удалён: альтернативного PTX-пути для dense MoE нет,
+// а naive expert-loop через matmul работает на любом backend и используется
+// в qwen3_moe (Qwen3SparseMoeBlock). `moe_gemm_gguf` оставлен как bail-заглушка
+// для обратной совместимости — рабочий quantized путь через FusedMoeGGUF
+// использует QTensor::indexed_moe_forward напрямую.
 #[allow(unused_imports)]
 use candle::quantized::{self, QTensor};
 use candle::{Result, Tensor};
 
-/// Dense MoE GEMM (f16/bf16 weights).
-///
-/// CUDA FFI-путь (`moe_gemm_wmma`) удалён: `libmoe.a` не собирается под
-/// dynamic-loading. Dense MoE на CUDA временно не поддерживается. Для
-/// quantized GGUF MoE используйте `QTensor::indexed_moe_forward` через
-/// `FusedMoeGGUF`.
-pub fn moe_gemm(
-    _input: &Tensor,
-    _weights: &Tensor,
-    _topk_weights: &Option<Tensor>,
-    _sorted_token_ids: &Tensor,
-    _experts_ids: &Tensor,
-    _topk: usize,
-    _is_prefill: bool,
-) -> Result<Tensor> {
-    candle::bail!(
-        "moe_gemm (dense MoE) is not implemented in this build: the CUDA FFI \
-         path requires libmoe.a which is not built under dynamic-loading. \
-         Use the quantized GGUF MoE path (FusedMoeGGUF) instead."
-    )
-}
-
-/// Quantized GGUF MoE GEMM.
+/// Quantized GGUF MoE GEMM (bail-заглушка).
 ///
 /// CUDA FFI-путь (`moe_gemm_gguf[_prefill]`) удалён: `libmoe.a` не собирается
 /// под dynamic-loading. Рабочий quantized MoE на CUDA —
 /// `QTensor::indexed_moe_forward` (PTX-рантайм). `FusedMoeGGUF::forward`
-/// должен использовать его напрямую, а не эту функцию.
+/// использует его напрямую, а не эту функцию. Bail оставлен для обратной
+/// совместимости с кодом, который мог бы вызывать эту функцию напрямую.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
     _input: &Tensor,
