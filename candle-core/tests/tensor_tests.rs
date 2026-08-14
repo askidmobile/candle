@@ -216,6 +216,15 @@ fn asort(device: &Device) -> Result<()> {
         sorted.to_vec2::<f32>()?,
         [[5.0, 4.0, 3.0, 1.1, 1.0], [8.0, 7.0, 2.1, 2.0, 1.0]]
     );
+
+    let offset_view = Tensor::new(&[[1f32, 2., 3.], [30., 10., 20.]], device)?.narrow(0, 1, 1)?;
+    let (sorted, indexes) = offset_view.sort_last_dim(true)?;
+    assert_eq!(indexes.to_vec2::<u32>()?, [[1, 2, 0]]);
+    assert_eq!(sorted.to_vec2::<f32>()?, [[10., 20., 30.]]);
+
+    let (sorted, indexes) = offset_view.sort_last_dim(false)?;
+    assert_eq!(indexes.to_vec2::<u32>()?, [[0, 2, 1]]);
+    assert_eq!(sorted.to_vec2::<f32>()?, [[30., 20., 10.]]);
     Ok(())
 }
 
@@ -344,6 +353,26 @@ fn binary_op(device: &Device) -> Result<()> {
         max.to_vec2::<f32>()?,
         [[3.0, 2.5, 4.0, 2.5, 5.0], [2.0, 1.0, 7.0, 8.0, 2.0]]
     );
+
+    let (b, s, h, pad) = (3usize, 4usize, 5usize, 2usize);
+    let base =
+        Tensor::arange(1f32, (b * (s + pad) * h + 1) as f32, device)?.reshape((b, s + pad, h))?;
+    let ub = base.narrow(1, 0, s)?; // uniform blocks: strides [h * (s + pad), h, 1]
+    let cont = ub.contiguous()?;
+    let scale = Tensor::arange(1f32, (b * s * h + 1) as f32, device)?.reshape((b, s, h))?;
+    assert_eq!(
+        (&ub + &scale)?.to_vec3::<f32>()?,
+        (&cont + &scale)?.to_vec3::<f32>()?,
+    );
+    assert_eq!(
+        (&ub * &scale)?.to_vec3::<f32>()?,
+        (&cont * &scale)?.to_vec3::<f32>()?,
+    );
+    // contiguous lhs, uniform blocks rhs.
+    assert_eq!(
+        (&scale + &ub)?.to_vec3::<f32>()?,
+        (&scale + &cont)?.to_vec3::<f32>()?,
+    );
     Ok(())
 }
 
@@ -359,6 +388,73 @@ fn ternary_op(device: &Device) -> Result<()> {
     assert_eq!(dims, [2, 5]);
     let result: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
     assert_eq!(result, [10., 1., 12., 3., 14., 5., 6., 7., 18., 19.]);
+
+    let fill = Tensor::new(7f32, device)?.broadcast_as((2, 5))?; // strides [0, 0]
+    assert_eq!(
+        ids.where_cond(&fill, &b)?.to_vec2::<f32>()?,
+        [[10., 7., 12., 7., 14.], [7., 7., 7., 18., 19.]],
+    );
+
+    let mask = Tensor::new(&[[0u8, 1, 1, 0, 1]], device)?.broadcast_as((2, 5))?; // strides [0, 1]
+    assert_eq!(
+        mask.where_cond(&a, &b)?.to_vec2::<f32>()?,
+        mask.contiguous()?.where_cond(&a, &b)?.to_vec2::<f32>()?,
+    );
+
+    let a_t = Tensor::arange(0f32, 10., device)?.reshape((5, 2))?.t()?;
+    let ids_t = Tensor::new(&[[0u8, 1], [1, 1], [0, 0], [1, 0], [1, 1]], device)?.t()?;
+    assert_eq!(
+        ids_t.where_cond(&a_t, &b)?.to_vec2::<f32>()?,
+        ids_t
+            .contiguous()?
+            .where_cond(&a_t.contiguous()?, &b)?
+            .to_vec2::<f32>()?,
+    );
+
+    let narrowed = Tensor::arange(0f32, 14., device)?
+        .reshape((2, 7))?
+        .narrow(1, 1, 5)?; // strides [7, 1], offset 1
+    assert_eq!(
+        ids.where_cond(&fill, &narrowed)?.to_vec2::<f32>()?,
+        ids.where_cond(&fill.contiguous()?, &narrowed.contiguous()?)?
+            .to_vec2::<f32>()?,
+    );
+
+    let fill2 = Tensor::new(9f32, device)?.broadcast_as((2, 5))?;
+    assert_eq!(
+        ids.where_cond(&a, &fill)?.to_vec2::<f32>()?,
+        ids.where_cond(&a, &fill.contiguous()?)?.to_vec2::<f32>()?,
+    );
+    assert_eq!(
+        ids.where_cond(&fill, &fill2)?.to_vec2::<f32>()?,
+        ids.where_cond(&fill.contiguous()?, &fill2.contiguous()?)?
+            .to_vec2::<f32>()?,
+    );
+
+    let row_mask = Tensor::new(&[[1u8], [0u8]], device)?.broadcast_as((2, 5))?; // strides [1, 0]
+    let row_ref = row_mask.contiguous()?;
+    assert_eq!(
+        row_mask.where_cond(&a, &b)?.to_vec2::<f32>()?,
+        row_ref.where_cond(&a, &b)?.to_vec2::<f32>()?,
+    );
+    assert_eq!(
+        row_mask.where_cond(&a, &fill)?.to_vec2::<f32>()?,
+        row_ref
+            .where_cond(&a, &fill.contiguous()?)?
+            .to_vec2::<f32>()?,
+    );
+    assert_eq!(
+        row_mask.where_cond(&fill, &b)?.to_vec2::<f32>()?,
+        row_ref
+            .where_cond(&fill.contiguous()?, &b)?
+            .to_vec2::<f32>()?,
+    );
+    assert_eq!(
+        row_mask.where_cond(&fill, &fill2)?.to_vec2::<f32>()?,
+        row_ref
+            .where_cond(&fill.contiguous()?, &fill2.contiguous()?)?
+            .to_vec2::<f32>()?,
+    );
     Ok(())
 }
 
@@ -905,6 +1001,20 @@ fn cat(device: &Device) -> Result<()> {
     assert_eq!(t_cat.i((0, 7, 1))?.to_vec0::<i64>()?, 105);
     assert_eq!(t_cat.i((0, 12, 1))?.to_vec0::<i64>()?, 10013);
     assert_eq!(t_cat.i((1, 12, 3))?.to_vec0::<i64>()?, 10031);
+
+    // compare contiguous to uniform blocks
+    let (b, s, h, pad) = (3usize, 4, 5, 2);
+    let base =
+        Tensor::arange(0f32, (b * (s + pad) * h) as f32, device)?.reshape((b, s + pad, h))?;
+    let tp1 = base.narrow(1, 0, s)?;
+    let tp2 = base.narrow(1, pad, s)?;
+    let cat_padded = Tensor::cat(&[&tp1, &tp2], 1)?;
+    let cat_cont = Tensor::cat(&[&tp1.contiguous()?, &tp2.contiguous()?], 1)?;
+    assert_eq!(
+        cat_padded.to_vec3::<f32>()?,
+        cat_cont.to_vec3::<f32>()?,
+        "cat along dim=1 with padded outer stride should match contiguous result"
+    );
     Ok(())
 }
 
@@ -1660,6 +1770,34 @@ fn randn(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn repeat_with_zero_factor(device: &Device) -> Result<()> {
+    let tensor = Tensor::new(&[[1u32, 2], [3, 4]], device)?;
+
+    let repeated_rows = tensor.repeat((0, 2))?;
+    assert_eq!(repeated_rows.dims(), &[0, 4]);
+    assert_eq!(repeated_rows.elem_count(), 0);
+
+    let repeated_columns = tensor.repeat((2, 0))?;
+    assert_eq!(repeated_columns.dims(), &[4, 0]);
+    assert_eq!(repeated_columns.elem_count(), 0);
+
+    Ok(())
+}
+
+fn meshgrid_with_empty_axis(device: &Device) -> Result<()> {
+    let empty_axis = Tensor::from_vec(Vec::<f32>::new(), 0, device)?;
+    let coordinates = Tensor::new(&[10f32, 20., 30.], device)?;
+
+    let grids = Tensor::meshgrid(&[&empty_axis, &coordinates], false)?;
+    assert_eq!(grids.len(), 2);
+    for grid in grids {
+        assert_eq!(grid.dims(), &[0, 3]);
+        assert_eq!(grid.elem_count(), 0);
+    }
+
+    Ok(())
+}
+
 fn zero_dim(device: &Device) -> Result<()> {
     let t = Tensor::zeros((4, 0, 1), DType::F32, device)?;
     assert_eq!(t.dims3()?, (4, 0, 1));
@@ -1729,6 +1867,18 @@ test_device!(clamp, clamp_cpu, clamp_gpu, clamp_metal);
 test_device!(asort, asort_cpu, asort_gpu, asort_metal);
 test_device!(asort_big, asort_big_cpu, asort_big_gpu, asort_big_metal);
 test_device!(var, var_cpu, var_gpu, var_metal);
+test_device!(
+    repeat_with_zero_factor,
+    repeat_with_zero_factor_cpu,
+    repeat_with_zero_factor_gpu,
+    repeat_with_zero_factor_metal
+);
+test_device!(
+    meshgrid_with_empty_axis,
+    meshgrid_with_empty_axis_cpu,
+    meshgrid_with_empty_axis_gpu,
+    meshgrid_with_empty_axis_metal
+);
 test_device!(zero_dim, zero_dim_cpu, zero_dim_gpu, zero_dim_metal);
 
 fn tensor_send_sync(device: &Device) -> Result<()> {
@@ -1965,6 +2115,28 @@ fn test_flip_3d_channels() -> Result<()> {
         &Device::Cpu,
     )?;
     candle_core::test_utils::assert_tensor_eq(&flipped, &expected)?;
+    Ok(())
+}
+
+#[test]
+fn tensor_from_data_validates_concrete_shape() -> Result<()> {
+    let values = [1f32, 2., 3., 4.];
+
+    assert!(Tensor::from_slice(&values, (2, 2, 2), &Device::Cpu).is_err());
+    assert!(Tensor::from_slice(&values, (2, 1), &Device::Cpu).is_err());
+    assert!(Tensor::from_vec(values.to_vec(), (2, 2, 2), &Device::Cpu).is_err());
+    assert!(Tensor::from_vec(values.to_vec(), (2, 1), &Device::Cpu).is_err());
+
+    let tensor = Tensor::from_slice(&values, (2, 2), &Device::Cpu)?;
+    assert_eq!(tensor.dims(), &[2, 2]);
+
+    let tensor = Tensor::from_vec(values.to_vec(), ((), 2), &Device::Cpu)?;
+    assert_eq!(tensor.dims(), &[2, 2]);
+
+    let empty: &[f32] = &[];
+    let tensor = Tensor::from_slice(empty, (0, 3), &Device::Cpu)?;
+    assert_eq!(tensor.dims(), &[0, 3]);
+
     Ok(())
 }
 

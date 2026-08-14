@@ -13,7 +13,7 @@ fn main() -> Result<()> {
     let ptx_path = out_dir.join("ptx.rs");
     let bindings = KernelBuilder::new()
         .source_dir("src") // Scan src/ for .cu files
-        .exclude(&["moe_*.cu"]) // Exclude moe kernels for ptx build
+        .exclude(&["moe_*.cu", "mmvq_gguf.cu", "mmq_*.cu"]) // Exclude statically compiled kernels from ptx build
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3")
@@ -30,16 +30,22 @@ fn main() -> Result<()> {
     // link-time зависимости от libmoe.a нет. Целевые модели Yttri — dense (Qwen3.5-4B),
     // не MoE.
     //
-    // ⚠️ ЛАТЕНТНАЯ МИНА (review T-331): СУЩЕСТВУЕТ ВТОРОЙ MoE-путь — `extern "C"`
-    // FFI `moe_gemm_wmma`/`moe_gemm_gguf`/`moe_gemm_gguf_prefill` (candle-kernels
+    // ⚠️ ЛАТЕНТНАЯ МИНА (review T-331): upstream в #3855 и связанных коммитах
+    // добавил новые MoE-ядра (moe_gguf, moe_wmma, mmq_quantize и т.д.) в libmoe.a.
+    // Мы этот builder ОТКЛЮЧЕН. СУЩЕСТВУЕТ ВТОРОЙ MoE-путь — `extern "C"` FFI
+    // `moe_gemm_wmma`/`moe_gemm_gguf`/`moe_gemm_gguf_prefill` (candle-kernels
     // `src/ffi.rs`), вызываемый из `candle-nn::moe` (#[cfg(feature="cuda")]) и далее
     // `candle-transformers::fused_moe` → `quantized_qwen3_moe`. Host-символы этих
-    // функций жили ТОЛЬКО в удалённой libmoe.a (PTX-рантайм их НЕ даёт). Сейчас
-    // сборка зелёная только из-за dead-code elimination: Yttri-бинарь не ссылается
-    // ни на один из этих символов. ЛЮБОЙ бинарь с feature="cuda", инстанцирующий
+    // функций жили ТОЛЬКО в libmoe.a (PTX-рантайм их НЕ даёт). Сейчас сборка
+    // зелёная только из-за dead-code elimination: Yttri-бинарь не ссылается ни на
+    // один из этих символов. ЛЮБОЙ бинарь с feature="cuda", инстанцирующий
     // `FusedMoeGGUF::forward` / `moe_gemm_*`, упадёт на финальном линке с unresolved
     // external symbol. Прежде чем включать MoE на CUDA — вернуть libmoe.a под
     // dynamic-loading-совместимой схемой (cudart через cudarc, без hard-link) ЛИБО
     // cfg-выключить cuda-ветку `candle-nn::moe` + `ffi.rs`.
+    //
+    // TODO(upstream-sync): при реэндейле MoE добавить недостающие ядра из upstream
+    // builder выше (moe_gguf, moe_wmma_gguf, mmq_quantize, mmq_instance_q*_k) —
+    // список файлов см. в git history upstream/main candle-kernels/build.rs.
     Ok(())
 }

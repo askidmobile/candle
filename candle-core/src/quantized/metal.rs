@@ -1,6 +1,6 @@
 use super::{GgmlDType, QStorage};
 use crate::backend::BackendStorage;
-use crate::{DType, MetalDevice, MetalStorage, Result, Shape, D};
+use crate::{DType, Layout, MetalDevice, MetalStorage, Result, Shape, D};
 use candle_metal_kernels::metal::Buffer;
 use std::sync::Arc;
 
@@ -19,7 +19,11 @@ pub struct QMetalStorage {
 impl QMetalStorage {
     pub fn zeros(device: &MetalDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
         let size = elem_count * dtype.type_size() / dtype.block_size();
-        let buffer = device.allocate_zeros(size)?;
+        let buffer = device
+            .new_buffer_builder()
+            .with_zeros(size)
+            .with_label("qstorage_zeros")
+            .build()?;
         Ok(Self {
             buffer,
             device: device.clone(),
@@ -90,12 +94,18 @@ impl QMetalStorage {
         use crate::quantized::k_quants::GgmlType;
 
         let copy_size = self.storage_size_in_bytes();
-        let buffer = self.device.allocate_buffer(copy_size)?;
-        let blit = self.device.blit_command_encoder()?;
-        blit.set_label("blit_to_cpu");
-        blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, copy_size);
-        blit.end_encoding();
-        self.device.wait_until_completed()?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size(copy_size)
+            .with_label("qstorage_dequantize_blit")
+            .build()?;
+        {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("blit_to_cpu");
+            blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, copy_size);
+        }
+        self.device.flush_and_wait_current()?;
         let mut out = vec![0.0; elem_count];
         let block_len = elem_count / self.dtype.block_size();
         match self.dtype {
@@ -175,7 +185,12 @@ impl QMetalStorage {
             }
         }
 
-        let buffer = self.device.new_buffer_with_data(&out)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&out)
+            .with_label("qstorage_dequantized")
+            .build()?;
         Ok(MetalStorage::new(
             buffer,
             self.device.clone(),
@@ -191,7 +206,12 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize(&src)?;
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantized")
+            .build()?;
         self.buffer = buffer;
         self.offset = 0;
         Ok(())
@@ -209,7 +229,12 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize_imatrix(&src, imatrix_weights, n_per_row)?;
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantize_imatrix")
+            .build()?;
         self.buffer = buffer;
         self.offset = 0;
         Ok(())
@@ -231,7 +256,12 @@ impl QMetalStorage {
             unreachable!()
         }
 
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantize_imatrix_onto")
+            .build()?;
         self.buffer = buffer;
         self.offset = 0;
         Ok(())
@@ -248,7 +278,12 @@ impl QMetalStorage {
             unreachable!()
         }
 
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantize_onto")
+            .build()?;
         self.buffer = buffer;
         self.offset = 0;
         Ok(())
@@ -256,6 +291,64 @@ impl QMetalStorage {
 
     pub fn storage_size_in_bytes(&self) -> usize {
         self.tensor_size.unwrap_or(self.buffer.length())
+    }
+
+    pub fn embedding(
+        &self,
+        rows: usize,
+        hidden: usize,
+        ids: &MetalStorage,
+        ids_l: &Layout,
+    ) -> Result<MetalStorage> {
+        use crate::MetalError;
+
+        if ids.dtype() != DType::U32 {
+            crate::bail!("quantized embedding expects u32 ids, got {:?}", ids.dtype())
+        }
+        if !ids_l.is_contiguous() {
+            crate::bail!("quantized embedding requires contiguous ids")
+        }
+        if !hidden.is_multiple_of(self.dtype.block_size()) {
+            crate::bail!(
+                "quantized embedding hidden size {hidden} is not divisible by block size {}",
+                self.dtype.block_size()
+            )
+        }
+        let expected_size = rows * hidden * self.dtype.type_size() / self.dtype.block_size();
+        if self.storage_size_in_bytes() != expected_size {
+            crate::bail!(
+                "quantized tensor has {} bytes, expected {expected_size}",
+                self.storage_size_in_bytes()
+            )
+        }
+        let ids_len = ids_l.shape().elem_count();
+        let device = self.device.clone();
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(ids_len * hidden, DType::F32)
+            .with_label("qembedding")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        candle_metal_kernels::call_quantized_get_rows(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            self.dtype.into(),
+            hidden,
+            hidden * self.dtype.type_size() / self.dtype.block_size(),
+            ids_len,
+            &self.buffer,
+            ids.buffer(),
+            ids_l.start_offset() * DType::U32.size_in_bytes(),
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+        Ok(MetalStorage::new(
+            dst,
+            device.clone(),
+            ids_len * hidden,
+            DType::F32,
+        ))
     }
 
     fn fwd_mv(
@@ -292,7 +385,11 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
-        let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_label("qmatmul")
+            .build()?;
         let encoder = device.command_encoder()?;
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
@@ -314,7 +411,8 @@ impl QMetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+        let dst_storage =
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
     }
 
@@ -384,7 +482,11 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
-        let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_label("qmatmul")
+            .build()?;
         let encoder = device.command_encoder()?;
 
         if !matches!(storage.dtype(), DType::F32 | DType::F16) {
@@ -443,20 +545,25 @@ impl QMetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+        let dst_storage =
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
         let size = self.storage_size_in_bytes();
-        let buffer = self.device.allocate_buffer(size)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size(size)
+            .with_label("qstorage_data_blit")
+            .build()?;
         {
-            let blit = self.device.blit_command_encoder()?;
+            let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
             blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, size);
-            blit.end_encoding();
         }
-        self.device.wait_until_completed()?;
+        self.device.flush_and_wait_current()?;
         Ok(read_to_vec::<u8>(&buffer, size))
     }
 }
@@ -465,7 +572,11 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &MetalDevice,
     data: &[T],
 ) -> Result<QStorage> {
-    let buffer = device.new_buffer_with_data(data)?;
+    let buffer = device
+        .new_buffer_builder()
+        .with_data(data)
+        .with_label("qstorage_load_quantized")
+        .build()?;
     let device = device.clone();
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,

@@ -123,6 +123,7 @@ mod metal_impl {
             &dst,
         )
         .map_err(crate::MetalError::from)?;
+        drop(encoder);
 
         let dst_storage =
             MetalStorage::new(dst, device, dst_shape.elem_count(), crate::DType::F32);

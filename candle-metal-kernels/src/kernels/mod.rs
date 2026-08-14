@@ -20,9 +20,9 @@ pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
 pub use fill::*;
 pub use indexing::*;
-pub use mlx_gemm::{call_mlx_gemm, GemmDType};
+pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
 pub use quantized::{
-    call_dequantize_q_to_half, call_quantized_matmul_mm_q4k_opt, call_quantized_matmul_mm_t,
+    call_quantized_get_rows, call_quantized_matmul_mm_q4k_opt, call_quantized_matmul_mm_t,
     call_quantized_matmul_mv_t, GgmlDType,
 };
 pub use random::*;

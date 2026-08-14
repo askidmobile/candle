@@ -1,6 +1,9 @@
 use crate::utils::EncoderProvider;
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use crate::{
+    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
+    Output, Source,
+};
+use objc2_metal::MTLSize;
 
 #[derive(Debug, Clone, Copy)]
 pub enum GgmlDType {
@@ -200,13 +203,14 @@ pub fn call_quantized_matmul_mv_t(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mv {name} B={b} M={m} K={k} N={n}");
 
     set_params!(
         encoder,
         (
             (rhs, rhs_offset),
             (lhs, lhs_offset),
-            (dst, dst_offset),
+            Output::with_offset(dst, dst_offset),
             ne00,
             ne01,
             ne02,
@@ -225,9 +229,6 @@ pub fn call_quantized_matmul_mv_t(
             r3
         )
     );
-    encoder.use_resource(lhs, MTLResourceUsage::Read);
-    encoder.use_resource(rhs, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     if matches!(
         dtype,
@@ -393,13 +394,14 @@ pub fn call_quantized_matmul_mm_t(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qmm_mm {name} M={ne11} K={ne00} N={ne01}");
 
     set_params!(
         encoder,
         (
             (src0, src0_offset),
             (src1, src1_offset),
-            (dst, dst_offset),
+            Output::with_offset(dst, dst_offset),
             ne00,
             ne02,
             nb01,
@@ -416,11 +418,94 @@ pub fn call_quantized_matmul_mm_t(
             r3
         )
     );
-    encoder.use_resource(src0, MTLResourceUsage::Read);
-    encoder.use_resource(src1, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     encoder.set_threadgroup_memory_length(0, 8192);
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_get_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    hidden_size: usize,
+    row_stride: usize,
+    ids_len: usize,
+    src: &Buffer,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let dst_row_stride = hidden_size * core::mem::size_of::<f32>();
+    let name = match dtype {
+        GgmlDType::F32 => "kernel_get_rows_f32",
+        GgmlDType::F16 => "kernel_get_rows_f16",
+        GgmlDType::BF16 => "kernel_get_rows_bf16",
+        GgmlDType::Q4_0 => "kernel_get_rows_q4_0",
+        GgmlDType::Q4_1 => "kernel_get_rows_q4_1",
+        GgmlDType::Q5_0 => "kernel_get_rows_q5_0",
+        GgmlDType::Q5_1 => "kernel_get_rows_q5_1",
+        GgmlDType::Q8_0 => "kernel_get_rows_q8_0",
+        GgmlDType::Q2K => "kernel_get_rows_q2_K",
+        GgmlDType::Q3K => "kernel_get_rows_q3_K",
+        GgmlDType::Q4K => "kernel_get_rows_q4_K",
+        GgmlDType::Q5K => "kernel_get_rows_q5_K",
+        GgmlDType::Q6K => "kernel_get_rows_q6_K",
+        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
+        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
+        // IQ* variants unsupported on Metal (T-283: wildcard для новых GGML dtypes)
+        GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ1S
+        | GgmlDType::IQ4NL
+        | GgmlDType::IQ3S
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ4XS
+        | GgmlDType::IQ1M => {
+            Err(MetalKernelError::UnsupportedDTypeForOp("IQ*", "get_rows"))?
+        }
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qget_rows {name} ids={ids_len} hidden={hidden_size}"
+    );
+
+    let thread_groups_count = MTLSize {
+        width: ids_len,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+
+    set_params!(
+        encoder,
+        (
+            src,
+            (ids, ids_offset),
+            Output::new(dst),
+            hidden_size as i64,
+            row_stride as u64,
+            0u64,
+            ids_len as i64,
+            core::mem::size_of::<u32>() as u64,
+            0u64,
+            dst_row_stride as u64,
+            0u64
+        )
+    );
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -538,10 +623,6 @@ pub fn call_quantized_matmul_mm_q4k_opt(
             r3
         )
     );
-    encoder.use_resource(src0, MTLResourceUsage::Read);
-    encoder.use_resource(scales_repacked, MTLResourceUsage::Read);
-    encoder.use_resource(src1, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     encoder.set_threadgroup_memory_length(0, 8192);
 
@@ -648,10 +729,6 @@ pub fn call_quantized_matmul_mm_q4k_v3(
             r3
         )
     );
-    encoder.use_resource(src0, MTLResourceUsage::Read);
-    encoder.use_resource(scales_repacked, MTLResourceUsage::Read);
-    encoder.use_resource(src1, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     encoder.set_threadgroup_memory_length(0, 8192);
 
@@ -758,10 +835,6 @@ pub fn call_quantized_matmul_mm_q4k_v4(
             r3
         )
     );
-    encoder.use_resource(src0, MTLResourceUsage::Read);
-    encoder.use_resource(scales_repacked, MTLResourceUsage::Read);
-    encoder.use_resource(src1, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     encoder.set_threadgroup_memory_length(0, 8192);
 
@@ -838,8 +911,6 @@ pub fn call_dequantize_q_to_half(
     let ne = elem_count as u64;
     set_params!(encoder, ((src, src_offset), (dst, 0usize), ne));
 
-    encoder.use_resource(src, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     let thread_groups = MTLSize {
         width: tg_count,

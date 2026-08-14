@@ -1,7 +1,9 @@
 use crate::utils::{BufferOffset, EncoderProvider};
+use crate::{
+    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
+    Output, Source,
+};
 use crate::{get_tile_size, linear_split};
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
-use objc2_metal::MTLResourceUsage;
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_cast_contiguous(
@@ -20,14 +22,13 @@ pub fn call_cast_contiguous(
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "cast {kernel_name} elems={length}");
 
-    set_params!(encoder, (length, &input, (output, output_offset)));
+    set_params!(encoder, (length, &input, Output::with_offset(output, output_offset)));
 
     let tile_size = get_tile_size(dtype_size);
     let tiles = length.div_ceil(tile_size);
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -51,16 +52,15 @@ pub fn call_cast_strided(
     encoder.set_compute_pipeline_state(&pipeline);
 
     let length: usize = shape.iter().product();
+    debug_group!(encoder, "cast_strided {kernel_name} elems={length}");
 
     set_params!(
         encoder,
-        (length, shape.len(), shape, input_strides, &input, (output, output_offset))
+        (length, shape.len(), shape, input_strides, &input, Output::with_offset(output, output_offset))
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
 
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

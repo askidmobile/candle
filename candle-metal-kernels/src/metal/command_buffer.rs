@@ -1,130 +1,54 @@
-use crate::{BlitCommandEncoder, ComputeCommandEncoder};
-use block2::RcBlock;
+use super::{BlitCommandEncoder, ComputeCommandEncoder, Device, Fence, PrevCeOutputs};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
 use std::borrow::Cow;
-use std::ptr::NonNull;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Condvar, Mutex, MutexGuard,
-};
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum CommandStatus {
-    Available,
-    Encoding,
-    Done,
-}
-
-#[derive(Debug)]
-pub struct CommandSemaphore {
-    pub cond: Condvar,
-    pub status: Mutex<CommandStatus>,
-}
-
-impl CommandSemaphore {
-    pub fn new() -> CommandSemaphore {
-        CommandSemaphore {
-            cond: Condvar::new(),
-            status: Mutex::new(CommandStatus::Available),
-        }
-    }
-
-    pub fn wait_until<F: FnMut(&mut CommandStatus) -> bool>(
-        &self,
-        mut f: F,
-    ) -> MutexGuard<'_, CommandStatus> {
-        self.cond
-            .wait_while(self.status.lock().unwrap(), |s| !f(s))
-            .unwrap()
-    }
-
-    pub fn set_status(&self, status: CommandStatus) {
-        *self.status.lock().unwrap() = status;
-        // We notify the condvar that the value has changed.
-        self.cond.notify_one();
-    }
-
-    pub fn when<T, B: FnMut(&mut CommandStatus) -> bool, F: FnMut() -> T>(
-        &self,
-        b: B,
-        mut f: F,
-        next: Option<CommandStatus>,
-    ) -> T {
-        let mut guard = self.wait_until(b);
-        let v = f();
-        if let Some(status) = next {
-            *guard = status;
-            self.cond.notify_one();
-        }
-        v
-    }
-}
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct CommandBuffer {
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    semaphore: Arc<CommandSemaphore>,
-    id: u64,
-    completed_command_buffer_id: Arc<AtomicU64>,
-    completion_handler_registered: Arc<AtomicBool>,
-    track_buffer_usage: bool,
 }
 
 unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
-    pub fn new(
-        raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        semaphore: Arc<CommandSemaphore>,
-        id: u64,
-        completed_command_buffer_id: Arc<AtomicU64>,
-        track_buffer_usage: bool,
-    ) -> Self {
-        Self {
-            raw,
-            semaphore,
-            id,
-            completed_command_buffer_id,
-            completion_handler_registered: Arc::new(AtomicBool::new(false)),
-            track_buffer_usage,
-        }
+    pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
+        Self { raw }
     }
 
-    pub fn compute_command_encoder(&self) -> ComputeCommandEncoder {
+    /// Create a compute command encoder with the provided per-encoder fence and global output map.
+    pub fn compute_command_encoder(&self, fence: &Arc<Fence>) -> ComputeCommandEncoder {
         self.as_ref()
-            .computeCommandEncoder()
-            .map(|raw| {
-                ComputeCommandEncoder::new(
-                    raw,
-                    Arc::clone(&self.semaphore),
-                    self.id,
-                    self.track_buffer_usage,
-                )
-            })
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .map(|raw| ComputeCommandEncoder::new(raw, self.raw.clone(), Arc::clone(fence)))
             .unwrap()
     }
 
-    pub fn blit_command_encoder(&self) -> BlitCommandEncoder {
+    /// Create a compute command encoder with freshly allocated fence and a standalone output map.
+    /// Used by tests and `EncoderProvider` implementations that don't share a global fence map.
+    pub fn compute_command_encoder_no_fence(&self) -> ComputeCommandEncoder {
+        let device = Device::new(self.raw.device());
+        let fence = Arc::new(Fence::new(&device));
+        self.as_ref()
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .map(|raw| ComputeCommandEncoder::new(raw, self.raw.clone(), fence))
+            .unwrap()
+    }
+
+    pub fn blit_command_encoder(
+        &self,
+        fence: &Arc<Fence>,
+        prev_ce_outputs: &PrevCeOutputs,
+    ) -> BlitCommandEncoder {
         self.as_ref()
             .blitCommandEncoder()
-            .map(|raw| {
-                BlitCommandEncoder::new(
-                    raw,
-                    Arc::clone(&self.semaphore),
-                    self.id,
-                    self.track_buffer_usage,
-                )
-            })
+            .map(|raw| BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs)))
             .unwrap()
     }
 
     pub fn commit(&self) {
-        if self.track_buffer_usage {
-            self.register_completion_handler();
-        }
         self.raw.commit()
     }
 
@@ -152,31 +76,6 @@ impl CommandBuffer {
 
     pub fn wait_until_completed(&self) {
         self.raw.waitUntilCompleted();
-        self.mark_completed();
-    }
-
-    pub fn mark_completed(&self) {
-        self.completed_command_buffer_id
-            .fetch_max(self.id, Ordering::Release);
-    }
-
-    fn register_completion_handler(&self) {
-        if self
-            .completion_handler_registered
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let id = self.id;
-        let completed = Arc::clone(&self.completed_command_buffer_id);
-        let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            completed.fetch_max(id, Ordering::Release);
-        });
-        unsafe {
-            self.raw.addCompletedHandler(RcBlock::as_ptr(&block).cast());
-        }
     }
 }
 
