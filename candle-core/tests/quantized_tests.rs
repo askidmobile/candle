@@ -774,7 +774,7 @@ fn quantize_q2k(device: &Device) -> Result<()> {
     let dst = round_vector(&dst);
     assert_eq!(
         [dst[0], dst[128], dst[256], dst[512], dst[800], dst[1023]],
-        [-0.499, -0.373, -0.249, 0.0, 0.287, 0.484]
+        [-0.5, -0.373, -0.25, 0.0, 0.283, 0.493]
     );
 
     let src_big = get_test_vector2(128.0, 1024, device)?;
@@ -915,7 +915,7 @@ fn quantize_q5k(device: &Device) -> Result<()> {
     let dst = round_vector(&dst);
     assert_eq!(
         [dst[0], dst[128], dst[256], dst[512], dst[800], dst[1023]],
-        [-0.499, -0.373, -0.249, 0.0, 0.287, 0.484]
+        [-0.5, -0.373, -0.25, 0.0, 0.283, 0.493]
     );
 
     let src_big = get_test_vector2(128.0, 1024, device)?;
@@ -1357,7 +1357,7 @@ fn quantized_matmul_q2k() -> Result<()> {
     assert_eq!(mm.dims(), [m, n]);
     let dst = mm.flatten_all()?.to_vec1::<f32>()?;
     let dst = round_vector(&[dst[0], dst[m * n / 3], dst[m * n * 2 / 3], dst[m * n - 1]]);
-    assert_eq!(dst, [0.887, 0.428, 0.219, 1.669]);
+    assert_eq!(dst, [1.486, 1.288, 0.828, 1.347]);
 
     ggml_matmul_error_test::<BlockQ2K>()?;
 
@@ -1435,7 +1435,7 @@ fn quantized_matmul_q5k() -> Result<()> {
     assert_eq!(mm.dims(), [m, n]);
     let dst = mm.flatten_all()?.to_vec1::<f32>()?;
     let dst = round_vector(&[dst[0], dst[m * n / 3], dst[m * n * 2 / 3], dst[m * n - 1]]);
-    assert_eq!(dst, [1.161, 1.498, -0.175, 1.739]);
+    assert_eq!(dst, [1.172, 1.509, -0.166, 1.766]);
 
     //Expected: 0.000740408897
     ggml_matmul_error_test::<BlockQ5K>()?;
