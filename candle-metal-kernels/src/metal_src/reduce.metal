@@ -1137,11 +1137,11 @@ METAL_FUNC void add_rms_norm_core(
         float sum = static_cast<float>(src_a[i]) + static_cast<float>(src_b[i]);
         value = RMSLoadOp<float>()(value, RMS<float>{ 1, sum * sum });
     }
-    RMS<float> result = RMS<float>{ value.count, static_cast<float>(value.mean) };
+    RMS<float> result = RMS<float>{ value.count, static_cast<float>(value.sum_sq) };
 
     result = reduce(result, tid);
     if (tid == 0) {
-        total = rsqrt(fast_divide(result.mean, float(el_per_block)) + eps);
+        total = rsqrt(fast_divide(result.sum_sq, float(el_per_block)) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
