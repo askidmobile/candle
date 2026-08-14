@@ -143,14 +143,13 @@ mod cuda {
                 shared_mem_bytes: smem_bytes,
             };
 
-            let topk_w_slice = if let Some(tw) = topk_weights {
-                let (tw_storage, _) = tw.storage_and_layout();
-                match &*tw_storage {
+            let topk_w_guard = topk_weights.as_ref().map(|tw| tw.storage_and_layout());
+            let topk_w_slice = match &topk_w_guard {
+                Some((tw_storage, _)) => match &**tw_storage {
                     Storage::Cuda(c) => Some(c.as_cuda_slice::<f32>()?),
                     _ => candle::bail!("topk_weights must be a cuda tensor"),
-                }
-            } else {
-                None
+                },
+                None => None,
             };
 
             let mut builder = func.builder();
@@ -231,14 +230,13 @@ mod cuda {
             _ => candle::bail!("expert_ids must be a cuda tensor"),
         };
 
-        let topk_w_slice = if let Some(tw) = topk_weights {
-            let (tw_storage, _) = tw.storage_and_layout();
-            match &*tw_storage {
+        let topk_w_guard = topk_weights.as_ref().map(|tw| tw.storage_and_layout());
+        let topk_w_slice = match &topk_w_guard {
+            Some((tw_storage, _)) => match &**tw_storage {
                 Storage::Cuda(c) => Some(c.as_cuda_slice::<f32>()?),
                 _ => candle::bail!("topk_weights must be a cuda tensor"),
-            }
-        } else {
-            None
+            },
+            None => None,
         };
 
         let output_slice = unsafe { dev.alloc::<f32>(size_m * size_n) }?;
@@ -333,7 +331,7 @@ mod cuda {
             let mut quant_builder = quant_func.builder();
             quant_builder.arg(input_slice);
             quant_builder.arg(&mut y_q8_1);
-            quant_let size_k_i = size_k as i32; builder.arg(&size_k_i);
+            let size_k_i = size_k as i32; quant_builder.arg(&size_k_i);
             let k_padded_i = k_padded as i32; quant_builder.arg(&k_padded_i);
             unsafe { quant_builder.launch(quant_cfg) }.w()?;
 
