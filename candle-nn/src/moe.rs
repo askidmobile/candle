@@ -384,8 +384,9 @@ mod cuda {
     }
 }
 
+#[allow(unused_variables)]
 pub fn moe_gemm(
-    _input: &Tensor,
+    input: &Tensor,
     weights: &Tensor,
     topk_weights: &Option<Tensor>,
     sorted_token_ids: &Tensor,
@@ -407,13 +408,13 @@ pub fn moe_gemm(
             );
         }
     }
-    let _ = (weights, topk_weights, sorted_token_ids, expert_ids, topk, is_prefill);
     candle::bail!("moe_gemm (dense MoE) is only supported on CUDA")
 }
 
+#[allow(unused_variables)]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
-    _input: &Tensor,
+    input: &Tensor,
     weights: &QTensor,
     topk_weights: &Option<Tensor>,
     sorted_token_ids: &Tensor,
@@ -437,6 +438,5 @@ pub fn moe_gemm_gguf(
             );
         }
     }
-    let _ = (weights, topk_weights, sorted_token_ids, expert_ids, topk, is_prefill, dtype);
     candle::bail!("moe_gemm_gguf is only supported on CUDA")
 }
