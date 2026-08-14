@@ -90,6 +90,8 @@ mod cuda {
                 );
             }
             let dev = input.device().as_cuda_device()?;
+            let sorted_token_ids = sorted_token_ids.to_dtype(DType::I32)?;
+            let expert_ids = expert_ids.to_dtype(DType::I32)?;
 
             let (input_storage, _) = input.storage_and_layout();
             let input_slice = match &*input_storage {
@@ -216,6 +218,8 @@ mod cuda {
         }
 
         let dev = input.device().as_cuda_device()?;
+        let sorted_token_ids = sorted_token_ids.to_dtype(DType::I32)?;
+        let expert_ids = expert_ids.to_dtype(DType::I32)?;
         let weight_ptr = weights.device_ptr()?;
 
         let (sorted_ids_storage, _) = sorted_token_ids.storage_and_layout();
