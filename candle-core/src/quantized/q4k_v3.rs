@@ -1,11 +1,11 @@
-//! T-278 Phase 0: bridge для `kernel_mul_mm_q4_K_f32_v3` (Level 1 threadgroup tile cache).
+//! T-278 Phase 0: bridge for `kernel_mul_mm_q4_K_f32_v3` (Level 1 threadgroup tile cache).
 //!
-//! SKELETON STATE: функционально идентичен `q4k_opt::matmul_q4k_opt_metal`,
-//! отличается только pipeline name (вызывает `call_quantized_matmul_mm_q4k_v3`).
-//! Будет получит threadgroup tile cache функциональность в Фазе 1.
+//! SKELETON STATE: functionally identical to `q4k_opt::matmul_q4k_opt_metal`,
+//! differs only in the pipeline name (calls `call_quantized_matmul_mm_q4k_v3`).
+//! It will get threadgroup tile cache functionality in Phase 1.
 //!
-//! Reuses `Q4KOptMetadataGpu` из `q4k_opt` — то же metadata buffer для V2 и V3,
-//! никакой новой структуры данных в Level 1.
+//! Reuses `Q4KOptMetadataGpu` from `q4k_opt` -- the same metadata buffer for V2 and V3,
+//! no new data structure in Level 1.
 
 #[cfg(feature = "metal")]
 pub use metal_impl::matmul_q4k_v3_metal;
@@ -20,14 +20,14 @@ mod metal_impl {
 
     /// T-278 Phase 0: dispatch V3 Q4_K_M matmul (skeleton).
     ///
-    /// Те же требования что и `matmul_q4k_opt_metal`:
-    /// - `qtensor.dtype() == GgmlDType::Q4K`
-    /// - `qtensor` на Metal device
+    /// Same requirements as `matmul_q4k_opt_metal`:
+    /// - `qtensor.dtype() == GgmlDType::Q4k`
+    /// - `qtensor` on a Metal device
     /// - `xs.dtype() == DType::F32`
     /// - Dimensions aligned: `M%64==0 && N%32==0` (FAST_PATH)
     ///
-    /// В Фазе 0 функционально = `matmul_q4k_opt_metal`. В Фазе 1 inner loop
-    /// kernel'а получит threadgroup memory weight tile cache.
+    /// In Phase 0 it is functionally = `matmul_q4k_opt_metal`. In Phase 1 the inner loop
+    /// of the kernel will get a threadgroup memory weight tile cache.
     pub fn matmul_q4k_v3_metal(
         qtensor: &QTensor,
         xs: &Tensor,

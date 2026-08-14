@@ -24,27 +24,27 @@ use libc;
 // ─────────────────────────────────────────────────────────────────────────────
 // WeightResidencySet — MTLResidencySet lifecycle management (T-271 Phase 4 redux)
 //
-// Задача: сообщить macOS что weight buffers (GGUF mmaps) нужны GPU постоянно
-// и не должны выгружаться в compressed memory. Это закрывает 5.7× RSS gap
-// между Yttri (2.5 GB) и llama.cpp (434 MB) при работе с той же моделью.
+// Goal: tell macOS that weight buffers (GGUF mmaps) are needed by the GPU permanently
+// and must not be evicted into compressed memory. This closes the 5.7x RSS gap
+// between Yttri (2.5 GB) and llama.cpp (434 MB) for the same model.
 //
-// Паттерн из llama.cpp ggml-metal-device.m:
-// - Per-buffer residency set создаётся при init каждого Metal buffer
-// - requestResidency() сразу при создании set — память permanently wired
-// - Background thread с keep_alive interval (default 3 мин) поддерживает
-//   residency alive через периодические requestResidency() каждые 500ms
+// Pattern from llama.cpp ggml-metal-device.m:
+// - A per-buffer residency set is created at the init of each Metal buffer
+// - requestResidency() right after set creation -- memory is permanently wired
+// - A background thread with a keep-alive interval (default 3 min) keeps the
+//   residency alive via periodic requestResidency() every 500ms
 //
-// Наша адаптация для Rust/candle (без per-buffer sets, один set на модель):
-// - WeightResidencySet создаётся при init модели
-// - new_buffer_no_copy добавляет каждый weight buffer через addAllocation()
-// - commit_and_request() вызывается после загрузки всех весов
-// - Background Rust thread каждые HEARTBEAT_INTERVAL_S секунд вызывает
-//   requestResidency() для предотвращения macOS eviction при idle
-// - Drop вызывает endResidency() + removeAllAllocations() + завершает thread
+// Our adaptation for Rust/candle (no per-buffer sets, one set per model):
+// - WeightResidencySet is created at model init
+// - new_buffer_no_copy adds each weight buffer via addAllocation()
+// - commit_and_request() is called after all weights are loaded
+// - A background Rust thread calls requestResidency() every HEARTBEAT_INTERVAL_S
+//   seconds to prevent macOS eviction while idle
+// - Drop calls endResidency() + removeAllAllocations() and joins the thread
 //
-// macOS version: MTLResidencySet доступен с macOS 15.0. Проверяется в runtime
-// через sysctl kern.osproductversion. Если < 15 или env YTTRI_DISABLE_RESIDENCY_SET=1
-// — возвращает None, поведение не меняется.
+// macOS version: MTLResidencySet is available since macOS 15.0. Checked at runtime
+// via sysctl kern.osproductversion. If < 15 or env YTTRI_DISABLE_RESIDENCY_SET=1
+// it returns None and behavior is unchanged.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use objc2::rc::Retained;
@@ -52,32 +52,32 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLAllocation, MTLDevice as MTLDeviceProtocol, MTLResidencySet, MTLResidencySetDescriptor};
 use objc2_foundation::NSString;
 
-/// Интервал heartbeat-запросов residency (секунды).
-/// llama.cpp использует 500ms; мы берём 30с — достаточно для предотвращения
-/// eviction, меньше CPU overhead.
+/// Heartbeat interval for residency requests (seconds).
+/// llama.cpp uses 500ms; we take 30s -- enough to prevent eviction,
+/// with less CPU overhead.
 const HEARTBEAT_INTERVAL_S: u64 = 30;
 
-/// Проверяет поддержку MTLResidencySet в runtime (macOS 15+).
-/// Результат кешируется в OnceLock — однократная проверка при первом вызове.
+/// Checks MTLResidencySet support at runtime (macOS 15+).
+/// Result is cached in a OnceLock -- a single check on the first call.
 fn supports_residency_set() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        // Быстрая проверка через env override
+        // Fast path via env override
         if std::env::var("YTTRI_DISABLE_RESIDENCY_SET")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
         {
             return false;
         }
-        // macOS version check через sysctl kern.osproductversion
-        // MTLResidencySet доступен с 15.0; мы на 26.x — всегда true,
-        // но проверяем корректно для portability.
+        // macOS version check via sysctl kern.osproductversion
+        // MTLResidencySet is available from 15.0; we are on 26.x -- always true,
+        // but we check correctly for portability.
         macos_version_ge_15()
     })
 }
 
-/// Возвращает true если macOS >= 15.0 по kern.osproductversion.
+/// Returns true if macOS >= 15.0 per kern.osproductversion.
 fn macos_version_ge_15() -> bool {
     use std::ffi::CString;
     let mut buf = [0u8; 64];
@@ -104,12 +104,12 @@ fn macos_version_ge_15() -> bool {
     major >= 15
 }
 
-/// Newtype wrapper делающий MTLResidencySet Send+Sync.
+/// Newtype wrapper making MTLResidencySet Send+Sync.
 ///
-/// Safety: MTLResidencySet thread-safe по Apple документации —
-/// requestResidency/endResidency/addAllocation/commit можно вызывать
-/// с любого потока. Все ObjC retain/release операции в Retained<>
-/// атомарны.
+/// Safety: MTLResidencySet is thread-safe per Apple docs --
+/// requestResidency/endResidency/addAllocation/commit can be called
+/// from any thread. All ObjC retain/release operations in Retained<>
+/// are atomic.
 struct SendableRset(Retained<ProtocolObject<dyn MTLResidencySet>>);
 unsafe impl Send for SendableRset {}
 unsafe impl Sync for SendableRset {}
@@ -121,33 +121,33 @@ impl std::ops::Deref for SendableRset {
     }
 }
 
-/// Внутреннее состояние residency set — содержит Objective-C объект.
-/// Завёрнут в Mutex чтобы addAllocation/commit/requestResidency могли
-/// вызываться из разных потоков (хотя типично это происходит последовательно).
+/// Internal residency set state -- holds the Objective-C object.
+/// Wrapped in a Mutex so addAllocation/commit/requestResidency can be called
+/// from different threads (although typically this happens sequentially).
 struct ResidencyInner {
     rset: SendableRset,
-    /// true = requestResidency() уже был вызван, memory wired.
+    /// true = requestResidency() has been called, memory is wired.
     resident: bool,
 }
 
-// Safety: ResidencyInner содержит только SendableRset (Send+Sync) и bool.
+// Safety: ResidencyInner contains only SendableRset (Send+Sync) and a bool.
 unsafe impl Send for ResidencyInner {}
 unsafe impl Sync for ResidencyInner {}
 
-/// Публичный handle на residency set модели.
+/// Public handle to the model's residency set.
 ///
-/// Создаётся через `MetalDevice::new_weight_residency_set()`.
-/// Использование:
-/// 1. Загрузить веса через `new_buffer_no_copy` — каждый буфер автоматически
-///    добавляется в set если device содержит этот WeightResidencySet.
-/// 2. Вызвать `commit_and_request()` после загрузки всех весов.
-/// 3. Держать `Arc<WeightResidencySet>` живым пока модель в памяти.
-///    Drop() автоматически вызовет endResidency().
+/// Created via `MetalDevice::new_weight_residency_set()`.
+/// Usage:
+/// 1. Load weights via `new_buffer_no_copy` -- each buffer is automatically
+///    added to the set if the device holds this WeightResidencySet.
+/// 2. Call `commit_and_request()` after all weights are loaded.
+/// 3. Keep the `Arc<WeightResidencySet>` alive while the model is in memory.
+///    Drop() automatically calls endResidency().
 pub struct WeightResidencySet {
     inner: Mutex<ResidencyInner>,
-    /// Сигнал останова background heartbeat thread.
+    /// Stop signal for the background heartbeat thread.
     stop: Arc<std::sync::atomic::AtomicBool>,
-    /// JoinHandle для graceful shutdown при Drop.
+    /// JoinHandle for graceful shutdown on Drop.
     thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -155,8 +155,8 @@ unsafe impl Send for WeightResidencySet {}
 unsafe impl Sync for WeightResidencySet {}
 
 impl WeightResidencySet {
-    /// Создать новый WeightResidencySet на данном MTLDevice.
-    /// Возвращает None если macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1.
+    /// Create a new WeightResidencySet on the given MTLDevice.
+    /// Returns None if macOS < 15 or YTTRI_DISABLE_RESIDENCY_SET=1.
     pub fn new(device: &Device) -> Option<Arc<Self>> {
         if !supports_residency_set() {
             return None;
@@ -169,21 +169,21 @@ impl WeightResidencySet {
         let rset = SendableRset(rset);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop.clone();
-        // Для heartbeat thread создаём отдельный Arc<SendableRset>
-        // чтобы не клонировать всю структуру.
+        // For the heartbeat thread we create a separate Arc<SendableRset>
+        // so we do not clone the whole structure.
         let rset_for_thread = Arc::new(SendableRset(rset.0.clone()));
-        // Background heartbeat thread — аналог llama.cpp background dispatch
-        // Периодически вызывает requestResidency() каждые HEARTBEAT_INTERVAL_S секунд.
-        // macOS может "забыть" о residency при memory pressure; heartbeat
-        // переодически напоминает ОС что буферы нужны GPU.
-        // Heartbeat thread — запрашивает requestResidency() каждые 30с
-        // только если YTTRI_WIRE_WEIGHTS=1. Иначе thread спит вечно.
+        // Background heartbeat thread -- analogous to llama.cpp background dispatch.
+        // Periodically calls requestResidency() every HEARTBEAT_INTERVAL_S seconds.
+        // macOS may "forget" the residency under memory pressure; the heartbeat
+        // periodically reminds the OS that the buffers are needed by the GPU.
+        // The heartbeat thread requests requestResidency() every 30s
+        // only if YTTRI_WIRE_WEIGHTS=1. Otherwise the thread sleeps forever.
         let wire_weights = std::env::var("YTTRI_WIRE_WEIGHTS").map(|v| v == "1").unwrap_or(false);
         let handle = std::thread::Builder::new()
             .name("yttri-residency-heartbeat".to_string())
             .spawn(move || {
                 if !wire_weights {
-                    // По умолчанию heartbeat не активен — requestResidency не вызывается.
+                    // By default the heartbeat is inactive -- requestResidency is not called.
                     return;
                 }
                 while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
@@ -201,10 +201,10 @@ impl WeightResidencySet {
         }))
     }
 
-    /// Добавить Metal buffer в residency set (uncommitted).
+    /// Add a Metal buffer to the residency set (uncommitted).
     ///
-    /// Вызывается автоматически из `MetalDevice::new_buffer_no_copy`.
-    /// Threshold: только буферы >= 1 MiB (weight tensors, не маленькие промежуточные).
+    /// Called automatically from `MetalDevice::new_buffer_no_copy`.
+    /// Threshold: only buffers >= 1 MiB (weight tensors, not small intermediates).
     pub fn add_buffer(&self, buffer: &Buffer) {
         if buffer.length() < 1024 * 1024 {
             return;
@@ -216,21 +216,21 @@ impl WeightResidencySet {
         }
     }
 
-    /// Зафиксировать все добавленные allocations (без requestResidency).
+    /// Commit all added allocations (without requestResidency).
     ///
-    /// Должен вызываться ОДИН РАЗ после загрузки всех весов модели.
-    /// commit() — регистрирует буферы в residency set без их принудительного wiring.
+    /// Must be called ONCE after all model weights are loaded.
+    /// commit() registers buffers in the residency set without forcibly wiring them.
     ///
-    /// Для принудительного wiring вызовите `request_residency()` отдельно.
-    /// Default: только commit(), без requestResidency() — иначе Physical footprint +500 MB.
+    /// To force wiring, call `request_residency()` separately.
+    /// Default: commit() only, without requestResidency() -- otherwise Physical footprint +500 MB.
     pub fn commit_and_request(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.rset.commit();
-            // requestResidency() намеренно НЕ вызывается здесь.
-            // Оно wires память в GPU (non-evictable), увеличивая Physical footprint на ~500 MB.
-            // Вместо этого macOS сам управляет eviction — страницы становятся resident
-            // по demand при первом доступе GPU.
-            // Для явного wiring: YTTRI_WIRE_WEIGHTS=1 (см. request_residency()).
+            // requestResidency() is intentionally NOT called here.
+            // It wires memory into the GPU (non-evictable), increasing Physical footprint by ~500 MB.
+            // Instead macOS manages eviction itself -- pages become resident
+            // on demand at first GPU access.
+            // For explicit wiring: YTTRI_WIRE_WEIGHTS=1 (see request_residency()).
             if std::env::var("YTTRI_WIRE_WEIGHTS").map(|v| v == "1").unwrap_or(false) {
                 inner.rset.requestResidency();
                 inner.resident = true;
@@ -245,12 +245,12 @@ impl WeightResidencySet {
         }
     }
 
-    /// Вернуть true если residency уже запрошена.
+    /// Return true if residency has already been requested.
     pub fn is_resident(&self) -> bool {
         self.inner.lock().map(|g| g.resident).unwrap_or(false)
     }
 
-    /// Принудительно завершить residency (обычно вызывается через Drop).
+    /// Forcibly end residency (normally called via Drop).
     fn end_residency_inner(inner: &mut ResidencyInner) {
         if inner.resident {
             inner.rset.endResidency();
@@ -263,16 +263,16 @@ impl WeightResidencySet {
 
 impl Drop for WeightResidencySet {
     fn drop(&mut self) {
-        // Останавливаем background thread
+        // Stop the background thread
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         if let Ok(mut guard) = self.thread_handle.lock() {
             if let Some(handle) = guard.take() {
-                // Не ждём join чтобы не блокировать Drop — thread сам завершится
-                // после текущего sleep интервала.
+                // We do not block on join -- the thread will finish on its own
+                // after the current sleep interval.
                 let _ = handle.join();
             }
         }
-        // Снимаем residency
+        // End residency
         if let Ok(mut inner) = self.inner.lock() {
             Self::end_residency_inner(&mut inner);
         }
@@ -284,9 +284,9 @@ use super::MetalError;
 // ─────────────────────────────────────────────────────────────────────────────
 // Allocation tracing API (T-269 Phase 1)
 //
-// Default off — нет overhead в hot path когда trace не активен.
-// Активируется через begin_allocation_trace() только во время calibration
-// forward. Результат забирается через end_allocation_trace().
+// Default off -- no overhead in the hot path when tracing is inactive.
+// Activated via begin_allocation_trace() only during a calibration
+// forward. The result is collected via end_allocation_trace().
 // ─────────────────────────────────────────────────────────────────────────────
 
 thread_local! {
@@ -294,34 +294,34 @@ thread_local! {
     static TRACE_LOG: RefCell<Vec<TraceEntry>> = RefCell::new(Vec::new());
 }
 
-/// Одна запись о Metal buffer аллокации во время calibration forward.
+/// A single record of a Metal buffer allocation during a calibration forward.
 #[derive(Clone, Debug)]
 pub struct TraceEntry {
-    /// Запрошенный размер (raw, до round-up).
+    /// Requested size (raw, before round-up).
     pub size: usize,
-    /// Фактический размер буфера после buf_size() round-up.
+    /// Actual buffer size after buf_size() round-up.
     pub rounded_size: usize,
-    /// Момент аллокации (монотонное время).
+    /// Allocation moment (monotonic time).
     pub timestamp: std::time::Instant,
-    /// true = буфер взят из pool (reuse), false = новый MTLBuffer.
+    /// true = buffer taken from the pool (reuse), false = new MTLBuffer.
     pub from_pool: bool,
 }
 
-/// Начать трассировку аллокаций. Очищает предыдущий лог.
-/// Вызвать перед calibration forward, после warmup.
+/// Start allocation tracing. Clears the previous log.
+/// Call before a calibration forward, after warmup.
 pub fn begin_allocation_trace() {
     TRACE_LOG.with(|l| l.borrow_mut().clear());
     TRACE_ALLOC.with(|c| c.set(true));
 }
 
-/// Остановить трассировку и вернуть собранный лог.
-/// Возвращает все TraceEntry с момента begin_allocation_trace().
+/// Stop tracing and return the collected log.
+/// Returns all TraceEntry since begin_allocation_trace().
 pub fn end_allocation_trace() -> Vec<TraceEntry> {
     TRACE_ALLOC.with(|c| c.set(false));
     TRACE_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
 }
 
-/// Проверить активна ли трассировка на текущем потоке.
+/// Check whether tracing is active on the current thread.
 #[inline(always)]
 pub fn allocation_trace_active() -> bool {
     TRACE_ALLOC.with(|c| c.get())
@@ -342,30 +342,30 @@ fn record_trace(size: usize, rounded: usize, from_pool: bool) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Scratch arena thread_local activation (T-269 Phase 2)
 //
-// ACTIVE_ARENA содержит текущую scratch arena для данного потока (если активна).
-// Активируется через MetalDevice::activate_scratch_arena() перед prefill loop,
-// деактивируется через deactivate_scratch_arena() после final fence.
+// ACTIVE_ARENA holds the current scratch arena for this thread (if active).
+// It is activated via MetalDevice::activate_scratch_arena() before the prefill loop,
+// and deactivated via deactivate_scratch_arena() after the final fence.
 //
-// Default: None — arena не активна, allocate_buffer использует обычный pool.
+// Default: None -- the arena is inactive, allocate_buffer uses the regular pool.
 // ─────────────────────────────────────────────────────────────────────────────
 
 thread_local! {
     static ACTIVE_ARENA: RefCell<Option<Arc<ScratchArena>>> = const { RefCell::new(None) };
-    /// Активная UnifiedScratchArena для Phase 3c offset dispatch.
-    /// None = отключена (default). Активируется через activate_unified_arena().
+    /// Active UnifiedScratchArena for Phase 3c offset dispatch.
+    /// None = disabled (default). Activated via activate_unified_arena().
     static ACTIVE_UNIFIED_ARENA: RefCell<Option<Arc<UnifiedScratchArena>>> = const { RefCell::new(None) };
-    /// Если true — следующий allocate_buffer пропускает arena fast path.
-    /// Используется для исключения long-lived allocations (KV cache) из arena.
-    /// Автоматически сбрасывается при каждом чтении (одноразовый флаг).
+    /// If true -- the next allocate_buffer skips the arena fast path.
+    /// Used to exclude long-lived allocations (KV cache) from the arena.
+    /// Automatically reset on every read (one-shot flag).
     static SKIP_ARENA_NEXT: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Пометить следующую аллокацию как "не для arena" (long-lived buffer).
+/// Mark the next allocation as "not for the arena" (a long-lived buffer).
 ///
-/// Вызывать перед созданием KV cache буферов (`Tensor::zeros`) или других
-/// долгоживущих буферов которые не должны занимать arena slots.
+/// Call before creating KV cache buffers (`Tensor::zeros`) or other
+/// long-lived buffers that should not occupy arena slots.
 ///
-/// Флаг автоматически сбрасывается после одного `allocate_buffer` вызова.
+/// The flag is automatically reset after a single `allocate_buffer` call.
 pub fn skip_arena_next_alloc() {
     SKIP_ARENA_NEXT.with(|s| s.set(true));
 }
@@ -422,13 +422,13 @@ pub struct MetalDevice {
     pub(crate) seed_value: Arc<RwLock<u64>>,
     pub(crate) completion_aware_pool: bool,
 
-    /// MTLResidencySet для weight buffers (T-271 Phase 4 redux).
+    /// MTLResidencySet for weight buffers (T-271 Phase 4 redux).
     ///
-    /// Создаётся через `new_weight_residency_set()` после init device.
-    /// None = macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1.
-    /// `new_buffer_no_copy` автоматически добавляет буферы в этот set.
+    /// Created via `new_weight_residency_set()` after device init.
+    /// None = macOS < 15 or YTTRI_DISABLE_RESIDENCY_SET=1.
+    /// `new_buffer_no_copy` automatically adds buffers to this set.
     ///
-    /// Arc<Mutex<>> чтобы можно было менять через &self (MetalDevice Clone).
+    /// Arc<Mutex<>> so it can be mutated via &self (MetalDevice is Clone).
     pub(crate) weight_residency: Arc<Mutex<Option<Arc<WeightResidencySet>>>>,
     /// Residency set registered on the command queue.
     pub(crate) residency_set: Arc<ResidencySet>,
@@ -530,22 +530,22 @@ impl MetalDevice {
         Ok(())
     }
 
-    /// Агрессивная очистка buffer pool.
+    /// Aggressive buffer pool cleanup.
     ///
-    /// В отличие от `flush_buffers()` полностью очищает все size buckets
-    /// после ожидания завершения in-flight GPU команд. Также очищает
-    /// кэши скомпилированных Metal libraries и pipeline state objects.
+    /// Unlike `flush_buffers()` this fully clears all size buckets
+    /// after waiting for in-flight GPU commands to finish. Also clears
+    /// the compiled Metal library and pipeline state object caches.
     ///
-    /// # Важные замечания
+    /// # Important notes
     ///
-    /// - **Cold-start spike**: после вызова все Metal shaders будут перекомпилированы
-    ///   при следующем использовании (~50-200мс на каждый source). Вызывайте только
-    ///   при teardown движка, а не между инференсами.
+    /// - **Cold-start spike**: after the call all Metal shaders will be recompiled
+    ///   on next use (~50-200ms per source). Call only at engine teardown,
+    ///   not between inferences.
     ///
-    /// - **Живые Arc-ссылки**: буферы, на которые существуют `Arc`-ссылки из
-    ///   живых тензоров (`MetalStorage`), не будут физически освобождены — только
-    ///   удалены из pool. Новые аллокации создадут новые буферы вместо
-    ///   переиспользования. Вызывайте после drop всех тензоров модели.
+    /// - **Live Arc references**: buffers that have `Arc` references from
+    ///   live tensors (`MetalStorage`) will not be physically released -- only
+    ///   removed from the pool. New allocations will create new buffers instead
+    ///   of reusing. Call after dropping all model tensors.
     pub fn purge_buffer_pool(&self) -> Result<()> {
         self.wait_until_completed()?;
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
@@ -577,18 +577,18 @@ impl MetalDevice {
         Ok((total_count, total_bytes, unused_count, unused_bytes))
     }
 
-    /// Статистика command pool:
+    /// Command pool statistics:
     /// `(entries, in_flight_total, encoding_entries, total_compute_count)`.
     pub fn command_pool_stats(&self) -> Result<(usize, usize, usize, usize)> {
         Ok(self.commands.pool_stats().map_err(MetalError::from)?)
     }
 
-    /// Размеры kernel caches: `(libraries, pipelines)`.
+    /// Kernel cache sizes: `(libraries, pipelines)`.
     pub fn kernel_cache_stats(&self) -> Result<(usize, usize)> {
         Ok(self.kernels.cache_stats().map_err(MetalError::from)?)
     }
 
-    /// Сводная статистика runtime памяти Metal:
+    /// Summary of Metal runtime memory:
     /// `(current_allocated_bytes, recommended_max_working_set_bytes)`.
     pub fn metal_memory_stats(&self) -> (usize, usize) {
         (
@@ -693,7 +693,7 @@ impl MetalDevice {
         F: FnOnce() -> Result<R>,
     {
         // Effectively-infinite limit so finalize_entry never auto-flushes.
-        // Real-world forward'ы у нас 200-300 ops; миллион даёт огромный запас.
+        // Real-world forwards are 200-300 ops; a million gives a huge margin.
         const SCOPE_LIMIT: usize = 1_000_000;
 
         let prev_limit = candle_metal_kernels::metal::commands::graph_scope_limit();
@@ -711,8 +711,8 @@ impl MetalDevice {
 
         let result = f();
 
-        // Final sync: CB commit + wait. После этого pool reuse безопасен,
-        // GPU outputs готовы для CPU чтения.
+        // Final sync: CB commit + wait. After this pool reuse is safe,
+        // GPU outputs are ready for CPU reads.
         self.wait_until_completed_fast()?;
 
         result
@@ -775,14 +775,14 @@ impl MetalDevice {
     // WeightResidencySet API (T-271 Phase 4 redux)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Создать WeightResidencySet для данного device и установить его
-    /// как активный. После этого каждый `new_buffer_no_copy` (GGUF weights)
-    /// автоматически добавляет буфер в set.
+    /// Create a WeightResidencySet for this device and set it as active.
+    /// After this every `new_buffer_no_copy` (GGUF weights) automatically
+    /// adds the buffer to the set.
     ///
-    /// Возвращает `Arc<WeightResidencySet>` — сохранить пока модель живёт.
-    /// Вызвать `commit_weight_residency()` после загрузки всех весов.
+    /// Returns an `Arc<WeightResidencySet>` -- keep it alive while the model lives.
+    /// Call `commit_weight_residency()` after all weights are loaded.
     ///
-    /// Если macOS < 15 или YTTRI_DISABLE_RESIDENCY_SET=1 — возвращает None.
+    /// If macOS < 15 or YTTRI_DISABLE_RESIDENCY_SET=1 -- returns None.
     pub fn new_weight_residency_set(&self) -> Option<Arc<WeightResidencySet>> {
         let rset = WeightResidencySet::new(&self.device)?;
         if let Ok(mut guard) = self.weight_residency.lock() {
@@ -791,10 +791,10 @@ impl MetalDevice {
         Some(rset)
     }
 
-    /// Зафиксировать residency set и запросить wiring для всех добавленных
-    /// weight buffers. Вызывать ОДИН РАЗ после загрузки всех весов модели.
+    /// Commit the residency set and request wiring for all added
+    /// weight buffers. Call ONCE after all model weights are loaded.
     ///
-    /// No-op если residency set не установлен.
+    /// No-op if no residency set is installed.
     pub fn commit_weight_residency(&self) {
         if let Ok(guard) = self.weight_residency.lock() {
             if let Some(ref rset) = *guard {
@@ -803,7 +803,7 @@ impl MetalDevice {
         }
     }
 
-    /// Получить клон активного WeightResidencySet (если есть).
+    /// Get a clone of the active WeightResidencySet (if any).
     pub fn weight_residency_set(&self) -> Option<Arc<WeightResidencySet>> {
         self.weight_residency.lock().ok()?.as_ref().cloned()
     }
@@ -896,19 +896,19 @@ impl MetalDevice {
         Ok(new_buffer)
     }
 
-    /// Создаёт Metal-буфер без копирования данных (zero-copy) из mmap'd памяти.
+    /// Creates a Metal buffer without copying data (zero-copy) from mmap'd memory.
     ///
-    /// Буфер НЕ добавляется в пул буферов MetalDevice — он привязан к mmap
-    /// и не должен переиспользоваться другими операциями.
+    /// The buffer is NOT added to the MetalDevice buffer pool -- it is tied to the mmap
+    /// and must not be reused by other operations.
     ///
-    /// T-271 Phase 4 redux: если установлен `weight_residency` set,
-    /// автоматически добавляет буфер через `addAllocation()` (uncommitted).
-    /// Вызвать `commit_weight_residency()` после загрузки всех весов.
+    /// T-271 Phase 4 redux: if a `weight_residency` set is installed,
+    /// the buffer is automatically added via `addAllocation()` (uncommitted).
+    /// Call `commit_weight_residency()` after all weights are loaded.
     ///
-    /// Требования:
-    /// - `ptr` ДОЛЖЕН быть page-aligned (mmap гарантирует это)
-    /// - `len` ДОЛЖЕН быть кратен page size (иначе Metal вернёт ошибку)
-    /// - Вызывающий код ОБЯЗАН гарантировать, что mmap живёт дольше буфера
+    /// Requirements:
+    /// - `ptr` MUST be page-aligned (mmap guarantees this)
+    /// - `len` MUST be a multiple of the page size (otherwise Metal returns an error)
+    /// - The caller MUST guarantee that the mmap outlives the buffer
     pub fn new_buffer_no_copy(
         &self,
         ptr: *mut std::ffi::c_void,
@@ -919,8 +919,8 @@ impl MetalDevice {
             .new_buffer_no_copy(ptr, len, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
-        // Добавляем в residency set если установлен.
-        // Только крупные буферы (>= 1 MiB) — weight tensors, не промежуточные.
+        // Add to the residency set if one is installed.
+        // Only large buffers (>= 1 MiB) -- weight tensors, not intermediates.
         if let Ok(guard) = self.weight_residency.lock() {
             if let Some(ref rset) = *guard {
                 rset.add_buffer(&new_buffer);
@@ -957,13 +957,13 @@ impl MetalDevice {
     // Scratch arena API (T-269 Phase 2)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Создать scratch arena с заданными slot sizes.
+    /// Create a scratch arena with the given slot sizes.
     ///
-    /// `slot_sizes` — байтовые размеры каждого slot (обычно power-of-2,
-    /// из Phase 1 trace результатов).
+    /// `slot_sizes` -- byte sizes of each slot (usually power-of-two,
+    /// from Phase 1 trace results).
     ///
-    /// Арена выделяет все MTLBuffer'ы сразу при создании.
-    /// Возвращает `Arc<ScratchArena>` — готова к активации через
+    /// The arena allocates all MTLBuffers up front at creation.
+    /// Returns an `Arc<ScratchArena>` ready to be activated via
     /// `activate_scratch_arena`.
     pub fn create_scratch_arena(&self, slot_sizes: &[usize]) -> Result<Arc<ScratchArena>> {
         Ok(Arc::new(
@@ -975,10 +975,10 @@ impl MetalDevice {
     // UnifiedScratchArena API (T-269 Phase 3c)
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Создать UnifiedScratchArena (один большой MTLBuffer + bump allocator).
+    /// Create a UnifiedScratchArena (one big MTLBuffer + bump allocator).
     ///
-    /// `capacity` — суммарный размер в байтах (рекомендуется ~764 МБ для Qwen3.5-2B).
-    /// Выделяет один MTLBuffer при создании.
+    /// `capacity` -- total size in bytes (recommended ~764 MB for Qwen3.5-2B).
+    /// Allocates a single MTLBuffer at creation.
     pub fn create_unified_arena(
         &self,
         capacity: usize,
@@ -988,22 +988,22 @@ impl MetalDevice {
         ))
     }
 
-    /// Активировать unified arena для текущего потока.
+    /// Activate the unified arena for the current thread.
     ///
-    /// После активации `try_acquire_unified` можно использовать для offset dispatch.
-    /// Default off — нет влияния на `allocate_buffer` пока.
+    /// After activation `try_acquire_unified` can be used for offset dispatch.
+    /// Default off -- no effect on `allocate_buffer` until then.
     pub fn activate_unified_arena(&self, arena: Arc<UnifiedScratchArena>) {
         ACTIVE_UNIFIED_ARENA.with(|a| *a.borrow_mut() = Some(arena));
     }
 
-    /// Деактивировать unified arena для текущего потока.
+    /// Deactivate the unified arena for the current thread.
     pub fn deactivate_unified_arena(&self) {
         ACTIVE_UNIFIED_ARENA.with(|a| *a.borrow_mut() = None);
     }
 
-    /// Сбросить bump offset unified arena (после GPU fence).
+    /// Reset the unified arena bump offset (after a GPU fence).
     ///
-    /// ОБЯЗАТЕЛЕН вызов `wait_until_completed_fast()` ДО reset.
+    /// Calling `wait_until_completed_fast()` BEFORE reset is MANDATORY.
     pub fn reset_unified_arena(&self) {
         ACTIVE_UNIFIED_ARENA.with(|a| {
             if let Some(arena) = a.borrow().as_ref() {
@@ -1012,17 +1012,17 @@ impl MetalDevice {
         });
     }
 
-    /// Попробовать выделить из unified arena.
+    /// Try to allocate from the unified arena.
     ///
-    /// Возвращает `(Arc<Buffer>, offset_in_bytes)` при успехе.
-    /// Возвращает `None` если arena не активна или исчерпана.
+    /// Returns `(Arc<Buffer>, offset_in_bytes)` on success.
+    /// Returns `None` if the arena is inactive or exhausted.
     ///
-    /// # Использование
+    /// # Usage
     ///
     /// ```ignore
     /// if let Some(alloc) = device.try_acquire_unified(size) {
     ///     call_kernel(..., &alloc.buffer, alloc.offset_in_bytes);
-    ///     // buffer и offset передаются напрямую в encoder без создания отдельного MTLBuffer
+    ///     // buffer and offset are passed directly to the encoder without creating a separate MTLBuffer
     /// } else {
     ///     let buffer = device.allocate_buffer(size)?;
     ///     call_kernel(..., &buffer, 0);
@@ -1039,18 +1039,18 @@ impl MetalDevice {
         })
     }
 
-    /// Выделить из unified arena с возвратом `(Arc<Buffer>, offset)`.
+    /// Allocate from the unified arena, returning `(Arc<Buffer>, offset)`.
     ///
-    /// Если unified arena активна — bump allocate из неё.
-    /// Если arena не активна или исчерпана — fallback к `allocate_buffer(size)` с offset=0.
+    /// If the unified arena is active -- bump-allocate from it.
+    /// If the arena is inactive or exhausted -- fall back to `allocate_buffer(size)` with offset=0.
     ///
-    /// Результат используется для создания `MetalStorage::new_with_offset`.
+    /// The result is used to create `MetalStorage::new_with_offset`.
     ///
     /// # Safety
     ///
-    /// Caller обязан гарантировать GPU fence (`wait_until_completed_fast`) перед
-    /// следующим `reset_unified_arena()`. Иначе GPU может записывать в offset
-    /// одновременно с новым kernel на том же offset.
+    /// The caller must guarantee a GPU fence (`wait_until_completed_fast`) before
+    /// the next `reset_unified_arena()`. Otherwise the GPU may write to an offset
+    /// concurrently with a new kernel at the same offset.
     pub fn new_buffer_unified(
         &self,
         element_count: usize,
@@ -1058,36 +1058,36 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<(Arc<Buffer>, usize)> {
         let size = element_count * dtype.size_in_bytes();
-        // Пробуем unified arena first.
+        // Try the unified arena first.
         if let Some(alloc) = self.try_acquire_unified(size) {
             return Ok((alloc.buffer, alloc.offset_in_bytes));
         }
-        // Fallback: обычный pool, offset = 0.
+        // Fallback: regular pool, offset = 0.
         let buf = self.allocate_buffer(size)?;
         Ok((buf, 0))
     }
 
-    /// Активировать scratch arena для текущего потока.
+    /// Activate the scratch arena for the current thread.
     ///
-    /// После вызова `allocate_buffer` будет сначала пробовать взять slot
-    /// из arena (lock-free через Arc::strong_count). Если arena не имеет
-    /// подходящего свободного slot — fallback к обычному pool.
+    /// After the call `allocate_buffer` first tries to acquire a slot
+    /// from the arena (lock-free via Arc::strong_count). If the arena has no
+    /// suitable free slot -- it falls back to the regular pool.
     ///
-    /// Вызывать перед prefill loop. Парная деактивация —
-    /// `deactivate_scratch_arena()` — ОБЯЗАТЕЛЬНА после final GPU fence.
+    /// Call before the prefill loop. The paired deactivation --
+    /// `deactivate_scratch_arena()` -- is MANDATORY after the final GPU fence.
     pub fn activate_scratch_arena(&self, arena: Arc<ScratchArena>) {
         ACTIVE_ARENA.with(|a| *a.borrow_mut() = Some(arena));
     }
 
-    /// Деактивировать scratch arena для текущего потока.
+    /// Deactivate the scratch arena for the current thread.
     ///
-    /// После вызова `allocate_buffer` использует только обычный pool.
-    /// Вызывать ВСЕГДА после prefill loop (даже при панике — используй RAII guard).
+    /// After the call `allocate_buffer` uses only the regular pool.
+    /// Always call after the prefill loop (even on panic -- use an RAII guard).
     pub fn deactivate_scratch_arena(&self) {
         ACTIVE_ARENA.with(|a| *a.borrow_mut() = None);
     }
 
-    /// Получить текущую активную scratch arena (для диагностики).
+    /// Get the currently active scratch arena (for diagnostics).
     pub fn active_scratch_arena(&self) -> Option<Arc<ScratchArena>> {
         ACTIVE_ARENA.with(|a| a.borrow().clone())
     }
@@ -1095,16 +1095,16 @@ impl MetalDevice {
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
         // ─── SCRATCH ARENA FAST PATH (T-269 Phase 2) ───────────────────
-        // Проверяем arena ДО pool lock. Lock-free: только атомарный
-        // strong_count check внутри try_acquire.
-        // Default off: ACTIVE_ARENA содержит None → бесплатный borrow().
+        // Check the arena BEFORE the pool lock. Lock-free: only an atomic
+        // strong_count check inside try_acquire.
+        // Default off: ACTIVE_ARENA holds None -> a free borrow().
         //
-        // SKIP_ARENA_NEXT: если установлен — пропускаем arena для этой аллокации.
-        // Используется для исключения long-lived buffers (KV cache) из arena.
+        // SKIP_ARENA_NEXT: if set -- skip the arena for this allocation.
+        // Used to exclude long-lived buffers (KV cache) from the arena.
         let skip_arena = SKIP_ARENA_NEXT.with(|s| {
             let v = s.get();
             if v {
-                s.set(false); // одноразовый флаг
+                s.set(false); // one-shot flag
             }
             v
         });
@@ -1114,8 +1114,8 @@ impl MetalDevice {
                     .as_ref()
                     .and_then(|arena| arena.try_acquire(size))
             }) {
-                // Arena hit: записываем в trace как from_pool=false
-                // чтобы Phase 1/2 trace мог различать arena vs pool vs new.
+                // Arena hit: record in the trace as from_pool=false
+                // so Phase 1/2 trace can distinguish arena vs pool vs new.
                 if allocation_trace_active() {
                     record_trace(size, buf.length(), false);
                 }
@@ -1124,7 +1124,7 @@ impl MetalDevice {
         }
         // ─── EXISTING POOL PATH (unchanged) ─────────────────────────────
 
-        // Проверяем trace один раз — нет branch misprediction в hot path когда off.
+        // Check tracing once -- no branch misprediction in the hot path when off.
         let trace_on = allocation_trace_active();
 
         let completed_command_buffer_id = if self.completion_aware_pool {

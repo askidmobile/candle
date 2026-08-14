@@ -210,9 +210,9 @@ impl DecoderLayer {
         // Decide whether to use MoE or regular MLP based on layer_idx and decoder_sparse_step
         let feed_forward =
             if cfg.num_experts > 0 && (layer_idx + 1).is_multiple_of(cfg.decoder_sparse_step) {
-                // Naive MoE loop (matmul per expert) — работает на любом backend
-                // (cuda/metal/cpu). FusedMoE (dense FFI) удалён: libmoe.a не собирается
-                // под dynamic-loading. Для quantized GGUF MoE см. FusedMoeGGUF (PTX-путь).
+                // Naive MoE loop (matmul per expert) -- works on any backend
+                // (cuda/metal/cpu). FusedMoE (dense FFI) is removed: libmoe.a is not built
+                // under dynamic-loading. For quantized GGUF MoE see FusedMoeGGUF (PTX path).
                 Qwen3FeedForward::NaiveMoE(Qwen3SparseMoeBlock::new(cfg, vb.pp("mlp"))?)
             } else {
                 Qwen3FeedForward::Mlp(Qwen3MLP::new(&cfg.into(), vb.pp("mlp"))?)

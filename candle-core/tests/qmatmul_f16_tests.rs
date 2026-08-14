@@ -1,11 +1,11 @@
-//! Numerical correctness тесты F16 input vs F32 input для Metal QMatMul.
+//! Numerical correctness tests of F16 input vs F32 input for Metal QMatMul.
 //!
-//! Покрывает Phase 1-3 плана F16 QMatMul Metal kernel:
+//! Covers Phase 1-3 of the F16 QMatMul Metal kernel plan:
 //! - mm path (prefill, m>1) — kernel_mul_mm template T_input
 //! - mv path (decode, m=1) — kernel_mul_mv_q* template impl
 //!
-//! Тест запускается только под `--features metal` на Apple Silicon.
-//! diff threshold = 1e-2 — соответствует F16 precision (mantissa 11 bit).
+//! The test runs only under `--features metal` on Apple Silicon.
+//! diff threshold = 1e-2 -- matches F16 precision (11-bit mantissa).
 
 #![cfg(feature = "metal")]
 
@@ -23,7 +23,7 @@ fn run_f16_vs_f32_qmatmul(
 ) -> Result<f32> {
     let device = Device::new_metal(0)?;
 
-    // Random weight (n, k) и random input (m, k).
+    // Random weight (n, k) and random input (m, k).
     let weight = Tensor::randn(0f32, 1f32, (n, k), &device)?;
     let input = Tensor::randn(0f32, 1f32, (m, k), &device)?;
 
@@ -38,8 +38,8 @@ fn run_f16_vs_f32_qmatmul(
     let input_f16 = input.to_dtype(DType::F16)?;
     let out_f16 = qmm.forward(&input_f16)?;
 
-    // Output обоих kernel — F32 (kernel пишет float dst).
-    // Считаем max abs diff.
+    // Output of both kernels is F32 (the kernel writes a float dst).
+    // Compute the max abs diff.
     let out_f32 = out_f32.flatten_all()?.to_vec1::<f32>()?;
     let out_f16 = out_f16.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
 
@@ -50,9 +50,9 @@ fn run_f16_vs_f32_qmatmul(
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
 
-    // RMS значения F32 output — используем как scale для нормализации diff'а.
-    // Это устраняет ложные срабатывания, когда отдельные элементы output
-    // близки к нулю (relative diff к 1e-3 даёт неинформативный 0.7+).
+    // RMS of the F32 output -- used as a scale to normalize the diff.
+    // This removes false positives when individual output elements
+    // are close to zero (relative diff vs 1e-3 yields an uninformative 0.7+).
     let out_rms = (out_f32.iter().map(|v| v * v).sum::<f32>() / out_f32.len() as f32).sqrt();
 
     let rel_to_rms = max_abs_diff / out_rms.max(1e-6);
@@ -62,8 +62,8 @@ fn run_f16_vs_f32_qmatmul(
     );
 
     // F16 mantissa = 11 bit → ~5e-4 relative precision per element.
-    // Накопление через k элементов: noise ~ sqrt(k) * eps на result element.
-    // Допуск к RMS output — порядка 1% (k=128) до 5% (k=512).
+    // Accumulation over k elements: noise ~ sqrt(k) * eps per result element.
+    // Tolerance vs RMS output -- about 1% (k=128) up to 5% (k=512).
     assert!(
         rel_to_rms < 5e-2,
         "F16 vs F32 qmatmul rel-to-RMS diff {rel_to_rms} exceeds 5% threshold \
@@ -80,21 +80,21 @@ fn qmatmul_f16_q4_0_mv() -> Result<()> {
     Ok(())
 }
 
-// mv path (m=1) — Q8_0 — отдельный non-template impl.
+// mv path (m=1) -- Q8_0 -- a separate non-template impl.
 #[test]
 fn qmatmul_f16_q8_0_mv() -> Result<()> {
     run_f16_vs_f32_qmatmul(GgmlDType::Q8_0, 64, 128, 1)?;
     Ok(())
 }
 
-// mv path (m=1) — Q4_K — K-quants отдельный impl, block_size=256.
+// mv path (m=1) -- Q4_K -- K-quants separate impl, block_size=256.
 #[test]
 fn qmatmul_f16_q4_k_mv() -> Result<()> {
     run_f16_vs_f32_qmatmul(GgmlDType::Q4K, 64, 512, 1)?;
     Ok(())
 }
 
-// mv path — Q6_K (полный test K-quants).
+// mv path -- Q6_K (full K-quants test).
 #[test]
 fn qmatmul_f16_q6_k_mv() -> Result<()> {
     run_f16_vs_f32_qmatmul(GgmlDType::Q6K, 64, 512, 1)?;
@@ -102,7 +102,7 @@ fn qmatmul_f16_q6_k_mv() -> Result<()> {
 }
 
 // mm path (m>1) — prefill, kernel_mul_mm template.
-// Размеры выбраны так, чтобы попасть в mm-вариант (m=64 > 1, BLOCK_SIZE_M=64).
+// Sizes chosen to hit the mm-variant (m=64 > 1, BLOCK_SIZE_M=64).
 #[test]
 fn qmatmul_f16_q4_0_mm() -> Result<()> {
     run_f16_vs_f32_qmatmul(GgmlDType::Q4_0, 64, 128, 64)?;
@@ -115,11 +115,11 @@ fn qmatmul_f16_q4_k_mm() -> Result<()> {
     Ok(())
 }
 
-// === Quantization quality (RMSE) — порт make_qkx2_quants ===
+// === Quantization quality (RMSE) -- port of make_qkx2_quants ===
 //
-// Эти тесты сравнивают качество candle quantize на random F32 weights с
-// llama.cpp reference. Метрика: nRMSE = RMSE(x, dequant(quant(x))) / RMS(x).
-// Threshold выбраны так, чтобы соответствовать ожидаемой точности типа.
+// These tests compare candle quantize quality on random F32 weights with
+// the llama.cpp reference. Metric: nRMSE = RMSE(x, dequant(quant(x))) / RMS(x).
+// Thresholds are chosen to match the expected precision of the type.
 fn quantize_dequantize_nrmse(dtype: GgmlDType, n: usize, k: usize) -> Result<f32> {
     let device = Device::Cpu;
     let weight = Tensor::randn(0f32, 1f32, (n, k), &device)?;
@@ -137,14 +137,14 @@ fn quantize_dequantize_nrmse(dtype: GgmlDType, n: usize, k: usize) -> Result<f32
     Ok(mse.sqrt() / rms.max(1e-9))
 }
 
-// Threshold'ы соответствуют llama.cpp ref на random Gaussian (это baseline точности
-// самих типов; преимущества make_qkx2_quants vs qkx1 видны на реальных weights с
-// long-tail outliers — там grid search действительно помогает).
+// Thresholds match the llama.cpp ref on random Gaussian (this is the baseline precision
+// of the types themselves; the advantage of make_qkx2_quants vs qkx1 shows on real weights with
+// long-tail outliers -- there the grid search really helps).
 #[test]
 fn quantize_quality_q4_k() -> Result<()> {
     let nrmse = quantize_dequantize_nrmse(GgmlDType::Q4K, 64, 512)?;
     println!("Q4_K nRMSE = {nrmse:.5}");
-    assert!(nrmse < 0.10, "Q4_K nRMSE {nrmse} превышает 0.10");
+    assert!(nrmse < 0.10, "Q4_K nRMSE {nrmse} exceeds 0.10");
     Ok(())
 }
 
@@ -152,7 +152,7 @@ fn quantize_quality_q4_k() -> Result<()> {
 fn quantize_quality_q5_k() -> Result<()> {
     let nrmse = quantize_dequantize_nrmse(GgmlDType::Q5K, 64, 512)?;
     println!("Q5_K nRMSE = {nrmse:.5}");
-    assert!(nrmse < 0.05, "Q5_K nRMSE {nrmse} превышает 0.05");
+    assert!(nrmse < 0.05, "Q5_K nRMSE {nrmse} exceeds 0.05");
     Ok(())
 }
 
@@ -160,9 +160,9 @@ fn quantize_quality_q5_k() -> Result<()> {
 fn quantize_quality_q2_k() -> Result<()> {
     let nrmse = quantize_dequantize_nrmse(GgmlDType::Q2K, 64, 512)?;
     println!("Q2_K nRMSE = {nrmse:.5}");
-    // Q2_K на random Gaussian обычно даёт nRMSE 0.25-0.35 (агрессивная 2-bit
-    // квантизация, без выраженных outliers где qkx2 grid search помогает).
-    assert!(nrmse < 0.40, "Q2_K nRMSE {nrmse} превышает 0.40");
+    // Q2_K on random Gaussian usually yields nRMSE 0.25-0.35 (aggressive 2-bit
+    // quantization, no pronounced outliers where qkx2 grid search helps).
+    assert!(nrmse < 0.40, "Q2_K nRMSE {nrmse} exceeds 0.40");
     Ok(())
 }
 
@@ -170,6 +170,6 @@ fn quantize_quality_q2_k() -> Result<()> {
 fn quantize_quality_q4_0() -> Result<()> {
     let nrmse = quantize_dequantize_nrmse(GgmlDType::Q4_0, 64, 512)?;
     println!("Q4_0 nRMSE = {nrmse:.5}");
-    assert!(nrmse < 0.10, "Q4_0 nRMSE {nrmse} превышает 0.10");
+    assert!(nrmse < 0.10, "Q4_0 nRMSE {nrmse} exceeds 0.10");
     Ok(())
 }

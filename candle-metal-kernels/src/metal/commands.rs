@@ -17,8 +17,8 @@ pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
 
-// Fork-compat: graph scope limit stubs (upstream использует single-state без pool).
-// Возвращают no-op значения; реальная semатика была в нашей pool-архитектуре.
+// Fork-compat: graph scope limit stubs (upstream uses single-state without a pool).
+// They return no-op values; the real semantics lived in our pool architecture.
 static GRAPH_SCOPE_LIMIT: AtomicUsize = AtomicUsize::new(0);
 pub fn set_graph_scope_limit(limit: usize) {
     GRAPH_SCOPE_LIMIT.store(limit, Ordering::Relaxed);
@@ -303,7 +303,7 @@ impl Commands {
     }
 
     /// Fast sync (fork-compat alias) — single-CB wait, skips empty entries.
-    /// Upstream архитектура имеет single state, поэтому эквивалент `flush_and_wait_current`.
+    /// Upstream architecture has a single state, so this is equivalent to `flush_and_wait_current`.
     pub fn flush_and_wait_fast(&self) -> Result<(), MetalKernelError> {
         self.flush_and_wait_current()
     }
@@ -319,14 +319,14 @@ impl Commands {
         ))
     }
 
-    /// Sync timing stats (fork-compat stub) — upstream не собирает per-sync тайминги.
+    /// Sync timing stats (fork-compat stub) -- upstream does not collect per-sync timings.
     /// Returns: (count=0, 0, 0, 0, 0, 0).
     pub fn take_sync_timings() -> (u64, u64, u64, u64, u64, u64) {
         (0, 0, 0, 0, 0, 0)
     }
 
-    /// Completed command buffer id (fork-compat stub) — upstream single-state не отслеживает id.
-    /// Возвращает 0 (completion-aware pool fork-фича отключена на upstream архитектуре).
+    /// Completed command buffer id (fork-compat stub) -- upstream single-state does not track ids.
+    /// Returns 0 (the completion-aware pool fork feature is disabled on the upstream architecture).
     pub fn completed_command_buffer_id(&self) -> u64 {
         0
     }

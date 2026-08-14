@@ -8,11 +8,11 @@ pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
     buffer: Arc<Buffer>,
-    /// Смещение в байтах от начала буфера до данных этого тензора.
-    /// Для обычных буферов (per-tensor) = 0.
-    /// Для shared NoCopy буфера (mmap zero-copy) = смещение тензора в файле.
+    /// Byte offset from the start of the buffer to this tensor's data.
+    /// For regular (per-tensor) buffers it is 0.
+    /// For a shared NoCopy buffer (mmap zero-copy) it is the tensor's offset in the file.
     offset: usize,
-    /// Размер данных тензора в байтах. None = весь буфер (обратная совместимость).
+    /// Data size of the tensor in bytes. None = the whole buffer (back-compat).
     tensor_size: Option<usize>,
 }
 
@@ -45,24 +45,24 @@ impl QMetalStorage {
         &self.buffer
     }
 
-    /// Смещение в байтах от начала буфера до данных этого тензора.
+    /// Byte offset from the start of the buffer to this tensor's data.
     pub fn offset(&self) -> usize {
         self.offset
     }
 
-    /// Native F16 dequantization на GPU без промежуточного F32 буфера.
-    /// ×2 экономия памяти на embed_tokens, output projection и других больших
-    /// квантованных весах. Использует Metal kernel `kernel_dequantize_*_f16`
-    /// (см. candle-metal-kernels/src/metal_src/quantized.metal).
+    /// Native F16 dequantization on the GPU without an intermediate F32 buffer.
+    /// 2x memory savings on embed_tokens, output projection and other large
+    /// quantized weights. Uses the Metal kernel `kernel_dequantize_*_f16`
+    /// (see candle-metal-kernels/src/metal_src/quantized.metal).
     ///
-    /// Для F16/F32/BF16 (не квантованных) тензоров делает обычный F32 dequantize
-    /// → to_dtype(F16) fallback (kernel поддерживает только Q-типы).
+    /// For F16/F32/BF16 (non-quantized) tensors it does a regular F32 dequantize
+    /// -> to_dtype(F16) fallback (the kernel supports only Q-types).
     pub fn dequantize_f16(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::backend::BackendStorage;
         use crate::MetalError;
 
-        // Fallback для не-квантованных типов (F16/F32/BF16): kernel не поддерживает,
-        // но семантика та же — просто dequantize + cast в F16.
+        // Fallback for non-quantized types (F16/F32/BF16): the kernel does not support them,
+        // but the semantics are the same -- just dequantize + cast to F16.
         if matches!(
             self.dtype,
             GgmlDType::F16 | GgmlDType::F32 | GgmlDType::BF16
@@ -444,14 +444,14 @@ impl QMetalStorage {
             )
         }
 
-        // Yttri 2026-05-06: enable mm-path для Q4K/Q6K (Q4_K_M основной dtype
-        // Qwen3.5-2B + Q6K embedding) — даёт ~8x ускорение prefill (2048
-        // vector matmul → 1 matrix matmul). Соответствующие kernels
-        // `kernel_mul_mm_q{4,6}_K_f{32,16}` определены в quantized.metal.
+        // Yttri 2026-05-06: enable the mm-path for Q4K/Q6K (Q4_K_M is the main dtype of
+        // Qwen3.5-2B + Q6K embedding) -- it gives ~8x prefill speedup (2048
+        // vector matmul -> 1 matrix matmul). The corresponding kernels
+        // `kernel_mul_mm_q{4,6}_K_f{32,16}` are defined in quantized.metal.
         //
-        // Остальные K-кванты (Q2/Q3/Q5/Q8) и IQ-кванты пока ходят через
-        // fwd_mv: либо нет mm-kernel, либо есть alignment-issues. Если
-        // появятся новые dtype'ы у Yttri-моделей — расширить список.
+        // The remaining K-quants (Q2/Q3/Q5/Q8) and IQ-quants still go through
+        // fwd_mv: either there is no mm-kernel, or there are alignment issues. If
+        // new dtypes appear in Yttri models -- extend this list.
         if matches!(
             self.dtype,
             GgmlDType::Q2K
@@ -602,11 +602,11 @@ pub fn load_quantized_bytes(
     }))
 }
 
-/// Создаёт QStorage из shared NoCopy Metal-буфера (zero-copy mmap).
+/// Creates a QStorage from a shared NoCopy Metal buffer (zero-copy mmap).
 ///
-/// Вместо копирования данных в отдельный Metal buffer, ссылается на часть
-/// общего буфера через offset. Размер буфера = весь файл, offset указывает
-/// на начало данных конкретного тензора.
+/// Instead of copying data into a separate Metal buffer, it references a slice
+/// of the shared buffer via an offset. The buffer size is the whole file; the offset points
+/// to the start of the specific tensor's data.
 pub fn load_quantized_from_shared_buffer(
     device: &MetalDevice,
     shared_buffer: Arc<Buffer>,

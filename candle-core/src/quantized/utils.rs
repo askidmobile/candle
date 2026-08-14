@@ -284,22 +284,22 @@ pub(super) fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32) 
     (scale, -min)
 }
 
-/// Порт `make_qkx2_quants` из llama.cpp ggml-quants.c (улучшенный k-quant scale finder
-/// с grid search по nstep шагам и weighted error metric).
+/// Port of `make_qkx2_quants` from llama.cpp ggml-quants.c (an improved k-quant scale finder
+/// with a grid search over nstep steps and a weighted error metric).
 ///
-/// Это **рекомендуемый** алгоритм для Q2_K/Q4_K/Q5_K вместо более простого
-/// `make_qkx1_quants` — даёт измеримо меньше квантизационной ошибки на больших
-/// matmul layers. См. llama.cpp commit history для деталей.
+/// This is the **recommended** algorithm for Q2_K/Q4_K/Q5_K over the simpler
+/// `make_qkx1_quants` -- it yields measurably less quantization error on large
+/// matmul layers. See the llama.cpp commit history for details.
 ///
-/// Параметры:
-/// - `nmax` — максимальное значение квантованного индекса (15 для Q4, 31 для Q5, 3 для Q2)
-/// - `weights` — importance weights per element (для Q2_K = abs(x); для Q4_K/Q5_K
-///   обычно `weights[l] = sqrt(sigma2 + x[l]^2)` если imatrix недоступна)
-/// - `rmin`, `rdelta`, `nstep` — параметры grid search (типичные: -1.0, 0.1, 20)
-/// - `use_mad` — использовать |error| вместо error² (true для Q2_K, false для Q4_K/Q5_K)
+/// Parameters:
+/// - `nmax` -- maximum value of the quantized index (15 for Q4, 31 for Q5, 3 for Q2)
+/// - `weights` -- importance weights per element (for Q2_K = abs(x); for Q4_K/Q5_K
+///   typically `weights[l] = sqrt(sigma2 + x[l]^2)` if no imatrix is available)
+/// - `rmin`, `rdelta`, `nstep` -- grid search parameters (typical: -1.0, 0.1, 20)
+/// - `use_mad` -- use |error| instead of error^2 (true for Q2_K, false for Q4_K/Q5_K)
 ///
-/// Возвращает `(scale, the_min)` где `the_min = -min` (положительная величина offset).
-/// Заполняет `L` оптимальными квантованными индексами.
+/// Returns `(scale, the_min)` where `the_min = -min` (a positive offset magnitude).
+/// Fills `L` with the optimal quantized indices.
 pub(super) fn make_qkx2_quants(
     nmax: i32,
     x: &[f32],
@@ -329,7 +329,7 @@ pub(super) fn make_qkx2_quants(
         sum_w += w;
         sum_x += w * x[i];
     }
-    let _ = sum_x; // используется в реализации llama.cpp для unweighted statistics
+    let _ = sum_x; // used in the llama.cpp impl for unweighted statistics
     if min > 0.0 {
         min = 0.0;
     }
@@ -343,7 +343,7 @@ pub(super) fn make_qkx2_quants(
     let iscale = nmax as f32 / (max - min);
     let mut scale = 1.0 / iscale;
 
-    // Initial pass — пишем в l_out начальную аппроксимацию + считаем initial error.
+    // Initial pass -- write an initial approximation into l_out + compute the initial error.
     let mut best_error = 0.0f32;
     for i in 0..n {
         let li = nearest_int(iscale * (x[i] - min)).clamp(0, nmax) as u8;

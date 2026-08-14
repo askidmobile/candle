@@ -6,7 +6,7 @@ use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 pub struct MetalDevice;
 
 impl MetalDevice {
-    /// No-op stub for non-macOS platforms (Metal не поддерживается).
+    /// No-op stub for non-macOS platforms (Metal is not supported).
     pub fn flush_buffers(&self) -> Result<()> {
         Err(Error::NotCompiledWithMetalSupport)
     }

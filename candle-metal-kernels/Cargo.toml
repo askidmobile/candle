@@ -25,11 +25,11 @@ once_cell = "1.21"
 thiserror = "2"
 tracing = "0.1.41"
 
-# Apple-only deps: всё содержимое crate'а — Metal-bindings, поэтому src/lib.rs
-# guard'ится #![cfg(target_os = "macos")]. Эти deps вынесены под target-cond
-# чтобы не тянуть objc2/block2 в dep-graph Linux/Windows builds (даже если
-# выше кто-то активировал feature, на не-macOS crate empty и линки на эти
-# крейты не нужны).
+# Apple-only deps: the whole crate is Metal-bindings, so src/lib.rs
+# is guarded by #![cfg(target_os = "macos")]. These deps are moved under target-cond
+# so objc2/block2 are not pulled into the dep-graph of Linux/Windows builds (even if
+# a feature is activated upstream; on non-macOS the crate is empty and links to these
+# crates are not needed).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-metal = { version = "0.3.2", features = ["block2"] }
 block2 = { version = ">=0.6.1, <0.8.0", features = ["alloc"], default-features = false }

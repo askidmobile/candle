@@ -148,9 +148,9 @@ pub fn call_quantized_matmul_mv_t(
         height: nth1,
         depth: 1,
     };
-    // F16 input variants пока поддержаны только для базовых Q-типов
-    // (Phase 1-2 плана). IQ кванты, Q8_1, Q8K, F32/F16/BF16 weights —
-    // F32 input only (Phase 7 опц.).
+    // F16 input variants are supported only for the basic Q-types
+    // (Phase 1-2 of the plan). IQ quants, Q8_1, Q8K, F32/F16/BF16 weights --
+    // F32 input only (Phase 7 opt.).
     let name: &str = if input_is_f16 {
         match dtype {
             GgmlDType::Q4_0 => "kernel_mul_mv_q4_0_f16",
@@ -242,7 +242,7 @@ pub fn call_quantized_matmul_mv_t(
             | GgmlDType::IQ4XS
             | GgmlDType::IQ1M
     ) {
-    encoder.set_threadgroup_memory_length(0, 16384); // 12KB для MPP, 8KB для legacy
+    encoder.set_threadgroup_memory_length(0, 16384); // 12KB for MPP, 8KB for legacy
     }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
@@ -299,8 +299,8 @@ pub fn call_quantized_matmul_mm_t(
         height: 1,
         depth: 1,
     };
-    // Проверка alignment для fast-path kernel (без bounds checking).
-    // Fast-path variants доступны для Q4K и Q6K когда M%64==0 и N%32==0.
+    // Alignment check for the fast-path kernel (without bounds checking).
+    // Fast-path variants are available for Q4K and Q6K when M%64==0 and N%32==0.
     let use_fast_path = matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K)
         && (ne01 % 64 == 0)
         && (ne11 % 32 == 0);
@@ -366,10 +366,10 @@ pub fn call_quantized_matmul_mm_t(
         }
     };
 
-    // MPP kernel — только на M5+/A19+ (на M4 не даёт ускорения, см. llama.cpp device.m)
+    // MPP kernel -- only on M5+/A19+ (no speedup on M4, see llama.cpp device.m)
     // llama.cpp benchmark: M2 Ultra +5% slower, M4/M4 Max no significant difference.
-    // Причина: hardware tensor-ускорение только с M5/A19.
-    let try_mpp = false; // отключено до M5 — см. GGML_METAL_TENSOR_ENABLE
+    // Reason: hardware tensor acceleration only with M5/A19.
+    let try_mpp = false; // disabled until M5 -- see GGML_METAL_TENSOR_ENABLE
     // input_is_f16 && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K);
     let (pipeline, is_mpp) = if try_mpp {
         let mpp_name = match dtype {
@@ -456,7 +456,7 @@ pub fn call_quantized_get_rows(
         GgmlDType::Q6K => "kernel_get_rows_q6_K",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
-        // IQ* variants unsupported on Metal (T-283: wildcard для новых GGML dtypes)
+        // IQ* variants unsupported on Metal (T-283: wildcard for new GGML dtypes)
         GgmlDType::IQ2XXS
         | GgmlDType::IQ2XS
         | GgmlDType::IQ3XXS
@@ -515,19 +515,19 @@ fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
 
-/// T-275 Phase 3: dispatch для optimized Q4_K_M + F32 input matmul kernel.
+/// T-275 Phase 3: dispatch for the optimized Q4_K_M + F32 input matmul kernel.
 ///
-/// Использует `kernel_mul_mm_q4_K_f32_opt` с дополнительным `scales_repacked`
-/// buffer (16 f16 per Q4_K block, layout V1 от `Q4KOptMetadata`).
+/// Uses `kernel_mul_mm_q4_K_f32_opt` with an additional `scales_repacked`
+/// buffer (16 f16 per Q4_K block, layout V1 from `Q4KOptMetadata`).
 ///
-/// Предусловия (вызывающий код должен гарантировать):
-/// - `dtype == GgmlDType::Q4K` — kernel specialized только для Q4_K_M
-/// - Input dtype = F32 — kernel specialized для F32 activations (НЕ F16)
-/// - `ne01 % 64 == 0 && ne11 % 32 == 0` — FAST_PATH alignment требование
-/// - `scales_repacked` содержит `Q4KOptMetadata.data` upload'нутый в Metal buffer
-///   с источником из того же `src0` Q4_K_M tensor (identity guard на стороне caller'а)
+/// Preconditions (the caller must guarantee):
+/// - `dtype == GgmlDType::Q4k` -- the kernel is specialized only for Q4_K_M
+/// - Input dtype = F32 -- the kernel is specialized for F32 activations (NOT F16)
+/// - `ne01 % 64 == 0 && ne11 % 32 == 0` -- FAST_PATH alignment requirement
+/// - `scales_repacked` contains `Q4KOptMetadata.data` uploaded to a Metal buffer
+///   sourced from the same `src0` Q4_K_M tensor (identity guard on the caller side)
 ///
-/// При нарушении предусловий — caller должен fall back на `call_quantized_matmul_mm_t`.
+/// On precondition violation -- the caller must fall back to `call_quantized_matmul_mm_t`.
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mm_q4k_opt(
     device: &Device,
@@ -546,7 +546,7 @@ pub fn call_quantized_matmul_mm_q4k_opt(
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    // Identical layout extraction что и в `call_quantized_matmul_mm_t`.
+    // Identical layout extraction as in `call_quantized_matmul_mm_t`.
     let ne00 = src0_shape[src0_shape.len() - 1] as i64;
     let ne01 = src0_shape[src0_shape.len() - 2] as i64;
     let ne02 = src0_shape[src0_shape.len() - 3] as i64;
@@ -570,8 +570,8 @@ pub fn call_quantized_matmul_mm_q4k_opt(
     let r2 = (ne12 / ne02) as u32;
     let r3 = (ne13 / ne03) as u32;
 
-    // Sanity check FAST_PATH alignment. Caller должен это проверить заранее, но
-    // дублируем как defensive check на случай wrong dispatch.
+    // Sanity check FAST_PATH alignment. The caller should check this beforehand,
+    // but we duplicate it as a defensive check against a wrong dispatch.
     if ne01 % 64 != 0 || ne11 % 32 != 0 {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
             "kernel_mul_mm_q4_K_f32_opt requires ne01%64==0 && ne11%32==0",
@@ -597,9 +597,9 @@ pub fn call_quantized_matmul_mm_q4k_opt(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Параметры в порядке, заданном в kernel_mul_mm_q4_K_f32_opt signature
-    // (см. quantized.metal). scales_repacked идёт ВТОРЫМ buffer (buffer(1)),
-    // остальные сдвинуты на +1 относительно vanilla kernel_mul_mm.
+    // Parameters in the order defined by the kernel_mul_mm_q4_K_f32_opt signature
+    // (see quantized.metal). scales_repacked is the SECOND buffer (buffer(1)),
+    // the rest are shifted by +1 relative to the vanilla kernel_mul_mm.
     set_params!(
         encoder,
         (
@@ -630,14 +630,14 @@ pub fn call_quantized_matmul_mm_q4k_opt(
     Ok(())
 }
 
-/// T-278 Phase 0: bridge для kernel_mul_mm_q4_K_f32_v3.
+/// T-278 Phase 0: bridge for kernel_mul_mm_q4_K_f32_v3.
 ///
-/// SKELETON STATE: функционально идентичен `call_quantized_matmul_mm_q4k_opt`,
-/// единственное отличие — pipeline state name. Будет переписан в Фазе 1 когда
-/// `kernel_mul_mm_q4_K_f32_v3` получит threadgroup tile cache.
+/// SKELETON STATE: functionally identical to `call_quantized_matmul_mm_q4k_opt`,
+/// the only difference is the pipeline state name. It will be rewritten in Phase 1 when
+/// `kernel_mul_mm_q4_K_f32_v3` gets threadgroup tile cache.
 ///
-/// Predicate / contract — точно те же что у `call_quantized_matmul_mm_q4k_opt`:
-/// - Q4_K_M weights с pre-packed `scales_repacked` metadata
+/// Predicate / contract -- exactly the same as `call_quantized_matmul_mm_q4k_opt`:
+/// - Q4_K_M weights with pre-packed `scales_repacked` metadata
 /// - F32 activations
 /// - FAST_PATH alignment: `ne01 % 64 == 0 && ne11 % 32 == 0`
 #[allow(clippy::too_many_arguments)]
@@ -736,14 +736,14 @@ pub fn call_quantized_matmul_mm_q4k_v3(
     Ok(())
 }
 
-/// T-280 Level 3: bridge для kernel_mul_mm_q4_K_f32_v4.
+/// T-280 Level 3: bridge for kernel_mul_mm_q4_K_f32_v4.
 ///
-/// Full half pipeline kernel: ma+mb+mc all half. Bypasses F32 Limiter (92.28%
-/// в V3 measurement) через half mc accumulator. См. T-280 spec для подробного
+/// Full half pipeline kernel: ma+mb+mc all half. Bypasses the F32 limiter (92.28%
+/// in the V3 measurement) via a half mc accumulator. See the T-280 spec for detailed
 /// rationale + risk model (lossy fp16 accumulation).
 ///
-/// Predicate / contract — те же что V3 / `_opt`:
-/// - Q4_K_M weights с pre-packed `scales_repacked` metadata
+/// Predicate / contract -- the same as V3 / `_opt`:
+/// - Q4_K_M weights with pre-packed `scales_repacked` metadata
 /// - F32 activations
 /// - FAST_PATH alignment: `ne01 % 64 == 0 && ne11 % 32 == 0`
 #[allow(clippy::too_many_arguments)]
@@ -842,11 +842,11 @@ pub fn call_quantized_matmul_mm_q4k_v4(
     Ok(())
 }
 
-/// Полная дequantization квантованного буфера в F16 (half) на GPU.
+/// Full dequantization of a quantized buffer to F16 (half) on the GPU.
 ///
-/// Используется при `CANDLE_DEQUANTIZE_ALL_F16=1` для материализации весов в F16
-/// без промежуточной F32-копии. Каждый поток обрабатывает один блок из 16 элементов
-/// (один half4x4). Размер `dst` буфера должен быть `elem_count * 2` байт.
+/// Used with `CANDLE_DEQUANTIZE_ALL_F16=1` to materialize weights as F16
+/// without an intermediate F32 copy. Each thread processes one block of 16 elements
+/// (one half4x4). The `dst` buffer size must be `elem_count * 2` bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn call_dequantize_q_to_half(
     device: &Device,
@@ -903,7 +903,7 @@ pub fn call_dequantize_q_to_half(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Каждый поток обрабатывает 16 элементов (одну half4x4 структуру).
+    // Each thread processes 16 elements (one half4x4 structure).
     let total_threads = elem_count.div_ceil(16);
     let threads_per_tg = 64usize;
     let tg_count = total_threads.div_ceil(threads_per_tg);

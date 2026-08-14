@@ -600,7 +600,7 @@ impl QCudaStorage {
         ids: &CudaStorage, //[batch, topk]
         ids_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        // Shape validation (раньше это был assert, что падало process-level).
+        // Shape validation (was an assert that crashed the process).
         let in_dims = input_l.shape().dims();
         if in_dims.len() != 3 {
             crate::bail!(
@@ -721,8 +721,8 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
-            // T-283: IQ-types added в candle-fork для polish, CUDA dequant
-            // ещё не реализован — fallback через bail.
+            // T-283: IQ-types added in candle-fork for polish, CUDA dequant
+            // not yet implemented -- fallback via bail.
             _ => crate::bail!("unsupported dtype for cuda dequantize: {:?}", self.dtype),
         }
 

@@ -1143,19 +1143,19 @@ impl candle::CustomOp3 for Sdpa {
         "metal-sdpa"
     }
 
-    /// CPU реализация SDPA (T-286).
+    /// CPU implementation of SDPA (T-286).
     ///
-    /// Поддерживает:
-    /// - mask=None (наиболее частый случай: Yttri quantized_qwen35, RustASR
+    /// Supports:
+    /// - mask=None (most common case: Yttri quantized_qwen35, RustASR
     ///   Qwen3-ASR encoder, gigaam conformer).
     /// - do_causal=false/true.
-    /// - softcapping (любое значение, включая 1.0 — без эффекта).
-    /// - GQA: n_q_heads = group_size × n_kv_heads.
-    /// - F32 / F16 / BF16 dtypes (compute в F32, output в input dtype).
+    /// - softcapping (any value, including 1.0 -- no effect).
+    /// - GQA: n_q_heads = group_size x n_kv_heads.
+    /// - F32 / F16 / BF16 dtypes (compute in F32, output in the input dtype).
     ///
-    /// НЕ поддерживает: mask=Some (z_image transformer use case, не Yttri/RustASR).
+    /// Does NOT support: mask=Some (z_image transformer use case, not Yttri/RustASR).
     /// Performance: O(b * n_q * q_seq * k_seq * (head_k + head_v)). Parallelism
-    /// через rayon par_iter по (batch, head, q_seq) pairs.
+    /// via rayon par_iter over (batch, head, q_seq) pairs.
     fn cpu_fwd(
         &self,
         s_q: &CpuStorage,
@@ -1276,7 +1276,7 @@ impl candle::CustomOp3 for Sdpa {
                     scores[ks] = dot * scale;
                 }
                 if apply_softcap {
-                    // Соответствует Metal kernel (sdpa_vector / sdpa_full):
+                    // Matches the Metal kernel (sdpa_vector / sdpa_full):
                     // score = tanh(scale * q·k) * softcap.
                     for s in scores.iter_mut() {
                         *s = softcap * s.tanh();
@@ -1391,8 +1391,8 @@ impl candle::CustomOp3 for Sdpa {
 
         let mut implementation_supports_use_case = q_head == k_head;
 
-        // Steel attention (full) поддерживает больше head_dim, включая 48
-        // (48 не кратно 32, поэтому vector kernel его не поддерживает)
+        // Steel attention (full) supports more head_dim, including 48
+        // (48 is not a multiple of 32, so the vector kernel does not support it)
         let supported_full_head_dim = q_head == 32
             || q_head == 48
             || q_head == 64
@@ -1402,7 +1402,7 @@ impl candle::CustomOp3 for Sdpa {
             || q_head == 128
             || q_head == 256
             || q_head == 512;
-        // Vector kernel требует head_dim кратный 32
+        // Vector kernel requires head_dim to be a multiple of 32
         let supported_vector_head_dim =
             q_head == 32 || q_head == 64 || q_head == 96 || q_head == 128 || q_head == 256;
         let supported_head_dim = supported_full_head_dim || supported_vector_head_dim;
@@ -1411,8 +1411,8 @@ impl candle::CustomOp3 for Sdpa {
         // F32 full attention at head_dim=512 exceeds 32KB Metal threadgroup memory
         let supports_sdpa_full_dtype = !(q_head == 512 && q.dtype() == DType::F32);
         let supports_sdpa_vector = q_seq <= 8 && supported_vector_head_dim && q_seq <= k_seq;
-        // Full path используется при q_seq > 8, а также как fallback для
-        // head_dim, не поддерживаемых vector kernel (например 48, 72, 80)
+        // The full path is used when q_seq > 8, and also as a fallback for
+        // head_dim values not supported by the vector kernel (e.g. 48, 72, 80)
         let supports_sdpa_full = supported_full_head_dim
             && supports_sdpa_full_mask
             && supports_sdpa_full_dtype

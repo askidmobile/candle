@@ -188,17 +188,17 @@ impl Kernels {
         self.load_pipeline_with_constants(device, source, name, None)
     }
 
-    /// Очистить кэши скомпилированных библиотек и pipeline state.
+    /// Clear the compiled library and pipeline state caches.
     ///
-    /// Полезно в long-running приложениях после выгрузки тяжёлых моделей,
-    /// чтобы снизить high-water memory pressure на Metal.
+    /// Useful in long-running applications after unloading heavy models,
+    /// to reduce high-water memory pressure on Metal.
     pub fn clear_caches(&self) -> Result<(), MetalKernelError> {
         self.libraries.write()?.clear();
         self.pipelines.write()?.clear();
         Ok(())
     }
 
-    /// Возвращает размеры кэшей `(libraries, pipelines)`.
+    /// Returns the cache sizes `(libraries, pipelines)`.
     pub fn cache_stats(&self) -> Result<(usize, usize), MetalKernelError> {
         let libs = self.libraries.read()?.len();
         let pipes = self.pipelines.read()?.len();

@@ -66,9 +66,9 @@ impl MultiHeadAttention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let q = self.query.forward(x)?;
-        // Encoder self-attention: xa=None, mask=None → безопасно для SDPA.
-        // Decoder self-attention: xa=None, mask=Some → matmul (causal mask).
-        // Decoder cross-attention: xa=Some, mask=None → matmul (SDPA вызывает hallucinations).
+        // Encoder self-attention: xa=None, mask=None -> safe for SDPA.
+        // Decoder self-attention: xa=None, mask=Some -> matmul (causal mask).
+        // Decoder cross-attention: xa=Some, mask=None -> matmul (SDPA causes hallucinations).
         let is_encoder_self_attn = xa.is_none() && mask.is_none();
         let (k, v) = match xa {
             None => {
@@ -116,11 +116,11 @@ impl MultiHeadAttention {
         let k = self.reshape_head(k)?; // (B, H, KV_S, D)
         let v = self.reshape_head(v)?; // (B, H, KV_S, D)
 
-        // Matmul path для всех attention (encoder, decoder self, decoder cross).
-        // SDPA Metal kernel вызывает hallucinations в Whisper decoder (cross-attention),
-        // и числовые артефакты в encoder при параллельной GPU нагрузке.
-        // Pre-matmul scaling создаёт contiguous копии (необходимо для Metal).
-        let _ = use_sdpa; // reserved для будущего включения SDPA после исправления kernel
+        // Matmul path for all attention (encoder, decoder self, decoder cross).
+        // The SDPA Metal kernel causes hallucinations in the Whisper decoder (cross-attention),
+        // and numeric artifacts in the encoder under parallel GPU load.
+        // Pre-matmul scaling creates contiguous copies (required for Metal).
+        let _ = use_sdpa; // reserved for future SDPA enablement after kernel fixes
         let scale = (head_dim as f64).powf(-0.25);
         let q = (q * scale)?.contiguous()?;
         let k = (k.transpose(2, 3)? * scale)?.contiguous()?;

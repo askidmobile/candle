@@ -644,13 +644,13 @@ impl Tensor {
     unary_op!(relu, Relu);
     unary_op!(silu, Silu);
 
-    /// Fused SiLU(self) * rhs — прямой Metal dispatch (T-275).
+    /// Fused SiLU(self) * rhs -- direct Metal dispatch (T-275).
     ///
-    /// На Metal: один kernel `bsilu_mul_<dtype>` вместо двух (`silu` + `mul`).
-    /// На CPU / non-Metal: fallback через `self.silu()? * rhs`.
+    /// On Metal: one kernel `bsilu_mul_<dtype>` instead of two (`silu` + `mul`).
+    /// On CPU / non-Metal: fallback via `self.silu()? * rhs`.
     ///
-    /// Требования: same shape, same dtype (F32/F16/BF16), оба contiguous.
-    /// При нарушении требований — fallback, не ошибка.
+    /// Requirements: same shape, same dtype (F32/F16/BF16), both contiguous.
+    /// On requirement violation -- fallback, not an error.
     pub fn silu_mul_direct(&self, rhs: &Self) -> Result<Self> {
         let shape = self.same_shape_binary_op(rhs, "silu_mul_direct")?;
         if shape.elem_count() == 0 {
@@ -677,7 +677,7 @@ impl Tensor {
                 }
             }
         }
-        // Fallback: CPU path или non-contiguous Metal
+        // Fallback: CPU path or non-contiguous Metal
         self.silu()? * rhs
     }
 

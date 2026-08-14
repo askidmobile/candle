@@ -896,9 +896,9 @@ impl GgmlType for BlockQ2K {
             let mut mins: [f32; QK_K / 16] = [0.0; QK_K / 16];
             let mut scales: [f32; QK_K / 16] = [0.0; QK_K / 16];
 
-            // Q2_K: используем make_qkx2_quants (порт из llama.cpp ref) с
-            // weights = |x| и use_mad=true — даёт меньше квантизационной ошибки
-            // чем legacy make_qkx1_quants.
+            // Q2_K: use make_qkx2_quants (a port of the llama.cpp ref) with
+            // weights = |x| and use_mad=true -- yields less quantization error
+            // than the legacy make_qkx1_quants.
             let mut weights = [0f32; 16];
             let mut l_aux = [0u8; 16];
             for (j, x_scale_slice) in x.chunks(16).enumerate() {
@@ -1563,9 +1563,9 @@ impl GgmlType for BlockQ4K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            // Q4_K: make_qkx2_quants (порт llama.cpp ref) с
-            // weights[l] = av_x + |x[l]|, av_x = sqrt(sum(x²)/32),
-            // и параметрами grid search rmin=-1.0, rdelta=0.1, nstep=20.
+            // Q4_K: make_qkx2_quants (a port of the llama.cpp ref) with
+            // weights[l] = av_x + |x[l]|, av_x = sqrt(sum(x^2)/32),
+            // and grid search parameters rmin=-1.0, rdelta=0.1, nstep=20.
             let mut weights = [0f32; 32];
             let mut l_aux = [0u8; 32];
             for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
@@ -1846,9 +1846,9 @@ impl GgmlType for BlockQ5K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            // Q5_K: make_qkx2_quants (порт llama.cpp ref) с
-            // weights[l] = av_x + |x[l]|, av_x = sqrt(sum(x²)/32),
-            // и параметрами grid search rmin=-0.5, rdelta=0.1, nstep=15.
+            // Q5_K: make_qkx2_quants (a port of the llama.cpp ref) with
+            // weights[l] = av_x + |x[l]|, av_x = sqrt(sum(x^2)/32),
+            // and grid search parameters rmin=-0.5, rdelta=0.1, nstep=15.
             let mut weights = [0f32; 32];
             let mut l_aux = [0u8; 32];
             for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {

@@ -101,15 +101,15 @@ impl Device {
         }
     }
 
-    /// Создаёт Metal-буфер без копирования данных (zero-copy).
+    /// Creates a Metal buffer without copying data (zero-copy).
     ///
-    /// Использует `newBufferWithBytesNoCopy` — Metal ссылается на существующую память
-    /// вместо копирования. Требования:
-    /// - `pointer` ДОЛЖЕН быть выровнен по page boundary (`getpagesize()`, обычно 16384)
-    /// - Вызывающий код ОБЯЗАН гарантировать, что память живёт дольше буфера
-    /// - `deallocator = None` — мы управляем временем жизни через mmap/Arc
+    /// Uses `newBufferWithBytesNoCopy` -- Metal references the existing memory
+    /// instead of copying. Requirements:
+    /// - `pointer` MUST be aligned to a page boundary (`getpagesize()`, usually 16384)
+    /// - The caller MUST guarantee that the memory outlives the buffer
+    /// - `deallocator = None` -- we manage the lifetime via mmap/Arc
     ///
-    /// Идеально для mmap'd файлов моделей: mmap всегда page-aligned.
+    /// Ideal for mmap'd model files: mmap is always page-aligned.
     pub fn new_buffer_no_copy(
         &self,
         pointer: *mut c_void,

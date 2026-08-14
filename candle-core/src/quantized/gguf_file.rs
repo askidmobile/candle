@@ -95,14 +95,14 @@ impl TensorInfo {
         self.read_into(reader, tensor_data_offset, device, &mut scratch)
     }
 
-    /// Phase 7.D #5: read с переиспользованием scratch buffer вместо
+    /// Phase 7.D #5: read with a reusable scratch buffer instead of a
     /// per-tensor `vec![0u8; size]` allocation.
     ///
-    /// Loader (например `quantized_var_builder::from_gguf`) выделяет один
-    /// `Vec<u8>` достаточного размера и передаёт его всем `read_into` вызовам
-    /// в loop. Это снижает peak heap во время загрузки с
-    /// `sum(all_tensor_sizes)` до `max(tensor_size)` — для Qwen3-ASR-0.6B-Q8
-    /// это ~50 МБ вместо ~743 МБ потенциальной аккумуляции через allocator.
+    /// The loader (e.g. `quantized_var_builder::from_gguf`) allocates one
+    /// `Vec<u8>` large enough and passes it to all `read_into` calls
+    /// in a loop. This lowers peak heap during loading from
+    /// `sum(all_tensor_sizes)` to `max(tensor_size)` -- for Qwen3-ASR-0.6B-Q8
+    /// that is ~50 MB instead of ~743 MB of potential allocator accumulation.
     pub fn read_into<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
@@ -183,9 +183,9 @@ impl TensorInfo {
         )
     }
 
-    /// Вычисляет смещение и размер тензора в файле (для zero-copy Metal buffer).
+    /// Computes the tensor's offset and size in the file (for a zero-copy Metal buffer).
     ///
-    /// Возвращает (offset_in_bytes, size_in_bytes) от начала файла (не от tensor_data_offset).
+    /// Returns (offset_in_bytes, size_in_bytes) from the start of the file (not from tensor_data_offset).
     pub fn byte_range(&self, tensor_data_offset: u64) -> Result<(usize, usize)> {
         let tensor_elems = self.shape.elem_count();
         let block_size = self.ggml_dtype.block_size();
@@ -660,8 +660,8 @@ impl Content {
         tensor_info.read(reader, self.tensor_data_offset, device)
     }
 
-    /// Phase 7.D #5: tensor с reusable scratch buffer.
-    /// См. `TensorInfo::read_into` для деталей.
+    /// Phase 7.D #5: tensor with a reusable scratch buffer.
+    /// See `TensorInfo::read_into` for details.
     pub fn tensor_into<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
@@ -688,9 +688,9 @@ impl Content {
         tensor_info.read_from_slice(data, self.tensor_data_offset, device)
     }
 
-    /// Вычисляет byte range тензора по имени.
+    /// Computes the byte range of a tensor by name.
     ///
-    /// Для zero-copy Metal buffer: возвращает (offset, size) тензора в файле.
+    /// For a zero-copy Metal buffer: returns (offset, size) of the tensor in the file.
     pub fn tensor_byte_range(&self, name: &str) -> Result<(usize, usize)> {
         let tensor_info = match self.tensor_infos.get(name) {
             Some(tensor_info) => tensor_info,
@@ -699,7 +699,7 @@ impl Content {
         tensor_info.byte_range(self.tensor_data_offset)
     }
 
-    /// Возвращает ggml_dtype тензора по имени.
+    /// Returns the ggml_dtype of a tensor by name.
     pub fn tensor_dtype(&self, name: &str) -> Result<GgmlDType> {
         let tensor_info = match self.tensor_infos.get(name) {
             Some(tensor_info) => tensor_info,
@@ -708,7 +708,7 @@ impl Content {
         Ok(tensor_info.ggml_dtype)
     }
 
-    /// Возвращает shape тензора по имени.
+    /// Returns the shape of a tensor by name.
     pub fn tensor_shape(&self, name: &str) -> Result<Vec<usize>> {
         let tensor_info = match self.tensor_infos.get(name) {
             Some(tensor_info) => tensor_info,

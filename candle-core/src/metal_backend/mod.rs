@@ -18,19 +18,19 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
-/// Включает inplace fast path для element-wise ops (Unary/Binary/Affine).
+/// Enables the in-place fast path for element-wise ops (Unary/Binary/Affine).
 ///
-/// Когда Arc::strong_count(input.buffer) == 1 и shape/dtype совпадают —
-/// Metal kernel пишет output в тот же буфер что и input (zero allocation).
-/// Element-wise kernels безопасны к self-aliasing: каждый thread читает
-/// и пишет по одному элементу независимо (нет читать-всё-потом-писать фаз).
+/// When Arc::strong_count(input.buffer) == 1 and shape/dtype match --
+/// the Metal kernel writes the output into the same buffer as the input (zero allocation).
+/// Element-wise kernels are safe for self-aliasing: each thread reads
+/// and writes a single element independently (no read-all-then-write phases).
 ///
-/// По умолчанию ON (T-269 Phase 5 promote). Emergency revert через YTTRI_INPLACE_OPS=0.
-/// Skip: RmsNorm, Softmax, Rope — нужен 2-pass или pair-wise rotation.
+/// Default ON (T-269 Phase 5 promote). Emergency revert via YTTRI_INPLACE_OPS=0.
+/// Skip: RmsNorm, Softmax, Rope -- they need a 2-pass or pair-wise rotation.
 ///
-/// Кешируется через OnceLock: env::var() читается один раз при первом
-/// вызове, потом дешёвый atomic load. Без кеша — 480 syscall'ов per
-/// pp4096 forward → регрессия -23%.
+/// Cached via OnceLock: env::var() is read once on the first call, then a
+/// cheap atomic load follows. Without the cache -- 480 syscalls per pp4096
+/// forward -> -23% regression.
 #[inline(always)]
 fn inplace_ops_enabled() -> bool {
     use std::sync::OnceLock;
@@ -55,8 +55,8 @@ pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffse
     }
 }
 
-/// Версия buffer_o учитывающая base_offset буфера (для unified arena).
-/// Складывает base_offset с layout start_offset для правильного addr.
+/// buffer_o variant accounting for the buffer's base_offset (for the unified arena).
+/// Adds base_offset to the layout start_offset for the correct address.
 pub fn buffer_o_with_base<'a>(
     buffer: &'a Buffer,
     base_offset: usize,
@@ -173,7 +173,7 @@ impl BackendStorage for MetalStorage {
         let el = shape.elem_count();
         let dtype = self.dtype;
 
-        // Inplace fast path для affine (scale + bias) — element-wise, dtype сохраняется.
+        // In-place fast path for affine (scale + bias) -- element-wise, dtype is preserved.
         let buffer = if inplace_ops_enabled()
             && layout.is_contiguous()
             && Arc::strong_count(&self.buffer) == 1
@@ -733,14 +733,14 @@ impl BackendStorage for MetalStorage {
         let shape = layout.shape();
         let el_count = shape.elem_count();
 
-        // Inplace fast path: reuse input buffer как output когда:
-        // 1. arc strong_count == 1 (только этот tensor владеет буфером)
-        // 2. layout contiguous (output элементы совпадают 1:1 с input)
-        // 3. dtype не меняется (element-wise unary сохраняет тип)
-        // 4. env-флаг YTTRI_INPLACE_OPS (default ON, T-269 Phase 5; YTTRI_INPLACE_OPS=0 для revert)
-        // Metal element-wise kernels: каждый GPU thread читает src[i] →
-        // вычисляет → пишет dst[i]. Нет зависимостей между потоками,
-        // нет read-all-then-write фазы. Self-aliasing (src == dst) безопасен.
+        // In-place fast path: reuse the input buffer as output when:
+        // 1. arc strong_count == 1 (only this tensor owns the buffer)
+        // 2. layout is contiguous (output elements match input 1:1)
+        // 3. dtype does not change (element-wise unary preserves the type)
+        // 4. env flag YTTRI_INPLACE_OPS (default ON, T-269 Phase 5; YTTRI_INPLACE_OPS=0 to revert)
+        // Metal element-wise kernels: each GPU thread reads src[i] ->
+        // computes -> writes dst[i]. No cross-thread dependencies,
+        // no read-all-then-write phase. Self-aliasing (src == dst) is safe.
         let buffer = if inplace_ops_enabled()
             && layout.is_contiguous()
             && Arc::strong_count(&self.buffer) == 1
@@ -1846,12 +1846,12 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // T-269 Phase 3c: unified arena для output buffer.
-        // NOTE: KV cache issue не решён — при использовании unified arena
-        // KV cache может попасть в arena и быть corrupted после reset.
-        // Пока используем обычный pool (offset=0) для всех ops кроме тех
-        // где KV cache явно исключён через skip флаг.
-        // TODO Phase 3c сессия 2: добавить skip_unified_next_alloc() в KV cache creation.
+        // T-269 Phase 3c: unified arena for the output buffer.
+        // NOTE: the KV cache issue is not solved -- when using the unified arena
+        // the KV cache may end up in the arena and be corrupted after reset.
+        // For now we use the regular pool (offset=0) for all ops except those
+        // where the KV cache is explicitly excluded via a skip flag.
+        // TODO Phase 3c session 2: add skip_unified_next_alloc() to KV cache creation.
         let buffer = self.device.new_buffer(b * m * n, self.dtype, "matmul")?;
         let encoder = self.device.command_encoder()?;
         let dtype = match self.dtype {
@@ -1877,7 +1877,7 @@ impl BackendStorage for MetalStorage {
             rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
             &rhs.buffer,
             &buffer,
-            0, // output_offset=0 (пул буфер), T-269 Phase 3c сессия 2 активирует unified
+            0, // output_offset=0 (pool buffer); T-269 Phase 3c session 2 activates the unified arena
         )
         .map_err(MetalError::from)?;
 
@@ -2029,10 +2029,10 @@ impl MetalStorage {
         }
     }
 
-    /// Создать MetalStorage с non-zero base offset (T-269 Phase 3c unified arena).
+    /// Create a MetalStorage with a non-zero base offset (T-269 Phase 3c unified arena).
     ///
-    /// `buffer_offset` — байтовый offset данных этого тензора в `buffer`.
-    /// Используется когда несколько тензоров используют одну большую backing allocation.
+    /// `buffer_offset` -- byte offset of this tensor's data within `buffer`.
+    /// Used when multiple tensors share one large backing allocation.
     pub fn new_with_offset(
         buffer: Arc<Buffer>,
         buffer_offset: usize,
@@ -2053,16 +2053,16 @@ impl MetalStorage {
         &self.buffer
     }
 
-    /// Байтовый offset данных этого тензора в backing buffer.
+    /// Byte offset of this tensor's data within the backing buffer.
     pub fn buffer_offset(&self) -> usize {
         self.buffer_offset
     }
 
-    /// Создать BufferOffset для данного layout с учётом base offset.
+    /// Create a BufferOffset for the given layout, accounting for the base offset.
     ///
-    /// Эквивалент `self.buffer_slice(layout, dtype)` но добавляет
-    /// `self.buffer_offset` к layout start offset. При buffer_offset==0
-    /// результат идентичен `buffer_o`.
+    /// Equivalent to `self.buffer_slice(layout, dtype)` but adds
+    /// `self.buffer_offset` to the layout start offset. With buffer_offset==0
+    /// the result is identical to `buffer_o`.
     #[inline(always)]
     pub fn buffer_slice<'a>(&'a self, layout: &Layout, dtype: DType) -> BufferOffset<'a> {
         BufferOffset {
@@ -2130,15 +2130,15 @@ impl MetalStorage {
         let k = k.min(vocab_size).max(1);
 
         const THREADS: usize = 256;
-        // FIX (Yttri 2026-06-30): было `(vocab_size + THREADS - 1) / THREADS` (~970 для
-        // vocab=248K). Но кернел стрейдит ВЕСЬ vocab по `tid` (`i += block_dim`), НЕ по
-        // `tile_id` → все ~970 тредгрупп делали ИДЕНТИЧНУЮ работу (970× редунданс), а
-        // выходной буфер раздувался до `tile_count*THREADS*k = vocab*k` (~10М эл-тов),
-        // что переносилось ~80МБ GPU→CPU и CPU-сортировалось КАЖДЫЙ токен — медленнее, чем
-        // полный CPU-сэмплинг, который этот путь должен был ускорить. Одной тредгруппы (256
-        // тредов) достаточно: каждый тред покрывает vocab/256 элементов, каждый элемент
-        // ровно раз. Top-k на выходе ИДЕНТИЧЕН (редундантные тайлы и так схлопывались
-        // dedup'ом в wrapper'е) — фикс parity-safe, лишь убирает 970× мусорной работы.
+        // FIX (Yttri 2026-06-30): was `(vocab_size + THREADS - 1) / THREADS` (~970 for
+        // vocab=248K). But the kernel strides the WHOLE vocab via `tid` (`i += block_dim`), NOT via
+        // `tile_id` -> all ~970 threadgroups did IDENTICAL work (970x redundancy), and the
+        // output buffer ballooned to `tile_count*THREADS*k = vocab*k` (~10M elements),
+        // which was transferred ~80MB GPU->CPU and CPU-sorted EVERY token -- slower than
+        // the full CPU sampling this path was meant to speed up. A single threadgroup (256
+        // threads) is enough: each thread covers vocab/256 elements, each element exactly
+        // once. The top-k output is IDENTICAL (redundant tiles collapsed via dedup in the
+        // wrapper anyway) -- the fix is parity-safe, it only removes 970x of wasted work.
         let tile_count = 1;
         let per_tile_els = THREADS * k;
 
@@ -2286,15 +2286,15 @@ impl MetalStorage {
             (false, false, false, false) => kernel_name(op, &self.dtype, "_strided"),
         };
 
-        // Inplace fast path для binary contiguous arithmetic ops.
-        // Reuse lhs buffer когда:
-        // 1. output dtype == lhs dtype (не comparison op — те дают U8)
-        // 2. оба input contiguous (иначе strided path нужен отдельный буфер)
+        // In-place fast path for binary contiguous arithmetic ops.
+        // Reuse the lhs buffer when:
+        // 1. output dtype == lhs dtype (not a comparison op -- those yield U8)
+        // 2. both inputs are contiguous (otherwise the strided path needs a separate buffer)
         // 3. strong_count(lhs.buffer) == 1
-        // 4. env-флаг YTTRI_INPLACE_OPS (default ON, T-269 Phase 5)
-        // Metal binary kernel: thread[i] читает lhs[i] и rhs[i] независимо →
-        // пишет out[i]. lhs[i] прочитан до записи в out[i] (тот же адрес) —
-        // нет race даже при lhs == out.
+        // 4. env flag YTTRI_INPLACE_OPS (default ON, T-269 Phase 5)
+        // Metal binary kernel: thread[i] reads lhs[i] and rhs[i] independently ->
+        // writes out[i]. lhs[i] is read before writing to out[i] (same address) --
+        // no race even when lhs == out.
         let buffer = if kernel == contiguous_kernel {
             let buffer = if inplace_ops_enabled()
                 && dtype == self.dtype
@@ -2344,10 +2344,10 @@ impl MetalStorage {
         Ok(Self::new(buffer, device.clone(), el_count, dtype))
     }
 
-    /// Fused SiLU(lhs) * rhs — прямой Metal dispatch без CustomOp2 overhead.
+    /// Fused SiLU(lhs) * rhs -- direct Metal dispatch without CustomOp2 overhead.
     ///
-    /// Требует: оба тензора contiguous, same shape, same dtype (F32/F16/BF16).
-    /// Используется в Mlp::forward для SwiGLU gate path (T-275).
+    /// Requires: both tensors contiguous, same shape, same dtype (F32/F16/BF16).
+    /// Used in Mlp::forward for the SwiGLU gate path (T-275).
     pub fn silu_mul_metal_direct(
         &self,
         rhs: &Self,
@@ -2412,7 +2412,7 @@ impl MetalStorage {
 
     /// Fast GPU→CPU transfer optimized for single-threaded inference.
     /// Same as `to_cpu()` but uses `wait_until_completed_fast()` which skips
-    /// empty pool entries. Saves ~0.5мс per call in inference with 24+ sync points.
+    /// empty pool entries. Saves ~0.5ms per call in inference with 24+ sync points.
     pub fn to_cpu_fast<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
         let buffer = self.device.allocate_buffer(size)?;
@@ -2431,7 +2431,7 @@ impl MetalStorage {
     /// This means CPU can read GPU results directly without blit copy.
     /// Only needs flush+wait to ensure GPU has finished writing.
     ///
-    /// Saves ~0.15мс per call by eliminating:
+    /// Saves ~0.15ms per call by eliminating:
     /// - allocate_buffer for blit destination
     /// - blit command encoder dispatch
     /// - extra memory allocation
@@ -2513,8 +2513,8 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(RwLock::new(299792458)),
             completion_aware_pool: device::completion_aware_pool_enabled_from_env(),
-            // Residency set инициализируется позже через new_weight_residency_set().
-            // На этом этапе device только создан — весов ещё нет.
+            // The residency set is initialized later via new_weight_residency_set().
+            // At this point the device was just created -- there are no weights yet.
             weight_residency: Arc::new(Mutex::new(None)),
             residency_set,
         })

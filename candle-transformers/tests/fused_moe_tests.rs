@@ -1,15 +1,15 @@
-// Фаза 3: dense FusedMoe (FFI) удалён. Quantized GGUF MoE работает через
-// FusedMoeGGUF + QTensor::indexed_moe_forward (PTX-путь). Dense MoE-модели
-// (qwen3_moe) используют naive expert-loop (Qwen3SparseMoeBlock, matmul).
+// Phase 3: dense FusedMoe (FFI) is removed. Quantized GGUF MoE works via
+// FusedMoeGGUF + QTensor::indexed_moe_forward (PTX path). Dense MoE models
+// (qwen3_moe) use the naive expert-loop (Qwen3SparseMoeBlock, matmul).
 //
-// ponytail: полный CUDA/GGUF-тест требует GPU + GGUF weights — вне scope self-check.
-// Когда появится CUDA CI: добавить тест на Q4K MoE с CPU reference comparison
-// через FusedMoeGGUF + QTensor::indexed_moe_forward, и тест на naive dense MoE
-// (Qwen3SparseMoeBlock) с CPU reference.
+// ponytail: a full CUDA/GGUF test requires a GPU + GGUF weights -- out of scope for this self-check.
+// When CUDA CI is available: add a Q4K MoE test with a CPU reference comparison
+// via FusedMoeGGUF + QTensor::indexed_moe_forward, and a naive dense MoE test
+// (Qwen3SparseMoeBlock) with a CPU reference.
 
 #[test]
 fn placeholder_no_dense_fused_moe() {
-    // Dense FusedMoe удалён; naive expert-loop тестируется косвенно через
-    // qwen3_moe model tests. Этот файл оставлен как маркер для будущих MoE-тестов.
+    // Dense FusedMoe is removed; the naive expert-loop is tested indirectly via
+    // qwen3_moe model tests. This file is kept as a marker for future MoE tests.
     assert!(true);
 }

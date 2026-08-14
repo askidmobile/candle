@@ -20,16 +20,16 @@ impl VarBuilder {
     /// Load quantized tensors from a GGUF file using sequential read with shared
     /// scratch buffer.
     ///
-    /// Phase 7.D #5: tensor data читается через переиспользуемый `Vec<u8>` scratch
-    /// buffer вместо per-tensor heap allocation. Peak heap при загрузке падает
-    /// с `sum(tensor_sizes)` (если allocator не reuses) до `max(tensor_size)`.
-    /// Для Qwen3-ASR-0.6B-Q8: ~50 МБ scratch вместо потенциальной allocator
-    /// аккумуляции до 743 МБ.
+    /// Phase 7.D #5: tensor data is read through a reusable `Vec<u8>` scratch
+    /// buffer instead of a per-tensor heap allocation. Peak heap during loading drops
+    /// from `sum(tensor_sizes)` (if the allocator does not reuse) to `max(tensor_size)`.
+    /// For Qwen3-ASR-0.6B-Q8: ~50 MB scratch instead of a potential allocator
+    /// accumulation up to 743 MB.
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         let mut file = std::fs::File::open(p)?;
         let content = candle::quantized::gguf_file::Content::read(&mut file)?;
-        // Pre-pass: вычисляем max tensor size — резервируем scratch один раз,
-        // избегая повторных realloc внутри read_into.
+        // Pre-pass: compute the max tensor size -- reserve the scratch once,
+        // avoiding repeated reallocs inside read_into.
         let max_tensor_bytes = content
             .tensor_infos
             .values()
@@ -50,7 +50,7 @@ impl VarBuilder {
             let tensor = content.tensor_into(&mut file, tensor_name, device, &mut scratch)?;
             data.insert(tensor_name.to_string(), Arc::new(tensor));
         }
-        // Освобождаем scratch — больше не нужен после загрузки.
+        // Free the scratch -- no longer needed after loading.
         drop(scratch);
         Ok(Self {
             data: Arc::new(data),
@@ -90,19 +90,19 @@ impl VarBuilder {
 
     /// Load quantized tensors from a GGUF file using Metal zero-copy buffers.
     ///
-    /// Создаёт ОДИН Metal NoCopy buffer на весь mmap'd файл. Каждый тензор ссылается
-    /// на свою часть этого buffer через offset — БЕЗ копирования данных.
+    /// Creates ONE Metal NoCopy buffer for the whole mmap'd file. Each tensor references
+    /// its own slice of this buffer via an offset -- WITHOUT copying data.
     ///
-    /// Это убирает ~98% времени загрузки модели на Metal (1-3 секунды → ~30ms для
-    /// создания mmap + NoCopy buffer + metadata parsing).
+    /// This removes ~98% of Metal model load time (1-3 seconds -> ~30ms for
+    /// creating the mmap + NoCopy buffer + metadata parsing).
     ///
-    /// **Требования:**
-    /// - Только Metal device (для других device'ов используйте `from_gguf_mmap`)
-    /// - macOS с Apple Silicon или Intel с дискретной GPU
-    /// - Размер файла должен быть кратен page size (4096 или 16384)
+    /// **Requirements:**
+    /// - Metal device only (for other devices use `from_gguf_mmap`)
+    /// - macOS with Apple Silicon or Intel with a discrete GPU
+    /// - File size must be a multiple of the page size (4096 or 16384)
     ///
-    /// **Время жизни:** VarBuilder хранит Arc<Mmap> и Arc<Buffer>, гарантируя
-    /// что mmap и Metal buffer живут пока есть хотя бы одна ссылка на тензоры.
+    /// **Lifetime:** VarBuilder holds an Arc<Mmap> and Arc<Buffer>, guaranteeing
+    /// that the mmap and Metal buffer live as long as there is at least one reference to the tensors.
     #[cfg(feature = "metal")]
     pub fn from_gguf_mmap_zero_copy<P: AsRef<std::path::Path>>(
         p: P,
@@ -118,9 +118,9 @@ impl VarBuilder {
         let mut cursor = std::io::Cursor::new(mmap.as_ref().as_ref());
         let content = candle::quantized::gguf_file::Content::read(&mut cursor)?;
 
-        // Размер mmap может быть не кратен page size — Metal NoCopy требует этого.
-        // Округляем вверх до ближайшей страницы.
-        // На macOS: aarch64 = 16384, x86_64 = 4096. Используем константу compile-time.
+        // The mmap size may not be a multiple of the page size -- Metal NoCopy requires it.
+        // Round up to the next page.
+        // On macOS: aarch64 = 16384, x86_64 = 4096. Use a compile-time constant.
         #[cfg(target_arch = "aarch64")]
         const PAGE_SIZE: usize = 16384;
         #[cfg(not(target_arch = "aarch64"))]
@@ -129,11 +129,11 @@ impl VarBuilder {
         let mmap_len = mmap.len();
         let aligned_len = (mmap_len + page_size - 1) & !(page_size - 1);
 
-        // Создаём единый Metal NoCopy buffer из mmap.
-        // mmap всегда page-aligned (гарантия ОС).
-        // Передаём aligned_len — Metal требует page-aligned size.
-        // NB: если aligned_len > mmap_len, Metal может читать padding-байты за концом файла,
-        // но это безопасно: mmap выделяет целые страницы, padding заполнен нулями.
+        // Create a single Metal NoCopy buffer from the mmap.
+        // mmap is always page-aligned (an OS guarantee).
+        // Pass aligned_len -- Metal requires a page-aligned size.
+        // NB: if aligned_len > mmap_len, Metal may read padding bytes past the end of the file,
+        // but this is safe: mmap allocates whole pages, the padding is zero-filled.
         let shared_buffer =
             metal_device.new_buffer_no_copy(mmap.as_ptr() as *mut std::ffi::c_void, aligned_len)?;
 
@@ -176,9 +176,9 @@ impl VarBuilder {
         })
     }
 
-    /// Construct from a pre-built tensor map. Useful когда тензоры уже извлечены
-    /// (например после name remapping из stranger GGUF naming) и нужно подать
-    /// в существующий quantized_nn loader.
+    /// Construct from a pre-built tensor map. Useful when tensors are already extracted
+    /// (e.g. after a name remapping from a stranger GGUF naming) and need to be fed
+    /// into an existing quantized_nn loader.
     pub fn from_tensors_map(
         data: std::collections::HashMap<String, Arc<QTensor>>,
         device: &Device,

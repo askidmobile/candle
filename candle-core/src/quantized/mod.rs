@@ -846,7 +846,7 @@ impl QTensor {
         &self.shape
     }
 
-    /// Внутренний accessor к QStorage (для intra-crate dispatch helpers как `q4k_opt::matmul_q4k_opt_metal`).
+    /// Internal accessor to QStorage (for intra-crate dispatch helpers like `q4k_opt::matmul_q4k_opt_metal`).
     pub(crate) fn storage(&self) -> &QStorage {
         &self.storage
     }
@@ -860,8 +860,8 @@ impl QTensor {
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
         // In the CUDA case, we have a specialized kernel as this can be useful for volta
         // architectures. https://github.com/huggingface/candle/issues/2136
-        // Для Metal — нативный GPU-kernel пишет half напрямую без F32-промежуточного,
-        // что вдвое снижает пик памяти при загрузке весов с CANDLE_DEQUANTIZE_ALL_F16.
+        // For Metal -- a native GPU-kernel writes half directly without an F32 intermediate,
+        // halving peak memory when loading weights with CANDLE_DEQUANTIZE_ALL_F16.
         match &self.storage {
             QStorage::Cuda(s) => {
                 let s = s.dequantize_f16(self.shape.elem_count())?;
@@ -929,9 +929,9 @@ impl QTensor {
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
-        // Layout safety: PTX-путь (`indexed_moe_forward_fused_q8_1_input`) читает
-        // input/ids через `as_cuda_slice` без применения layout offset/strides,
-        // поэтому требуем contiguous c-contiguous и нулевой start_offset.
+        // Layout safety: the PTX path (`indexed_moe_forward_fused_q8_1_input`) reads
+        // input/ids via `as_cuda_slice` without applying layout offset/strides,
+        // so we require c-contiguous layout and zero start_offset.
         if !x.layout().is_contiguous() {
             crate::bail!("indexed_moe_forward requires contiguous input tensor");
         }

@@ -1,28 +1,29 @@
 // Adapted from https://github.com/guoqingbao/attention.rs/blob/main/src/moe.rs
 //
-// FFI CUDA-GEMM путь (`moe_gemm_wmma`/`moe_gemm_gguf[_prefill]`) удалён:
-// host-символы жили в `libmoe.a`, которая не собирается с T-331 dynamic-loading
-// (см. candle-kernels/build.rs). Любая сборка с этим FFI падала на линке с
-// unresolved external symbol. Рабочий MoE-путь на CUDA — `QTensor::indexed_moe_forward`
-// (PTX-рантайм, dynamic-loading-совместимый, см. candle-core/src/quantized/cuda.rs).
-// Quantized GGUF MoE: см. FusedMoeGGUF в candle-transformers/src/fused_moe.rs.
+// FFI CUDA-GEMM path (`moe_gemm_wmma`/`moe_gemm_gguf[_prefill]`) is removed:
+// host symbols lived in `libmoe.a`, which is not built under T-331 dynamic-loading
+// (see candle-kernels/build.rs). Any build linking this FFI failed at link time
+// with unresolved external symbol. The working MoE path on CUDA is
+// `QTensor::indexed_moe_forward` (PTX runtime, dynamic-loading-compatible;
+// see candle-core/src/quantized/cuda.rs).
+// Quantized GGUF MoE: see FusedMoeGGUF in candle-transformers/src/fused_moe.rs.
 //
-// Dense MoE (`moe_gemm`) удалён: альтернативного PTX-пути для dense MoE нет,
-// а naive expert-loop через matmul работает на любом backend и используется
-// в qwen3_moe (Qwen3SparseMoeBlock). `moe_gemm_gguf` оставлен как bail-заглушка
-// для обратной совместимости — рабочий quantized путь через FusedMoeGGUF
-// использует QTensor::indexed_moe_forward напрямую.
+// Dense MoE (`moe_gemm`) is removed: there is no alternative PTX path for dense
+// MoE, and the naive expert-loop via matmul works on any backend and is used in
+// qwen3_moe (Qwen3SparseMoeBlock). `moe_gemm_gguf` is kept as a bail stub for
+// backward compatibility -- the working quantized path via FusedMoeGGUF uses
+// QTensor::indexed_moe_forward directly.
 #[allow(unused_imports)]
 use candle::quantized::{self, QTensor};
 use candle::{Result, Tensor};
 
-/// Quantized GGUF MoE GEMM (bail-заглушка).
+/// Quantized GGUF MoE GEMM (bail stub).
 ///
-/// CUDA FFI-путь (`moe_gemm_gguf[_prefill]`) удалён: `libmoe.a` не собирается
-/// под dynamic-loading. Рабочий quantized MoE на CUDA —
-/// `QTensor::indexed_moe_forward` (PTX-рантайм). `FusedMoeGGUF::forward`
-/// использует его напрямую, а не эту функцию. Bail оставлен для обратной
-/// совместимости с кодом, который мог бы вызывать эту функцию напрямую.
+/// The CUDA FFI path (`moe_gemm_gguf[_prefill]`) is removed: `libmoe.a` is not
+/// built under dynamic-loading. The working quantized MoE on CUDA is
+/// `QTensor::indexed_moe_forward` (PTX runtime). `FusedMoeGGUF::forward` uses it
+/// directly rather than this function. The bail is kept for backward
+/// compatibility with code that may call this function directly.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
     _input: &Tensor,

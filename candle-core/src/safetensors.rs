@@ -522,38 +522,38 @@ impl MmapedSafetensors {
         Ok(self.safetensors[index].get().0.tensor(name)?)
     }
 
-    /// Подсказывает kernel что mmap pages не нужны (madvise MADV_DONTNEED).
+    /// Hints to the kernel that mmap pages are not needed (madvise MADV_DONTNEED).
     ///
-    /// Phase 7.D #4: на macOS file-backed mmap pages засчитываются в RSS
-    /// процесса. После полной загрузки tensors в device (Metal/CUDA) эти
-    /// pages становятся бесполезны — данные уже скопированы в GPU buffers.
-    /// `advise_dontneed` сообщает kernel освободить page cache, что снижает
-    /// peak RSS на 500-800 МБ для крупных моделей.
+    /// Phase 7.D #4: on macOS file-backed mmap pages are counted towards the process'
+    /// RSS. After fully loading tensors into a device (Metal/CUDA) these pages become
+    /// useless -- the data has already been copied into GPU buffers.
+    /// `advise_dontneed` tells the kernel to release the page cache, which lowers
+    /// peak RSS by 500-800 MB for large models.
     ///
-    /// **Важно:** после вызова **повторное чтение** из этого `MmapedSafetensors`
-    /// потребует re-faulting pages (медленнее). Используйте только когда вы
-    /// уверены, что больше не будете загружать тензоры через этот экземпляр.
+    /// **Important:** after the call, **re-reading** from this `MmapedSafetensors`
+    /// requires re-faulting pages (slower). Use only when you are sure you will not
+    /// load tensors through this instance again.
     ///
-    /// На non-Unix platforms — no-op (memmap2::UncheckedAdvice доступен только Unix).
+    /// On non-Unix platforms -- no-op (memmap2::UncheckedAdvice is available only on Unix).
     ///
     /// # Safety
     ///
-    /// `MADV_DONTNEED` помечен в memmap2 как unsafe потому что доступы к pages
-    /// после advise могут вернуть нули для anonymous mappings или
-    /// re-fault'нуться для file mappings — это может выглядеть как UB. Но мы
-    /// используем **read-only file mapping** (safetensors), и после advise
-    /// мы **не читаем** mmap pages (тензоры скопированы в device buffer).
-    /// Так что вызов безопасен в этом контексте.
+    /// `MADV_DONTNEED` is marked unsafe in memmap2 because accesses to pages
+    /// after the advise may return zeros for anonymous mappings or
+    /// re-fault for file mappings -- which can look like UB. But we use a
+    /// **read-only file mapping** (safetensors), and after the advise we
+    /// **do not read** the mmap pages (tensors are copied into the device buffer).
+    /// So the call is safe in this context.
     pub fn advise_dontneed(&self) {
         #[cfg(unix)]
         for st in &self.safetensors {
-            // SAFETY: read-only file mapping, дальнейших чтений не будет
-            // (см. doc-comment выше).
+            // SAFETY: read-only file mapping; no further reads will happen
+            // (see the doc-comment above).
             unsafe {
                 let cart = st.backing_cart();
-                // На macOS MADV_DONTNEED для file-backed mappings часто игнорируется
-                // (kernel оптимизирует под page cache reuse). MADV_FREE_REUSABLE
-                // гарантированно вычитает pages из RSS — Darwin-only.
+                // On macOS MADV_DONTNEED for file-backed mappings is often ignored
+                // (the kernel optimizes for page cache reuse). MADV_FREE_REUSABLE
+                // reliably subtracts pages from RSS -- Darwin-only.
                 #[cfg(target_vendor = "apple")]
                 let _ = cart.unchecked_advise(memmap2::UncheckedAdvice::FreeReusable);
                 #[cfg(not(target_vendor = "apple"))]

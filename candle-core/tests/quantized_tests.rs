@@ -1526,15 +1526,15 @@ test_device!(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// indexed_moe_forward: проверка что bail! вместо panic на неподдерживаемом backend.
-// Раньше был panic!("indexed_moe_forward is not implemented in this platform!").
-// ponytail: полный CUDA-тест требует GPU + feature cuda — вне scope этого self-check.
-// Когда появится CUDA CI: добавить тест на Q4K с CPU reference comparison.
+// indexed_moe_forward: verify bail! instead of panic on an unsupported backend.
+// Previously this was panic!("indexed_moe_forward is not implemented in this platform!").
+// ponytail: a full CUDA test requires a GPU + feature cuda -- out of scope for this self-check.
+// When CUDA CI is available: add a Q4K test with a CPU reference comparison.
 #[test]
 fn indexed_moe_forward_cpu_bails_not_panics() -> Result<()> {
     use candle_core::quantized::QTensor;
-    // Создаём минимальный QTensor на CPU и пробуем indexed_moe_forward.
-    // На CPU должен вернуть Err, не паниковать.
+    // Build a minimal QTensor on CPU and try indexed_moe_forward.
+    // On CPU it must return Err, not panic.
     let device = Device::Cpu;
     let weight = Tensor::zeros((2, 4, 256), DType::F32, &device)?;
     let qtensor = QTensor::quantize(&weight, GgmlDType::Q4K)?;
@@ -1554,23 +1554,23 @@ fn indexed_moe_forward_cpu_bails_not_panics() -> Result<()> {
     Ok(())
 }
 
-// indexed_moe_forward: contiguous/zero-offset валидация.
-// На CPU backend layout-check проходит до backend-dispatch, bail должен быть
-// про layout, не про backend — но т.к. backend-check идёт после layout-check,
-// на CPU получим backend error. Этот тест фиксирует что layout validation
-// не паникует на non-contiguous input.
+// indexed_moe_forward: contiguous/zero-offset validation.
+// On the CPU backend the layout-check runs before backend-dispatch; the bail
+// should be about layout, not backend -- but since the backend-check comes after
+// the layout-check, on CPU we get a backend error. This test ensures the layout
+// validation does not panic on non-contiguous input.
 #[test]
 fn indexed_moe_forward_non_contiguous_bails_not_panics() -> Result<()> {
     use candle_core::quantized::QTensor;
     let device = Device::Cpu;
     let weight = Tensor::zeros((2, 4, 256), DType::F32, &device)?;
     let qtensor = QTensor::quantize(&weight, GgmlDType::Q4K)?;
-    // non-contiguous: transpose last two dims of a [1,2,256] tensor → [1,256,2]
+    // non-contiguous: transpose last two dims of a [1,2,256] tensor -> [1,256,2]
     let xs_cont = Tensor::zeros((1, 2, 256), DType::F32, &device)?;
     let xs = xs_cont.transpose(1, 2)?; // [1,8,2] non-contiguous
     let ids = Tensor::zeros((1, 1), DType::U32, &device)?;
-    // CPU backend bail произойдёт раньше (backend-check после layout-check),
-    // но layout-check не должен паниковать.
+    // The CPU backend bail happens first (backend-check after layout-check),
+    // but the layout-check must not panic.
     let res = qtensor.indexed_moe_forward(&xs, &ids);
     assert!(res.is_err(), "non-contiguous input must return Err");
     Ok(())

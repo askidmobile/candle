@@ -1,17 +1,17 @@
-// Pre-allocated scratch arena для intermediate Metal буферов (T-269 Phase 2 + Phase 3c).
+// Pre-allocated scratch arena for intermediate Metal buffers (T-269 Phase 2 + Phase 3c).
 //
 // Slot lifecycle:
-// 1. arena.try_acquire(size) → Some(Arc<Buffer>) если найден свободный slot
-//    с capacity >= rounded(size). strong_count slot становится 2 (arena + caller).
-// 2. Caller владеет Arc, передаёт в Tensor / MetalStorage.
-// 3. Когда Tensor drop'd, Arc::drop → strong_count goes to 1.
-// 4. Если caller вызвал GPU sync (wait_until_completed_fast), GPU done писать.
-// 5. Следующий try_acquire видит strong_count == 1 → reuse safe.
+// 1. arena.try_acquire(size) -> Some(Arc<Buffer>) if a free slot is found
+//    with capacity >= rounded(size). The slot strong_count becomes 2 (arena + caller).
+// 2. Caller owns the Arc, passes it into Tensor / MetalStorage.
+// 3. When the Tensor is dropped, Arc::drop -> strong_count goes back to 1.
+// 4. If the caller invoked a GPU sync (wait_until_completed_fast), the GPU is done writing.
+// 5. The next try_acquire sees strong_count == 1 -> reuse is safe.
 //
-// Безопасность: arena reuse возможен ТОЛЬКО после внешнего fence.
-// Caller (Yttri forward()) обязан вызвать wait_until_completed_fast() ДО
-// следующей allocate_buffer() чтобы GPU завершил запись в предыдущие slots.
-// Это гарантируется sync per 4 layers в prefill loop.
+// Safety: arena reuse is possible ONLY after an external fence.
+// The caller (Yttri forward()) must call wait_until_completed_fast() BEFORE
+// the next allocate_buffer() so the GPU has finished writing to previous slots.
+// This is guaranteed by the sync-per-4-layers point in the prefill loop.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -23,35 +23,35 @@ use crate::MetalKernelError;
 use super::buffer::{Buffer, MTLResourceOptions};
 use super::device::Device;
 
-/// Один slot в scratch arena.
+/// A single slot in the scratch arena.
 ///
-/// `buffer` — pre-allocated MTLBuffer с StorageModeShared.
-/// Slot "свободен" когда `Arc::strong_count(&buffer) == 1`
-/// (только arena держит ссылку).
+/// `buffer` -- a pre-allocated MTLBuffer with StorageModeShared.
+/// The slot is "free" when `Arc::strong_count(&buffer) == 1`
+/// (only the arena holds a reference).
 pub struct ArenaSlot {
     pub buffer: Arc<Buffer>,
     pub capacity: usize,
 }
 
-/// Pre-allocated scratch arena для intermediate Metal буферов.
+/// Pre-allocated scratch arena for intermediate Metal buffers.
 ///
-/// Все slots выделяются при создании через `new()`. `try_acquire()`
-/// ищет свободный slot с достаточной ёмкостью — lock-free через
-/// `Arc::strong_count`. При неудаче — caller fallback к pool.
+/// All slots are allocated at creation via `new()`. `try_acquire()`
+/// finds a free slot with sufficient capacity -- lock-free via
+/// `Arc::strong_count`. On failure the caller falls back to the pool.
 ///
-/// # Безопасность
+/// # Safety
 ///
-/// `Send + Sync` объявлены unsafe потому что `Arc<Buffer>` внутри не Send
-/// из-за objc2 internals. Inference single-threaded, поэтому безопасно —
-/// аналогично существующему `Commands` и `Buffer` в candle-metal-kernels.
+/// `Send + Sync` are declared unsafe because the inner `Arc<Buffer>` is not Send
+/// due to objc2 internals. Inference is single-threaded, so this is safe --
+/// analogous to the existing `Commands` and `Buffer` in candle-metal-kernels.
 ///
-/// GPU safety гарантируется внешним fence: перед reuse caller обязан
-/// вызвать `MetalDevice::wait_until_completed_fast()`.
+/// GPU safety is guaranteed by an external fence: before reuse the caller must
+/// call `MetalDevice::wait_until_completed_fast()`.
 pub struct ScratchArena {
-    /// Pre-allocated slots. Индекс фиксирован на весь lifetime arena.
+    /// Pre-allocated slots. The index is fixed for the arena's whole lifetime.
     pub slots: Vec<ArenaSlot>,
-    /// Round-robin start для поиска свободного slot (оптимизация).
-    /// Cell<usize> — нет мьютекса, inference single-threaded.
+    /// Round-robin start for searching a free slot (optimization).
+    /// Cell<usize> -- no mutex, inference is single-threaded.
     acquire_start: Cell<usize>,
 }
 
@@ -59,13 +59,13 @@ unsafe impl Send for ScratchArena {}
 unsafe impl Sync for ScratchArena {}
 
 impl ScratchArena {
-    /// Создать arena с заданными размерами slots.
+    /// Create an arena with the given slot sizes.
     ///
-    /// Каждый элемент `slot_sizes` → один MTLBuffer (StorageModeShared).
-    /// Выделения происходят сразу, при создании arena.
+    /// Each element of `slot_sizes` becomes one MTLBuffer (StorageModeShared).
+    /// Allocations happen immediately, at arena creation.
     ///
-    /// `slot_sizes` должен содержать **точные байтовые размеры** (не rounded),
-    /// обычно это power-of-2 значения из Phase 1 trace.
+    /// `slot_sizes` must contain **exact byte sizes** (not rounded),
+    /// usually power-of-two values from the Phase 1 trace.
     pub fn new(device: &Device, slot_sizes: &[usize]) -> Result<Self, MetalKernelError> {
         let opts = MTLResourceOptions::StorageModeShared;
         let mut slots = Vec::with_capacity(slot_sizes.len());
@@ -82,26 +82,26 @@ impl ScratchArena {
         })
     }
 
-    /// Попробовать взять slot из arena без блокировки.
+    /// Try to acquire a slot from the arena without locking.
     ///
-    /// Ищет slot с:
-    /// - `capacity >= rounded(requested)` — буфер достаточно большой
-    /// - `Arc::strong_count(&buffer) == 1` — только arena держит ссылку
-    ///   (slot не используется каким-то живым Tensor'ом)
+    /// Looks for a slot with:
+    /// - `capacity >= rounded(requested)` -- the buffer is large enough
+    /// - `Arc::strong_count(&buffer) == 1` -- only the arena holds a reference
+    ///   (the slot is not in use by any live Tensor)
     ///
-    /// При успехе: инкрементирует strong_count (возвращает Arc::clone),
-    /// обновляет round-robin pointer.
+    /// On success: increments strong_count (returns Arc::clone),
+    /// updates the round-robin pointer.
     ///
-    /// При неудаче: возвращает `None` → caller должен fallback к pool.
+    /// On failure: returns `None` -> the caller must fall back to the pool.
     ///
     /// # Safety
     ///
-    /// Caller ОБЯЗАН гарантировать GPU fence (`wait_until_completed_fast`)
-    /// перед тем как slot может быть выдан для нового использования.
-    /// Иначе GPU может писать в buffer одновременно с новым kernel.
+    /// The caller MUST guarantee a GPU fence (`wait_until_completed_fast`)
+    /// before a slot can be handed out for a new use.
+    /// Otherwise the GPU may write to the buffer concurrently with a new kernel.
     pub fn try_acquire(&self, requested: usize) -> Option<Arc<Buffer>> {
-        // Round-up до power-of-two (как buf_size() в device.rs).
-        // .max(64) — минимальный MTLBuffer alignment.
+        // Round-up to a power of two (like buf_size() in device.rs).
+        // .max(64) -- minimum MTLBuffer alignment.
         let rounded = requested.saturating_sub(1).next_power_of_two().max(64);
         let n = self.slots.len();
         let start = self.acquire_start.get();
@@ -109,10 +109,10 @@ impl ScratchArena {
         for offset in 0..n {
             let idx = (start + offset) % n;
             let slot = &self.slots[idx];
-            // Arc::strong_count — AtomicUsize::load(Relaxed). Дёшево.
-            // Single-threaded inference: нет TOCTOU race.
+            // Arc::strong_count -- AtomicUsize::load(Relaxed). Cheap.
+            // Single-threaded inference: no TOCTOU race.
             if slot.capacity >= rounded && Arc::strong_count(&slot.buffer) == 1 {
-                // Продвигаем start чтобы следующий запрос не начинал с того же.
+                // Advance start so the next request does not start from the same slot.
                 self.acquire_start.set((idx + 1) % n);
                 return Some(Arc::clone(&slot.buffer));
             }
@@ -120,15 +120,15 @@ impl ScratchArena {
         None
     }
 
-    /// Суммарный байтовый размер всех pre-allocated slots.
+    /// Total byte size of all pre-allocated slots.
     pub fn total_bytes(&self) -> usize {
         self.slots.iter().map(|s| s.capacity).sum()
     }
 
-    /// Количество свободных slots (strong_count == 1).
+    /// Number of free slots (strong_count == 1).
     ///
-    /// Полезно для diagnostics: если `free_count() == 0` во время forward —
-    /// arena исчерпана и fallback к pool активен.
+    /// Useful for diagnostics: if `free_count() == 0` during forward --
+    /// the arena is exhausted and the fallback to the pool is active.
     pub fn free_count(&self) -> usize {
         self.slots
             .iter()
@@ -136,7 +136,7 @@ impl ScratchArena {
             .count()
     }
 
-    /// Гистограмма ёмкостей: `(capacity_bytes, count)` отсортированная по ёмкости.
+    /// Capacity histogram: `(capacity_bytes, count)` sorted by capacity.
     pub fn capacity_histogram(&self) -> Vec<(usize, usize)> {
         let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
         for s in &self.slots {
@@ -147,69 +147,69 @@ impl ScratchArena {
 }
 
 // ============================================================
-// UnifiedScratchArena — Phase 3c: один большой MTLBuffer +
+// UnifiedScratchArena -- Phase 3c: one big MTLBuffer +
 // bump allocator + offset dispatch.
 //
-// Дизайн: один MTLBuffer (~700 МБ) создаётся при загрузке модели.
-// Все intermediate aллокации — это offsets в нём.
-// После каждого sync-fence (per N layers) offset сбрасывается
-// (reset), и все предыдущие virtual allocations освобождаются.
+// Design: a single MTLBuffer (~700 MB) is created at model load.
+// All intermediate allocations are offsets into it.
+// After each sync-fence (per N layers) the offset is reset,
+// releasing all previous virtual allocations.
 //
-// Это transliteration ggml_dyn_tallocr simplified version.
-// Не нужен complex free-list — у нас sync-per-N-layers boundary
-// даёт natural reset point.
+// This is a transliteration of a simplified ggml_dyn_tallocr.
+// No complex free-list is needed -- the sync-per-N-layers boundary
+// gives a natural reset point.
 //
-// # Использование
+// # Usage
 //
-// 1. Создать один раз при загрузке модели:
+// 1. Create once at model load:
 //    let arena = Arc::new(UnifiedScratchArena::new(&device, 764 * 1024 * 1024)?);
 //
-// 2. В forward prefill loop перед каждой группой layers:
-//    arena.reset(); // сбросить bump pointer
+// 2. In the forward prefill loop, before each group of layers:
+//    arena.reset(); // reset the bump pointer
 //
-// 3. При allocate_buffer — вместо нового MTLBuffer:
+// 3. On allocate_buffer -- instead of a new MTLBuffer:
 //    let (buf, offset) = arena.try_acquire(size)?;
 //    call_kernel(..., &buf, offset);
 //
-// 4. После sync fence (wait_until_completed_fast):
-//    // GPU завершил, offset стал безопасным для reset.
+// 4. After the sync fence (wait_until_completed_fast):
+//    // GPU is done, the offset is safe to reset.
 //    arena.reset();
 //
-// # Безопасность
+// # Safety
 //
-// GPU ОБЯЗАН завершить использование всех offset'ов из текущего
-// "эпизода" (period между двумя reset()) ДО вызова reset().
-// Caller обеспечивает это через wait_until_completed_fast().
+// The GPU MUST finish using all offsets from the current
+// "episode" (the period between two reset() calls) BEFORE reset() is called.
+// The caller ensures this via wait_until_completed_fast().
 // ============================================================
 
-/// Результат успешного acquire из UnifiedScratchArena.
+/// The result of a successful acquire from UnifiedScratchArena.
 pub struct UnifiedAlloc {
-    /// Shared backing buffer (Arc — arena держит ещё одну ссылку).
+    /// Shared backing buffer (Arc -- the arena holds one more reference).
     pub buffer: Arc<Buffer>,
-    /// Byte offset в buffer.
+    /// Byte offset into the buffer.
     pub offset_in_bytes: usize,
 }
 
-/// Bump-allocator scratch arena: один MTLBuffer, offset dispatch.
+/// Bump-allocator scratch arena: one MTLBuffer, offset dispatch.
 ///
-/// Thread-safety: `Send + Sync` unsafe по той же причине что `ScratchArena`.
-/// Inference single-threaded, bump_offset — AtomicUsize для корректности
-/// при потенциальном multi-thread (forward не параллелен сейчас).
+/// Thread-safety: `Send + Sync` unsafe for the same reason as `ScratchArena`.
+/// Inference is single-threaded; bump_offset is AtomicUsize for correctness
+/// in a potential multi-threaded case (forward is not parallel right now).
 pub struct UnifiedScratchArena {
-    /// Единственный большой MTLBuffer (StorageModeShared).
+    /// The single large MTLBuffer (StorageModeShared).
     backing: Arc<Buffer>,
-    /// Текущий bump offset в байтах.
+    /// Current bump offset in bytes.
     bump_offset: AtomicUsize,
-    /// Максимальный размер backing buffer.
+    /// Maximum size of the backing buffer.
     capacity: usize,
-    /// Счётчик exhausted alloc'ов (диагностика).
+    /// Counter of exhausted allocations (diagnostics).
     exhausted_count: AtomicUsize,
 }
 
 unsafe impl Send for UnifiedScratchArena {}
 unsafe impl Sync for UnifiedScratchArena {}
 
-/// Metal требует минимального alignment 256 байт для buffer offset'ов.
+/// Metal requires a minimum alignment of 256 bytes for buffer offsets.
 const METAL_BUFFER_OFFSET_ALIGNMENT: usize = 256;
 
 #[inline(always)]
@@ -218,10 +218,10 @@ fn align_up(size: usize, align: usize) -> usize {
 }
 
 impl UnifiedScratchArena {
-    /// Создать UnifiedScratchArena с заданным capacity (байты).
+    /// Create a UnifiedScratchArena with the given capacity (bytes).
     ///
-    /// Весь backing buffer выделяется сразу. Рекомендуемый размер
-    /// для Qwen3.5-2B pp4096: 764 МБ (по profiling Phase 1).
+    /// The whole backing buffer is allocated up front. Recommended size
+    /// for Qwen3.5-2B pp4096: 764 MB (from Phase 1 profiling).
     pub fn new(device: &Device, capacity: usize) -> Result<Self, MetalKernelError> {
         let backing = device.new_buffer(capacity, MTLResourceOptions::StorageModeShared)?;
         Ok(Self {
@@ -232,21 +232,21 @@ impl UnifiedScratchArena {
         })
     }
 
-    /// Попробовать выделить `size` байт из arena.
+    /// Try to allocate `size` bytes from the arena.
     ///
-    /// Возвращает `Some((Arc<Buffer>, offset))` если есть место.
-    /// Возвращает `None` если arena исчерпана (caller fallback к pool).
+    /// Returns `Some((Arc<Buffer>, offset))` if there is room.
+    /// Returns `None` if the arena is exhausted (caller falls back to the pool).
     ///
-    /// Offset выровнен по `METAL_BUFFER_OFFSET_ALIGNMENT` (256 байт).
+    /// The offset is aligned to `METAL_BUFFER_OFFSET_ALIGNMENT` (256 bytes).
     pub fn try_acquire(&self, size: usize) -> Option<UnifiedAlloc> {
         if size == 0 {
             return None;
         }
-        // Align size UP до кратного alignment для следующего alloc.
+        // Align size UP to a multiple of alignment for the next alloc.
         let aligned = align_up(size, METAL_BUFFER_OFFSET_ALIGNMENT);
         let offset = self.bump_offset.fetch_add(aligned, Ordering::Relaxed);
         if offset + aligned > self.capacity {
-            // Перемотать назад (arena исчерпана, не тратим место дальше).
+            // Roll back (arena exhausted, do not waste space further).
             self.bump_offset.fetch_sub(aligned, Ordering::Relaxed);
             self.exhausted_count.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -257,26 +257,26 @@ impl UnifiedScratchArena {
         })
     }
 
-    /// Сброс bump offset к нулю.
+    /// Reset the bump offset to zero.
     ///
-    /// ОПАСНО: вызывать ТОЛЬКО после `wait_until_completed_fast()`.
-    /// GPU должен завершить все operations использующие предыдущие offset'ы.
+    /// DANGEROUS: call ONLY after `wait_until_completed_fast()`.
+    /// The GPU must have finished all operations using previous offsets.
     #[inline]
     pub fn reset(&self) {
         self.bump_offset.store(0, Ordering::Relaxed);
     }
 
-    /// Текущее использование bump в байтах.
+    /// Current bump usage in bytes.
     pub fn used_bytes(&self) -> usize {
         self.bump_offset.load(Ordering::Relaxed)
     }
 
-    /// Ёмкость backing buffer в байтах.
+    /// Backing buffer capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Сколько раз arena исчерпывалась с момента создания (диагностика).
+    /// How many times the arena has been exhausted since creation (diagnostics).
     pub fn exhausted_count(&self) -> usize {
         self.exhausted_count.load(Ordering::Relaxed)
     }

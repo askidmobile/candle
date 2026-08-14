@@ -1,11 +1,11 @@
-//! T-280 Level 3: bridge для `kernel_mul_mm_q4_K_f32_v4` (Full Half Pipeline).
+//! T-280 Level 3: bridge for `kernel_mul_mm_q4_K_f32_v4` (Full Half Pipeline).
 //!
-//! Final piece Q4_K_M kernel optimization journey: mc accumulator converts
-//! `simdgroup_float8x8` → `simdgroup_half8x8` чтобы bypass F32 Limiter (92.28%
-//! V3 measurement). Lossy: numerical drift fp16 accumulator над K dimension —
-//! gate cosine ≥ 0.99 + semantic eq ≥ 8/10 (см. T-280 spec).
+//! Final piece of the Q4_K_M kernel optimization journey: the mc accumulator converts
+//! `simdgroup_float8x8` -> `simdgroup_half8x8` to bypass the F32 limiter (92.28%
+//! in the V3 measurement). Lossy: fp16 accumulator numerical drift over the K dimension --
+//! gate cosine >= 0.99 + semantic eq >= 8/10 (see the T-280 spec).
 //!
-//! Reuses `Q4KOptMetadataGpu` из `q4k_opt` — то же metadata buffer для V2/V3/V4.
+//! Reuses `Q4KOptMetadataGpu` from `q4k_opt` -- the same metadata buffer for V2/V3/V4.
 
 #[cfg(feature = "metal")]
 pub use metal_impl::matmul_q4k_v4_metal;
@@ -20,15 +20,15 @@ mod metal_impl {
 
     /// T-280 Level 3: dispatch V4 Q4_K_M matmul (full half pipeline).
     ///
-    /// Те же требования что и `matmul_q4k_opt_metal` / `matmul_q4k_v3_metal`:
-    /// - `qtensor.dtype() == GgmlDType::Q4K`
-    /// - `qtensor` на Metal device
+    /// Same requirements as `matmul_q4k_opt_metal` / `matmul_q4k_v3_metal`:
+    /// - `qtensor.dtype() == GgmlDType::Q4k`
+    /// - `qtensor` on a Metal device
     /// - `xs.dtype() == DType::F32`
     /// - Dimensions aligned: `M%64==0 && N%32==0` (FAST_PATH)
     ///
-    /// Отличие от V3: kernel accumulator (`mc`) now `simdgroup_half8x8` вместо
-    /// `simdgroup_float8x8`. Lossy numerical change — `simdgroup_store` выполняет
-    /// auto-conversion half → float dst.
+    /// Difference from V3: the kernel accumulator (`mc`) is now `simdgroup_half8x8` instead of
+    /// `simdgroup_float8x8`. Lossy numerical change -- `simdgroup_store` performs an
+    /// auto-conversion half -> float dst.
     pub fn matmul_q4k_v4_metal(
         qtensor: &QTensor,
         xs: &Tensor,

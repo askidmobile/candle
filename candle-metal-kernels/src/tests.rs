@@ -2510,7 +2510,7 @@ fn kernel_mul_mm_f16_instantiations_compile() {
 fn kernel_mul_mv_f16_instantiations_compile() {
     let device = device();
     let kernels = Kernels::new();
-    // Все 10 F32 mv-kernels (back-compat) и 10 F16 mv-kernels (новые).
+    // All 10 F32 mv-kernels (back-compat) and 10 F16 mv-kernels (new).
     let f32_names = [
         "kernel_mul_mv_q4_0_f32",
         "kernel_mul_mv_q4_1_f32",
@@ -2522,7 +2522,7 @@ fn kernel_mul_mv_f16_instantiations_compile() {
         "kernel_mul_mv_q4_K_f32",
         "kernel_mul_mv_q5_K_f32",
         "kernel_mul_mv_q6_K_f32",
-        // mul_mv_id F32 — после rename impls
+        // mul_mv_id F32 -- after rename impls
         "kernel_mul_mv_id_q8_0_f32",
         "kernel_mul_mv_id_q2_K_f32",
         "kernel_mul_mv_id_q3_K_f32",

@@ -187,9 +187,9 @@ mod metal_sdpa_tests {
 }
 
 mod cpu_sdpa_tests {
-    // T-286: CPU SDPA — критично для Windows embeddings + ASR на машинах
-    // без рабочего CUDA. Тесты проверяют корректность против naive реализации
-    // через matmul + softmax.
+    // T-286: CPU SDPA -- critical for Windows embeddings + ASR on machines
+    // without working CUDA. Tests verify correctness against a naive implementation
+    // via matmul + softmax.
     use candle::{DType, Device, Result, Shape, Tensor};
     use rand::SeedableRng;
     use rand_distr::Distribution;
@@ -214,7 +214,7 @@ mod cpu_sdpa_tests {
         do_causal: bool,
         softcap: f32,
     ) -> Result<Tensor> {
-        // GQA expansion: repeat k/v вдоль head dim, если n_q > n_kv.
+        // GQA expansion: repeat k/v along the head dim, if n_q > n_kv.
         let q_dims = q.dims();
         let k_dims = k.dims();
         let n_q = q_dims[1];
@@ -241,7 +241,7 @@ mod cpu_sdpa_tests {
             att = (att.tanh()? * softcap as f64)?;
         }
         if do_causal {
-            // Build causal mask (qseq, kseq) с -inf над диагональю.
+            // Build a causal mask (qseq, kseq) with -inf above the diagonal.
             let q_seq = q_dims[2];
             let k_seq = k_dims[2];
             let mut mask = vec![0f32; q_seq * k_seq];
@@ -369,7 +369,7 @@ mod cpu_sdpa_tests {
         let got_f32 = got.to_dtype(DType::F32)?;
         let err: f32 = ((&truth_f32 - &got_f32)?.abs()?.sum_all()?).to_scalar()?;
         let norm: f32 = truth_f32.abs()?.sum_all()?.to_scalar()?;
-        // F16 имеет меньшую precision — допускаем 1% относительной ошибки.
+        // F16 has lower precision -- allow 1% relative error.
         assert!(err / norm < 1e-2, "rel err {} / norm {}", err, norm);
         Ok(())
     }

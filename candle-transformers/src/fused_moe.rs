@@ -14,10 +14,11 @@ pub struct MoeCfg {
     pub decoder_sparse_step: Option<usize>,
 }
 
-// Dense FusedMoe (FFI moe_gemm) удалён: libmoe.a не собирается под dynamic-loading
-// (T-331), альтернативного PTX-пути для dense MoE нет. Dense MoE-модели (qwen3-moe)
-// используют naive expert-loop через стандартный matmul (см. Qwen3SparseMoeBlock).
-// Quantized GGUF MoE — FusedMoeGGUF ниже (PTX-путь QTensor::indexed_moe_forward).
+// Dense FusedMoe (FFI moe_gemm) is removed: libmoe.a is not built under
+// dynamic-loading (T-331), and there is no alternative PTX path for dense MoE.
+// Dense MoE models (qwen3-moe) use the naive expert-loop via standard matmul
+// (see Qwen3SparseMoeBlock). Quantized GGUF MoE -- FusedMoeGGUF below
+// (PTX path via QTensor::indexed_moe_forward).
 
 pub struct FusedMoeGGUF {
     pub gate: Linear,
@@ -106,21 +107,21 @@ impl FusedMoeGGUF {
         }
 
         let ys = {
-            // PTX-путь: QTensor::indexed_moe_forward (dynamic-loading-совместимый).
-            // ids = topk_ids [num_tokens, topk] — expert id для каждого (token, topk-slot).
-            // Сортировка sorted_token_ids не нужна — ядро индексирует weights через ids напрямую.
-            // input [num_tokens, 1, hidden] (input_dim1=1 → broadcast: все topk используют тот же input).
+            // PTX path: QTensor::indexed_moe_forward (dynamic-loading-compatible).
+            // ids = topk_ids [num_tokens, topk] -- expert id for each (token, topk-slot).
+            // sorted_token_ids sorting is not needed -- the kernel indexes weights via ids directly.
+            // input [num_tokens, 1, hidden] (input_dim1=1 -> broadcast: all topk use the same input).
             let xs_3d = xs.reshape((num_tokens, 1, hidden_dim))?;
             let gate = self.gate_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
             let up = self.up_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
 
-            // down_inputs [num_tokens, topk, intermediate] (input_dim1=topk → каждая
-            // (token, topk) позиция использует свой input).
+            // down_inputs [num_tokens, topk, intermediate] (input_dim1=topk -> each
+            // (token, topk) position uses its own input).
             let down_inputs = (up * gate.apply(&self.act)?)?;
             let down = self.down_experts.indexed_moe_forward(&down_inputs, &topk_ids)?;
 
-            // Применяем topk_weights [num_tokens, topk] поверх [num_tokens, topk, hidden]
-            // (FFI-путь делал это внутри ядра). sum по topk dim → [num_tokens, hidden].
+            // Apply topk_weights [num_tokens, topk] over [num_tokens, topk, hidden]
+            // (the FFI path did this inside the kernel). sum over topk dim -> [num_tokens, hidden].
             let topk_w = topk_weights.unsqueeze(D::Minus1)?;
             (down * topk_w)?
         };

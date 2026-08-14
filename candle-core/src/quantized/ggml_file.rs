@@ -188,13 +188,13 @@ pub fn qtensor_from_ggml(
     }
 }
 
-/// Создаёт QTensor из shared Metal NoCopy buffer (zero-copy mmap).
+/// Creates a QTensor from a shared Metal NoCopy buffer (zero-copy mmap).
 ///
-/// Вместо копирования данных в отдельный Metal buffer, этот метод ссылается
-/// на часть общего NoCopy buffer через offset. Данные остаются в mmap'd памяти,
-/// Metal GPU обращается к ним напрямую через unified memory.
+/// Instead of copying data into a separate Metal buffer, this method references
+/// a slice of the shared NoCopy buffer via an offset. The data stays in mmap'd memory,
+/// the Metal GPU accesses it directly via unified memory.
 ///
-/// Для CPU и CUDA fallback'ит на обычный `qtensor_from_ggml`.
+/// For CPU and CUDA it falls back to the regular `qtensor_from_ggml`.
 #[cfg(feature = "metal")]
 pub fn qtensor_from_shared_metal_buffer(
     ggml_dtype: GgmlDType,

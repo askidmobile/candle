@@ -516,9 +516,9 @@ impl Device {
         }
     }
 
-    /// Освободить неиспользуемые Metal буферы из buffer pool.
-    /// На CPU/CUDA — no-op.
-    /// Вызывать после synchronize() для освобождения памяти.
+    /// Release unused Metal buffers from the buffer pool.
+    /// No-op on CPU/CUDA.
+    /// Call after synchronize() to free memory.
     pub fn flush_buffers(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
@@ -527,15 +527,15 @@ impl Device {
         }
     }
 
-    /// Агрессивно очистить Metal buffer pool и kernel caches.
+    /// Aggressively clear the Metal buffer pool and kernel caches.
     ///
-    /// Включает ожидание завершения in-flight операций и полную очистку
-    /// внутреннего allocator pool для возврата памяти системе.
-    /// На CPU/CUDA — no-op.
+    /// Includes waiting for in-flight operations to finish and fully clearing the
+    /// internal allocator pool to return memory to the system.
+    /// No-op on CPU/CUDA.
     ///
-    /// **Внимание**: после вызова Metal shaders будут перекомпилированы при
-    /// следующем использовании (cold-start spike). Вызывайте только при teardown.
-    /// См. [`MetalDevice::purge_buffer_pool`] для подробностей.
+    /// **Note**: after the call Metal shaders will be recompiled on next use
+    /// (cold-start spike). Call only at teardown.
+    /// See [`MetalDevice::purge_buffer_pool`] for details.
     pub fn purge_buffers(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),

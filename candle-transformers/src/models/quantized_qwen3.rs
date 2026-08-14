@@ -21,21 +21,21 @@ pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
-    /// Phase 7.D: shared scratch buffer для tensor reads. Переиспользуется
-    /// между всеми `tensor` / `qmatmul` / `rms_norm` calls — peak heap при
-    /// загрузке падает с `sum(tensor_sizes)` (per-tensor allocations) до
-    /// `max(tensor_size)`. Pre-allocated с capacity = max tensor size.
+    /// Phase 7.D: shared scratch buffer for tensor reads. Reused across
+    /// all `tensor` / `qmatmul` / `rms_norm` calls -- peak heap during loading
+    /// drops from `sum(tensor_sizes)` (per-tensor allocations) to
+    /// `max(tensor_size)`. Pre-allocated with capacity = max tensor size.
     scratch: Vec<u8>,
-    /// Phase 7.D #6: zero-copy mode — если установлен, tensor data берётся
-    /// как sub-view общего Metal NoCopy buffer (mmap'd file → GPU напрямую,
-    /// без CPU heap allocations и без отдельных Metal buffers per tensor).
+    /// Phase 7.D #6: zero-copy mode -- when set, tensor data is taken
+    /// as a sub-view of a shared Metal NoCopy buffer (mmap'd file -> GPU directly,
+    /// without CPU heap allocations and without separate Metal buffers per tensor).
     #[cfg(feature = "metal")]
     shared_metal_buffer: Option<Arc<candle_metal_kernels::metal::Buffer>>,
 }
 
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
-        // Pre-pass: вычисляем max tensor size — резервируем scratch один раз.
+        // Pre-pass: compute the max tensor size -- reserve the scratch once.
         let max_tensor_bytes = ct
             .tensor_infos
             .values()
@@ -60,9 +60,9 @@ impl<R: Read + Seek> Gguf<R> {
         }
     }
 
-    /// Phase 7.D #6: enable zero-copy mode — tensors берутся как sub-views
-    /// общего Metal NoCopy buffer на mmap'd file. Caller отвечает за
-    /// keeping `mmap` alive до drop'а Gguf (через Arc).
+    /// Phase 7.D #6: enable zero-copy mode -- tensors are taken as sub-views
+    /// of a shared Metal NoCopy buffer over the mmap'd file. The caller is responsible
+    /// for keeping `mmap` alive until the Gguf is dropped (via Arc).
     #[cfg(feature = "metal")]
     pub fn with_metal_no_copy_buffer(
         mut self,
@@ -72,8 +72,8 @@ impl<R: Read + Seek> Gguf<R> {
         self
     }
 
-    /// Загрузка тензора. Если zero-copy включён через `with_metal_no_copy_buffer`,
-    /// возвращает sub-view shared buffer. Иначе — обычное чтение через scratch.
+    /// Load a tensor. If zero-copy is enabled via `with_metal_no_copy_buffer`,
+    /// returns a sub-view of the shared buffer. Otherwise -- a regular read through the scratch.
     fn load_tensor(&mut self, name: &str) -> Result<QTensor> {
         #[cfg(feature = "metal")]
         if let Some(ref shared) = self.shared_metal_buffer {
@@ -529,13 +529,13 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
-    /// Phase 7.D #6: zero-copy load из mmap'd GGUF.
-    /// Создаёт ОДИН Metal NoCopy buffer на весь mmap, каждый тензор —
-    /// sub-view через offset (БЕЗ копирования в CPU heap или отдельные
-    /// Metal buffers). Эквивалент Yttri Local LLM `quantized_qwen35::
+    /// Phase 7.D #6: zero-copy load from mmap'd GGUF.
+    /// Creates ONE Metal NoCopy buffer for the whole mmap; each tensor is
+    /// a sub-view via offset (WITHOUT copying into CPU heap or separate
+    /// Metal buffers). Equivalent to Yttri Local LLM `quantized_qwen35::
     /// from_gguf_zero_copy`.
     ///
-    /// На non-Metal device fallback к обычному `from_gguf`.
+    /// On a non-Metal device it falls back to the regular `from_gguf`. 
     #[cfg(feature = "metal")]
     pub fn from_gguf_zero_copy<P: AsRef<std::path::Path>>(
         path: P,
@@ -550,7 +550,7 @@ impl ModelWeights {
         let mut cursor = std::io::Cursor::new(mmap.as_ref());
         let ct = gguf_file::Content::read(&mut cursor)?;
 
-        // Page-aligned размер для Metal NoCopy buffer.
+        // Page-aligned size for the Metal NoCopy buffer.
         #[cfg(target_arch = "aarch64")]
         const PAGE_SIZE: usize = 16384;
         #[cfg(not(target_arch = "aarch64"))]
@@ -560,14 +560,14 @@ impl ModelWeights {
         let shared_buffer = metal_device
             .new_buffer_no_copy(mmap.as_ptr() as *mut std::ffi::c_void, aligned_len)?;
 
-        // Берём raw pointer на mmap data ДО leak'а, потом leak'аем mmap чтобы
-        // pages держались пока ModelWeights жив (NoCopy buffer ссылается на них).
-        // Cursor получает 'static slice — это обеспечивается leak'ом mmap.
+        // Take the raw pointer to the mmap data BEFORE the leak, then leak the mmap so
+        // the pages stay alive while ModelWeights is alive (the NoCopy buffer references them).
+        // The cursor gets a 'static slice -- this is guaranteed by the mmap leak.
         let data_ptr: *const u8 = mmap.as_ptr();
         let data_len = mmap.len();
         std::mem::forget(mmap);
-        // SAFETY: pages валидны пока NoCopy buffer жив (Metal держит указатель).
-        // Buffer хранится в Gguf через with_metal_no_copy_buffer → ModelWeights.
+        // SAFETY: the pages are valid as long as the NoCopy buffer is alive (Metal holds the pointer).
+        // The buffer is stored in Gguf via with_metal_no_copy_buffer -> ModelWeights.
         let data_slice: &'static [u8] = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
         let cursor2 = std::io::Cursor::new(data_slice);
 
@@ -586,15 +586,15 @@ impl ModelWeights {
 
     fn build_from_gguf<R: Read + Seek>(mut gg: Gguf<R>) -> Result<Self> {
         let device = gg.device.clone();
-        // Поддерживаем оба prefix'а: `qwen3.*` (стандартный Qwen3 LLM) и
-        // `qwen3vl.*` (Qwen3-VL/Qwen3-ASR — text-only часть имеет ту же
-        // архитектуру и tensor naming, отличается только prefix metadata).
+        // Support both prefixes: `qwen3.*` (standard Qwen3 LLM) and
+        // `qwen3vl.*` (Qwen3-VL/Qwen3-ASR -- the text-only part has the same
+        // architecture and tensor naming, only the prefix metadata differs).
         let md_get = |s: &str| {
             let v = gg.metadata().get(s);
             if let Some(v) = v {
                 return Ok(v);
             }
-            // Fallback: попробовать `qwen3vl.*` если запрашивали `qwen3.*`.
+            // Fallback: try `qwen3vl.*` if `qwen3.*` was requested.
             if let Some(rest) = s.strip_prefix("qwen3.") {
                 let alt = format!("qwen3vl.{}", rest);
                 if let Some(v) = gg.metadata().get(&alt) {
@@ -720,13 +720,13 @@ impl ModelWeights {
         self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
 
-    /// Forward pass с pre-computed embeddings (вместо token IDs).
+    /// Forward pass with pre-computed embeddings (instead of token IDs).
     ///
-    /// Используется в multimodal pipeline'ах (ASR, VL) где входная
-    /// последовательность — combined audio_embeds + text_embeds.
-    /// Skip embedding lookup — input уже [batch, seq, hidden_size].
+    /// Used in multimodal pipelines (ASR, VL) where the input
+    /// sequence is combined audio_embeds + text_embeds.
+    /// Skip embedding lookup -- the input is already [batch, seq, hidden_size].
     ///
-    /// Возвращает logits **только последнего токена**: [batch, vocab].
+    /// Returns logits **of the last token only**: [batch, vocab].
     pub fn forward_embeds(&mut self, embeds: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l, _h) = embeds.dims3()?;
@@ -745,18 +745,18 @@ impl ModelWeights {
         self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
 
-    /// Доступ к embed_tokens — для построения text embeddings в multimodal
-    /// контекстах (где вход — concatenation audio + text embeddings).
+    /// Access to embed_tokens -- for building text embeddings in multimodal
+    /// contexts (where the input is a concatenation of audio + text embeddings).
     pub fn embed_tokens(&self) -> &Embedding {
         &self.embed_tokens
     }
 
-    /// Hidden size модели (для размерности audio projector outputs).
+    /// Model hidden size (for the dimensionality of audio projector outputs).
     pub fn hidden_size(&self) -> usize {
         self.embed_tokens.embeddings().dim(1).unwrap_or(0)
     }
 
-    /// Тип данных модели (F16 / F32 / BF16) — для cast audio embeds.
+    /// Model dtype (F16 / F32 / BF16) -- for casting audio embeds.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
