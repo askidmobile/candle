@@ -1,6 +1,8 @@
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::Activation;
-use candle_transformers::fused_moe::{FusedMoe, FusedMoeGGUF, MoeCfg};
+use candle_transformers::fused_moe::{FusedMoe, MoeCfg};
+#[cfg(feature = "cuda")]
+use candle_transformers::fused_moe::FusedMoeGGUF;
 use candle_nn::VarBuilder;
 
 #[test]

@@ -385,7 +385,7 @@ mod cuda {
 }
 
 pub fn moe_gemm(
-    input: &Tensor,
+    _input: &Tensor,
     weights: &Tensor,
     topk_weights: &Option<Tensor>,
     sorted_token_ids: &Tensor,
@@ -413,7 +413,7 @@ pub fn moe_gemm(
 
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
-    input: &Tensor,
+    _input: &Tensor,
     weights: &QTensor,
     topk_weights: &Option<Tensor>,
     sorted_token_ids: &Tensor,
