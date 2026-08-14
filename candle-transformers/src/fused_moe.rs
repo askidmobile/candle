@@ -274,7 +274,7 @@ impl FusedMoeGGUF {
                     let down = self.down_experts.indexed_moe_forward(&down_inputs, &topk_ids)?;
 
                     let topk_w = topk_weights.unsqueeze(D::Minus1)?;
-                    (down * topk_w)?.sum(D::Minus2)?
+                    down.broadcast_mul(&topk_w)?.sum(D::Minus2)?
                 }
             }
         } else {
@@ -287,7 +287,7 @@ impl FusedMoeGGUF {
             let down = self.down_experts.indexed_moe_forward(&down_inputs, &topk_ids)?;
 
             let topk_w = topk_weights.unsqueeze(D::Minus1)?;
-            (down * topk_w)?.sum(D::Minus2)?
+            down.broadcast_mul(&topk_w)?.sum(D::Minus2)?
         };
 
         let mut ys = ys;
