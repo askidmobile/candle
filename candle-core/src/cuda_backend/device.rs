@@ -361,7 +361,9 @@ impl CudaDevice {
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
         let ms = self.modules.read().unwrap();
         if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
-            let func = mdl.load_function(fn_name).w()?;
+            let func = mdl.load_function(fn_name).map_err(|e| {
+                crate::Error::Msg(format!("failed to load function '{fn_name}' from loaded module: {e}"))
+            })?;
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
@@ -369,9 +371,13 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
+        let cuda_module = self.context.load_module(mdl.ptx().into()).map_err(|e| {
+            crate::Error::Msg(format!("failed to load PTX module: {e}"))
+        })?;
         ms.mdls[mdl.index()] = Some(cuda_module.clone());
-        let func = cuda_module.load_function(fn_name).w()?;
+        let func = cuda_module.load_function(fn_name).map_err(|e| {
+            crate::Error::Msg(format!("failed to load function '{fn_name}' from fresh module: {e}"))
+        })?;
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
