@@ -40,6 +40,9 @@ extern "C" __global__ void count_tokens_per_expert_kernel(
     }
 }
 
+#define ALIGN16(x) (((x) + 15) & ~15)
+
+// Single-block or multi-warp parallel exclusive scan supporting any num_experts up to 65536.
 extern "C" __global__ void expert_prefix_sum_kernel(
     const int32_t* __restrict__ counts,
     int32_t* __restrict__ offsets,
@@ -48,28 +51,39 @@ extern "C" __global__ void expert_prefix_sum_kernel(
     extern __shared__ int32_t temp_storage[];
 
     int tid = threadIdx.x;
-    int val = (tid < num_experts) ? counts[tid] : 0;
-    temp_storage[tid] = val;
-    __syncthreads();
+    int block_size = blockDim.x;
 
-    // Hillis-Steele Parallel Scan (Inclusive in shared memory)
-    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
-        int temp_val = 0;
-        if (tid >= offset) {
-            temp_val = temp_storage[tid - offset];
-        }
-        __syncthreads();
-        if (tid >= offset) {
-            temp_storage[tid] += temp_val;
-        }
-        __syncthreads();
+    // Phase 1: Local prefix sum in chunks
+    int running_sum = 0;
+    if (tid == 0) {
+        offsets[0] = 0;
     }
 
-    if (tid < num_experts) {
-        offsets[tid + 1] = temp_storage[tid];
-        if (tid == 0) {
-            offsets[0] = 0;
+    for (int chunk_start = 0; chunk_start < num_experts; chunk_start += block_size) {
+        int idx = chunk_start + tid;
+        int val = (idx < num_experts) ? counts[idx] : 0;
+        temp_storage[tid] = val;
+        __syncthreads();
+
+        for (int offset = 1; offset < block_size; offset <<= 1) {
+            int temp_val = 0;
+            if (tid >= offset) {
+                temp_val = temp_storage[tid - offset];
+            }
+            __syncthreads();
+            if (tid >= offset) {
+                temp_storage[tid] += temp_val;
+            }
+            __syncthreads();
         }
+
+        if (idx < num_experts) {
+            offsets[idx + 1] = running_sum + temp_storage[tid];
+        }
+        __syncthreads();
+
+        running_sum += temp_storage[block_size - 1];
+        __syncthreads();
     }
 }
 
@@ -137,11 +151,11 @@ __device__ void moe_gemm_grouped_device(
     const T* expert_w = weights + (size_t)expert_id * size_n * size_k;
 
     extern __shared__ uint8_t smem_bytes[];
+    size_t a_bytes = ALIGN16(M_BLK * K_BLK * sizeof(T));
+    size_t b_bytes = ALIGN16(N_BLK * K_BLK * sizeof(T));
     T* A_sh = reinterpret_cast<T*>(smem_bytes);
-    T* B_sh = reinterpret_cast<T*>(smem_bytes + M_BLK * K_BLK * sizeof(T));
-    size_t AB_bytes = M_BLK * K_BLK * sizeof(T) + N_BLK * K_BLK * sizeof(T);
-    size_t pad = (16 - (AB_bytes % 16)) % 16;
-    float* C_sh = reinterpret_cast<float*>(smem_bytes + AB_bytes + pad);
+    T* B_sh = reinterpret_cast<T*>(smem_bytes + a_bytes);
+    float* C_sh = reinterpret_cast<float*>(smem_bytes + a_bytes + b_bytes);
 
     const int laneId = threadIdx.x % 32;
     const int warpId = threadIdx.x / 32;
@@ -532,26 +546,20 @@ __device__ void moe_gemm_gguf_prefill_device(
 
     extern __shared__ uint8_t smem_bytes[];
     
-    // 1. A tile: [M_BLK, qk] (dequantized)
+    // 1. A tile: [M_BLK, qk] (dequantized, 16-byte aligned)
+    size_t A_sh_bytes = ALIGN16((size_t)vllm_moe::M_BLK * qk * sizeof(T));
     T* A_sh = reinterpret_cast<T*>(smem_bytes);
-    size_t A_sh_bytes = (size_t)vllm_moe::M_BLK * qk * sizeof(T);
     
-    // 2. B tile: [N_BLK, qk] (dequantized)
-    uint8_t* B_sh_ptr = smem_bytes + A_sh_bytes;
-    size_t B_sh_bytes = (size_t)vllm_moe::N_BLK * qk * sizeof(T);
+    // 2. B tile: [N_BLK, qk] (dequantized, 16-byte aligned)
+    size_t B_sh_bytes = ALIGN16((size_t)vllm_moe::N_BLK * qk * sizeof(T));
+    T* B_sh = reinterpret_cast<T*>(smem_bytes + A_sh_bytes);
     
-    // 3. B quantized tile: [N_BLK * block_size_bytes] (raw GGUF)
-    uint8_t* B_quant_sh_ptr = B_sh_ptr + B_sh_bytes;
-    size_t B_quant_sh_bytes = (size_t)vllm_moe::N_BLK * block_size_bytes;
+    // 3. B quantized tile: [N_BLK * block_size_bytes] (raw GGUF, 16-byte aligned)
+    size_t B_quant_sh_bytes = ALIGN16((size_t)vllm_moe::N_BLK * block_size_bytes);
+    uint8_t* B_quant_sh = smem_bytes + A_sh_bytes + B_sh_bytes;
 
-    // 4. C tile: [M_BLK, N_BLK] (float accumulator)
-    uint8_t* C_sh_ptr = B_quant_sh_ptr + B_quant_sh_bytes;
-    size_t C_sh_offset = reinterpret_cast<uintptr_t>(C_sh_ptr) % alignof(float);
-    if (C_sh_offset != 0) C_sh_ptr += (alignof(float) - C_sh_offset);
-    
-    T* B_sh = reinterpret_cast<T*>(B_sh_ptr);
-    uint8_t* B_quant_sh = reinterpret_cast<uint8_t*>(B_quant_sh_ptr);
-    float* C_sh = reinterpret_cast<float*>(C_sh_ptr);
+    // 4. C tile: [M_BLK, N_BLK] (float accumulator, 16-byte aligned)
+    float* C_sh = reinterpret_cast<float*>(smem_bytes + A_sh_bytes + B_sh_bytes + B_quant_sh_bytes);
 
     const int laneId = threadIdx.x;
     const int warpId = threadIdx.y;

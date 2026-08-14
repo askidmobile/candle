@@ -40,13 +40,8 @@ mod cuda {
             count_func.launch(count_cfg, (expert_ids, &expert_counts, size_m as i32))
         }?;
 
-        // 2. Prefix sum to get expert offsets
-        let mut scan_threads = num_experts;
-        if scan_threads < 32 {
-            scan_threads = 32;
-        } else if scan_threads > 1024 {
-            candle::bail!("MoE prefix sum supports up to 1024 experts, got {num_experts}");
-        }
+        // 2. Prefix sum to get expert offsets (supports up to 65536 experts via chunked scan)
+        let scan_threads = (num_experts.next_power_of_two()).clamp(32, 1024);
         let smem_size = (scan_threads * std::mem::size_of::<i32>()) as u32;
         let scan_func = dev.get_or_load_func("expert_prefix_sum_kernel", &candle_kernels::MOE)?;
         let scan_cfg = LaunchConfig {
@@ -133,12 +128,10 @@ mod cuda {
             let grid = (num_experts as u32, grid_n as u32, 1);
             let block = (128, 1, 1);
 
-            let a_sh_bytes = 32 * 16 * 2;
-            let b_sh_bytes = 32 * 16 * 2;
-            let c_sh_bytes = 32 * 32 * std::mem::size_of::<f32>();
-            let ab_bytes = a_sh_bytes + b_sh_bytes;
-            let pad = (16 - (ab_bytes % 16)) % 16;
-            let smem_bytes = (ab_bytes + pad + c_sh_bytes) as u32;
+            let a_sh_bytes = (32 * 16 * std::mem::size_of::<T>() + 15) & !15;
+            let b_sh_bytes = (32 * 16 * std::mem::size_of::<T>() + 15) & !15;
+            let c_sh_bytes = (32 * 32 * std::mem::size_of::<f32>() + 15) & !15;
+            let smem_bytes = (a_sh_bytes + b_sh_bytes + c_sh_bytes) as u32;
 
             let cfg = LaunchConfig {
                 grid_dim: grid,
@@ -291,11 +284,11 @@ mod cuda {
 
             let block_size_bytes = weights.dtype().type_size();
             let qk = weights.dtype().block_size();
-            let a_sh_bytes = 32 * qk * (if dtype == DType::F16 { 2 } else { 2 });
-            let b_sh_bytes = 32 * qk * 2;
-            let b_quant_sh_bytes = 32 * block_size_bytes;
-            let c_sh_bytes = 32 * 32 * std::mem::size_of::<f32>();
-            let smem_bytes = (a_sh_bytes + b_sh_bytes + b_quant_sh_bytes + 16 + c_sh_bytes) as u32;
+            let a_sh_bytes = (32 * qk * 2 + 15) & !15;
+            let b_sh_bytes = (32 * qk * 2 + 15) & !15;
+            let b_quant_sh_bytes = (32 * block_size_bytes + 15) & !15;
+            let c_sh_bytes = (32 * 32 * std::mem::size_of::<f32>() + 15) & !15;
+            let smem_bytes = (a_sh_bytes + b_sh_bytes + b_quant_sh_bytes + c_sh_bytes) as u32;
 
             let cfg = LaunchConfig {
                 grid_dim: grid,

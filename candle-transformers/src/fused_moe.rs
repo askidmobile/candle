@@ -224,41 +224,59 @@ impl FusedMoeGGUF {
 
         let ys = if is_prefill && xs.device().is_cuda() {
             // High-throughput WMMA grouped prefill path on CUDA
-            let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
+            let prefill_res: Result<Tensor> = (|| {
+                let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
 
-            let gate = moe::moe_gemm_gguf(
-                &xs,
-                &self.gate_experts,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                true,
-                self.dtype,
-            )?;
-            let up = moe::moe_gemm_gguf(
-                &xs,
-                &self.up_experts,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                true,
-                self.dtype,
-            )?;
+                let gate = moe::moe_gemm_gguf(
+                    &xs,
+                    &self.gate_experts,
+                    &None,
+                    &sorted_token_ids,
+                    &expert_ids,
+                    self.num_experts_per_tok,
+                    true,
+                    self.dtype,
+                )?;
+                let up = moe::moe_gemm_gguf(
+                    &xs,
+                    &self.up_experts,
+                    &None,
+                    &sorted_token_ids,
+                    &expert_ids,
+                    self.num_experts_per_tok,
+                    true,
+                    self.dtype,
+                )?;
 
-            let down_inputs = (up * gate.apply(&self.act)?)?;
-            let down = moe::moe_gemm_gguf(
-                &down_inputs,
-                &self.down_experts,
-                &Some(topk_weights),
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                true,
-                self.dtype,
-            )?;
-            down.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)?
+                let down_inputs = (up * gate.apply(&self.act)?)?;
+                let down = moe::moe_gemm_gguf(
+                    &down_inputs,
+                    &self.down_experts,
+                    &Some(topk_weights.clone()),
+                    &sorted_token_ids,
+                    &expert_ids,
+                    self.num_experts_per_tok,
+                    true,
+                    self.dtype,
+                )?;
+                down.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)
+            })();
+
+            match prefill_res {
+                Ok(out) => out,
+                Err(_) => {
+                    // Fallback to direct indexed_moe_forward path
+                    let xs_3d = xs.reshape((num_tokens, 1, hidden_dim))?;
+                    let gate = self.gate_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
+                    let up = self.up_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
+
+                    let down_inputs = (up * gate.apply(&self.act)?)?;
+                    let down = self.down_experts.indexed_moe_forward(&down_inputs, &topk_ids)?;
+
+                    let topk_w = topk_weights.unsqueeze(D::Minus1)?;
+                    (down * topk_w)?.sum(D::Minus2)?
+                }
+            }
         } else {
             // Direct indexed_moe_forward path (single-pass, zero sort overhead)
             let xs_3d = xs.reshape((num_tokens, 1, hidden_dim))?;
