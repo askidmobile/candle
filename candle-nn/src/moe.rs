@@ -20,7 +20,7 @@ mod cuda {
 
     fn calculate_expert_offsets(
         dev: &CudaDevice,
-        expert_ids: &CudaSlice<i32>,
+        expert_ids: &CudaSlice<u32>,
         size_m: usize,
         num_experts: usize,
     ) -> Result<CudaSlice<i32>> {
@@ -90,9 +90,7 @@ mod cuda {
                 );
             }
             let dev = input.device().as_cuda_device()?;
-            let sorted_token_ids = sorted_token_ids.to_dtype(DType::I32)?;
-            let expert_ids = expert_ids.to_dtype(DType::I32)?;
-
+                        
             let (input_storage, _) = input.storage_and_layout();
             let input_slice = match &*input_storage {
                 Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
@@ -107,13 +105,13 @@ mod cuda {
 
             let (sorted_ids_storage, _) = sorted_token_ids.storage_and_layout();
             let sorted_ids_slice = match &*sorted_ids_storage {
-                Storage::Cuda(c) => c.as_cuda_slice::<i32>()?,
+                Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
                 _ => candle::bail!("sorted_token_ids must be a cuda tensor"),
             };
 
             let (expert_ids_storage, _) = expert_ids.storage_and_layout();
             let expert_ids_slice = match &*expert_ids_storage {
-                Storage::Cuda(c) => c.as_cuda_slice::<i32>()?,
+                Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
                 _ => candle::bail!("expert_ids must be a cuda tensor"),
             };
 
@@ -218,19 +216,17 @@ mod cuda {
         }
 
         let dev = input.device().as_cuda_device()?;
-        let sorted_token_ids = sorted_token_ids.to_dtype(DType::I32)?;
-        let expert_ids = expert_ids.to_dtype(DType::I32)?;
-        let weight_ptr = weights.device_ptr()?;
+                        let weight_ptr = weights.device_ptr()?;
 
         let (sorted_ids_storage, _) = sorted_token_ids.storage_and_layout();
         let sorted_ids_slice = match &*sorted_ids_storage {
-            Storage::Cuda(c) => c.as_cuda_slice::<i32>()?,
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
             _ => candle::bail!("sorted_token_ids must be a cuda tensor"),
         };
 
         let (expert_ids_storage, _) = expert_ids.storage_and_layout();
         let expert_ids_slice = match &*expert_ids_storage {
-            Storage::Cuda(c) => c.as_cuda_slice::<i32>()?,
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
             _ => candle::bail!("expert_ids must be a cuda tensor"),
         };
 

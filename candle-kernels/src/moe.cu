@@ -29,7 +29,7 @@ using namespace nvcuda::wmma;
 // ============================================================================
 
 extern "C" __global__ void count_tokens_per_expert_kernel(
-    const int32_t* __restrict__ expert_ids,
+    const uint32_t* __restrict__ expert_ids,
     int32_t* __restrict__ expert_counts,
     int size_m
 ) {
@@ -124,7 +124,7 @@ template<typename T, int WMMA_M, int WMMA_N, int WARPS_N>
 __device__ void moe_gemm_grouped_device(
     const T* __restrict__ input,
     const T* __restrict__ weights,
-    const int32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
     T* __restrict__ output,
@@ -284,7 +284,7 @@ __device__ void moe_gemm_grouped_device(
 extern "C" __global__ void moe_gemm_wmma_f16_prefill(
     const half* __restrict__ input,
     const half* __restrict__ weights,
-    const int32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
     half* __restrict__ output,
@@ -299,7 +299,7 @@ extern "C" __global__ void moe_gemm_wmma_f16_prefill(
 extern "C" __global__ void moe_gemm_wmma_f16_decode(
     const half* __restrict__ input,
     const half* __restrict__ weights,
-    const int32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
     half* __restrict__ output,
@@ -315,7 +315,7 @@ extern "C" __global__ void moe_gemm_wmma_f16_decode(
 extern "C" __global__ void moe_gemm_wmma_bf16_prefill(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weights,
-    const int32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
     __nv_bfloat16* __restrict__ output,
@@ -330,7 +330,7 @@ extern "C" __global__ void moe_gemm_wmma_bf16_prefill(
 extern "C" __global__ void moe_gemm_wmma_bf16_decode(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weights,
-    const int32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
     __nv_bfloat16* __restrict__ output,
@@ -353,8 +353,8 @@ template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_
 __device__ void moe_gemm_gguf_decode_device(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
-    const int32_t* __restrict__ sorted_token_ids,
-    const int32_t* __restrict__ expert_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ expert_ids,
     const float* __restrict__ topk_weights,
     float * __restrict__ all_outputs,
     int num_experts,
@@ -439,8 +439,8 @@ __device__ void moe_gemm_gguf_decode_device(
 extern "C" __global__ void moe_gemm_gguf_##NAME( \
     const void * __restrict__ all_weights, \
     const void * __restrict__ all_inputs, \
-    const int32_t* __restrict__ sorted_token_ids, \
-    const int32_t* __restrict__ expert_ids, \
+    const uint32_t* __restrict__ sorted_token_ids, \
+    const uint32_t* __restrict__ expert_ids, \
     const float* __restrict__ topk_weights, \
     float * __restrict__ all_outputs, \
     int num_experts, int topk, \
@@ -517,7 +517,7 @@ template<typename T, int qk, typename block_q_t, int wrap_size>
 __device__ void moe_gemm_gguf_prefill_device(
     const T* __restrict__ input,
     const uint8_t* __restrict__ weights,
-    const int32_t* __restrict__ sorted_token_ids,
+    const uint32_t* __restrict__ sorted_token_ids,
     const int32_t* __restrict__ expert_offsets,
     const float* __restrict__ topk_weights,
     float* __restrict__ output,
@@ -701,7 +701,7 @@ __device__ void moe_gemm_gguf_prefill_device(
 extern "C" __global__ void moe_gemm_gguf_prefill_##T_TYPE##_##NAME( \
     const T_TYPE* __restrict__ input, \
     const uint8_t* __restrict__ weights, \
-    const int32_t* __restrict__ sorted_token_ids, \
+    const uint32_t* __restrict__ sorted_token_ids, \
     const int32_t* __restrict__ expert_offsets, \
     const float* __restrict__ topk_weights, \
     float* __restrict__ output, \
