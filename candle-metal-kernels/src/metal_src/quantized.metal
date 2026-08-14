@@ -7583,7 +7583,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
 
 // same as kernel_mul_mm_impl, but src1 and dst are accessed via indices stored in rowids
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
-void kernel_mul_mm_id_impl(
+METAL_FUNC inline void kernel_mul_mm_id_impl(
         device const  uchar * src0,
         device const  uchar * src1,
         threadgroup ushort2 * rowids,
@@ -7598,8 +7598,8 @@ void kernel_mul_mm_id_impl(
         constant   uint64_t & nb11,
         constant   uint64_t & nb12,
         constant    int64_t & ne0,
-        constant    int64_t & ne1,
-        constant    int64_t & ne0ne1,
+                    int64_t   ne1,
+                    int64_t   ne0ne1,
         threadgroup   uchar * shared_memory,
         uint3                 tgpig[[threadgroup_position_in_grid]],
         uint                  tiitg[[thread_index_in_threadgroup]],
