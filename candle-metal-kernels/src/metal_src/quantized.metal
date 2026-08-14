@@ -7598,9 +7598,9 @@ void kernel_mul_mm_id_impl(
         constant   uint64_t & nb11,
         constant   uint64_t & nb12,
         constant    int64_t & ne0,
-                    int64_t   ne1,
-                    int64_t   ne0ne1,
-        threadgroup   uchar * shared_memory [[threadgroup(0)]],
+        constant    int64_t & ne1,
+        constant    int64_t & ne0ne1,
+        threadgroup   uchar * shared_memory,
         uint3                 tgpig[[threadgroup_position_in_grid]],
         uint                  tiitg[[thread_index_in_threadgroup]],
         uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
