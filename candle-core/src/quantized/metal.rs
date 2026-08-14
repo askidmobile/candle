@@ -444,14 +444,14 @@ impl QMetalStorage {
             )
         }
 
-        // Yttri 2026-05-06: enable the mm-path for Q4K/Q6K (Q4_K_M is the main dtype of
+        // Enable the mm-path for Q4K/Q6K (Q4_K_M is the main dtype of
         // Qwen3.5-2B + Q6K embedding) -- it gives ~8x prefill speedup (2048
         // vector matmul -> 1 matrix matmul). The corresponding kernels
         // `kernel_mul_mm_q{4,6}_K_f{32,16}` are defined in quantized.metal.
         //
         // The remaining K-quants (Q2/Q3/Q5/Q8) and IQ-quants still go through
         // fwd_mv: either there is no mm-kernel, or there are alignment issues. If
-        // new dtypes appear in Yttri models -- extend this list.
+        // new dtypes appear in supported models -- extend this list.
         if matches!(
             self.dtype,
             GgmlDType::Q2K

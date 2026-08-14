@@ -1,6 +1,6 @@
 // delta_rule.cu — CUDA compute kernels для DeltaNet delta_rule (per-token decode).
 //
-// Прямой порт Metal-ядер из Yttri (modules/ai/local_llm/metal/delta_rule.metal).
+// Port of Metal delta_rule kernels for DeltaNet recurrent state update.
 // Математика и layout идентичны Metal-референсу — это portable-эквивалент
 // fused GPU-пути для Windows/Linux (NVIDIA), устраняющий GPU↔CPU sync на
 // рекуррентном шаге DeltaNet.

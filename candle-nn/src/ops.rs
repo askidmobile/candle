@@ -1143,17 +1143,17 @@ impl candle::CustomOp3 for Sdpa {
         "metal-sdpa"
     }
 
-    /// CPU implementation of SDPA (T-286).
+    /// CPU implementation of SDPA.
     ///
     /// Supports:
-    /// - mask=None (most common case: Yttri quantized_qwen35, RustASR
+    /// - mask=None (most common case: quantized_qwen35, ASR
     ///   Qwen3-ASR encoder, gigaam conformer).
     /// - do_causal=false/true.
     /// - softcapping (any value, including 1.0 -- no effect).
     /// - GQA: n_q_heads = group_size x n_kv_heads.
     /// - F32 / F16 / BF16 dtypes (compute in F32, output in the input dtype).
     ///
-    /// Does NOT support: mask=Some (z_image transformer use case, not Yttri/RustASR).
+    /// Does NOT support: mask=Some (z_image transformer use case).
     /// Performance: O(b * n_q * q_seq * k_seq * (head_k + head_v)). Parallelism
     /// via rayon par_iter over (batch, head, q_seq) pairs.
     fn cpu_fwd(
@@ -1169,7 +1169,7 @@ impl candle::CustomOp3 for Sdpa {
 
         if self.mask.is_some() {
             candle::bail!(
-                "CPU SDPA: external mask not yet implemented (T-286 minimal scope). \
+                "CPU SDPA: external mask not yet implemented. \
                  Use do_causal or pre-merge mask into q/k bias."
             );
         }

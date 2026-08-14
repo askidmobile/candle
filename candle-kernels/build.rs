@@ -21,7 +21,7 @@ fn main() -> Result<()> {
 
     bindings.write(&ptx_path)?;
 
-    // T-331 / Phase 0 (dynamic-loading): MoE kernels (libmoe.a) and the associated
+    // Phase 0 (dynamic-loading): MoE kernels (libmoe.a) and the associated
     // `rustc-link-lib=dylib=cudart` are REMOVED. The cudart link here made the exe
     // hard-dependent on cudart64_*.dll at startup (STATUS_ENTRYPOINT_NOT_FOUND on
     // machines without CUDA), which defeats the goal of dynamic-loading (cudarc

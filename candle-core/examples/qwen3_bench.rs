@@ -17,7 +17,7 @@ use std::time::Instant;
 
 const GGUF_PATH: &str = concat!(
     env!("HOME"),
-    "/Library/Application Support/com.yttri.app/models/qwen3-0.6b/qwen3-0.6b-q4_0.gguf"
+    "./models/qwen3-0.6b/qwen3-0.6b-q4_0.gguf"
 );
 
 fn main() -> Result<()> {

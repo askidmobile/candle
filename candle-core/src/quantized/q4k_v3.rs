@@ -1,4 +1,4 @@
-//! T-278 Phase 0: bridge for `kernel_mul_mm_q4_K_f32_v3` (Level 1 threadgroup tile cache).
+//! Bridge for `kernel_mul_mm_q4_K_f32_v3` (Level 1 threadgroup tile cache).
 //!
 //! SKELETON STATE: functionally identical to `q4k_opt::matmul_q4k_opt_metal`,
 //! differs only in the pipeline name (calls `call_quantized_matmul_mm_q4k_v3`).
@@ -18,7 +18,7 @@ mod metal_impl {
     use crate::quantized::{GgmlDType, QStorage, QTensor};
     use crate::{MetalStorage, Result, Shape, Storage, Tensor};
 
-    /// T-278 Phase 0: dispatch V3 Q4_K_M matmul (skeleton).
+    /// Dispatch V3 Q4_K_M matmul (skeleton).
     ///
     /// Same requirements as `matmul_q4k_opt_metal`:
     /// - `qtensor.dtype() == GgmlDType::Q4k`

@@ -1,9 +1,9 @@
-//! T-280 Level 3: bridge for `kernel_mul_mm_q4_K_f32_v4` (Full Half Pipeline).
+//! Bridge for `kernel_mul_mm_q4_K_f32_v4` (Full Half Pipeline).
 //!
 //! Final piece of the Q4_K_M kernel optimization journey: the mc accumulator converts
 //! `simdgroup_float8x8` -> `simdgroup_half8x8` to bypass the F32 limiter (92.28%
 //! in the V3 measurement). Lossy: fp16 accumulator numerical drift over the K dimension --
-//! gate cosine >= 0.99 + semantic eq >= 8/10 (see the T-280 spec).
+//! gate cosine >= 0.99 + semantic eq >= 8/10.
 //!
 //! Reuses `Q4KOptMetadataGpu` from `q4k_opt` -- the same metadata buffer for V2/V3/V4.
 
@@ -18,7 +18,7 @@ mod metal_impl {
     use crate::quantized::{GgmlDType, QStorage, QTensor};
     use crate::{MetalStorage, Result, Shape, Storage, Tensor};
 
-    /// T-280 Level 3: dispatch V4 Q4_K_M matmul (full half pipeline).
+    /// Dispatch V4 Q4_K_M matmul (full half pipeline).
     ///
     /// Same requirements as `matmul_q4k_opt_metal` / `matmul_q4k_v3_metal`:
     /// - `qtensor.dtype() == GgmlDType::Q4k`

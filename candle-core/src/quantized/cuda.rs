@@ -721,7 +721,7 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
-            // T-283: IQ-types added in candle-fork for polish, CUDA dequant
+            // IQ-types added in candle-fork, CUDA dequant
             // not yet implemented -- fallback via bail.
             _ => crate::bail!("unsupported dtype for cuda dequantize: {:?}", self.dtype),
         }

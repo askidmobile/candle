@@ -644,7 +644,7 @@ impl Tensor {
     unary_op!(relu, Relu);
     unary_op!(silu, Silu);
 
-    /// Fused SiLU(self) * rhs -- direct Metal dispatch (T-275).
+    /// Fused SiLU(self) * rhs -- direct Metal dispatch.
     ///
     /// On Metal: one kernel `bsilu_mul_<dtype>` instead of two (`silu` + `mul`).
     /// On CPU / non-Metal: fallback via `self.silu()? * rhs`.

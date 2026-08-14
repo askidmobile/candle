@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 /// Element-wise kernels are safe for self-aliasing: each thread reads
 /// and writes a single element independently (no read-all-then-write phases).
 ///
-/// Default ON (T-269 Phase 5 promote). Emergency revert via YTTRI_INPLACE_OPS=0.
+/// Default ON. Revert via CANDLE_INPLACE_OPS=0.
 /// Skip: RmsNorm, Softmax, Rope -- they need a 2-pass or pair-wise rotation.
 ///
 /// Cached via OnceLock: env::var() is read once on the first call, then a
@@ -36,7 +36,7 @@ fn inplace_ops_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("YTTRI_INPLACE_OPS")
+        std::env::var("CANDLE_INPLACE_OPS").or_else(|_| std::env::var("YTTRI_INPLACE_OPS"))
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true)
     })
@@ -123,7 +123,7 @@ pub struct MetalStorage {
     /// Byte offset of this storage's data within `buffer`.
     ///
     /// For most allocations this is 0. Non-zero when the storage occupies
-    /// a sub-region of a shared backing MTLBuffer (T-269 Phase 3c unified arena).
+    /// a sub-region of a shared backing MTLBuffer (unified arena).
     buffer_offset: usize,
     /// a reference to the device owning this buffer
     device: MetalDevice,
@@ -737,7 +737,7 @@ impl BackendStorage for MetalStorage {
         // 1. arc strong_count == 1 (only this tensor owns the buffer)
         // 2. layout is contiguous (output elements match input 1:1)
         // 3. dtype does not change (element-wise unary preserves the type)
-        // 4. env flag YTTRI_INPLACE_OPS (default ON, T-269 Phase 5; YTTRI_INPLACE_OPS=0 to revert)
+        // 4. env flag CANDLE_INPLACE_OPS (default ON; CANDLE_INPLACE_OPS=0 to revert)
         // Metal element-wise kernels: each GPU thread reads src[i] ->
         // computes -> writes dst[i]. No cross-thread dependencies,
         // no read-all-then-write phase. Self-aliasing (src == dst) is safe.
@@ -1846,7 +1846,7 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        // T-269 Phase 3c: unified arena for the output buffer.
+        // Unified arena for the output buffer.
         // NOTE: the KV cache issue is not solved -- when using the unified arena
         // the KV cache may end up in the arena and be corrupted after reset.
         // For now we use the regular pool (offset=0) for all ops except those
@@ -1877,7 +1877,7 @@ impl BackendStorage for MetalStorage {
             rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
             &rhs.buffer,
             &buffer,
-            0, // output_offset=0 (pool buffer); T-269 Phase 3c session 2 activates the unified arena
+            0, // output_offset=0 (pool buffer)
         )
         .map_err(MetalError::from)?;
 
@@ -2029,7 +2029,7 @@ impl MetalStorage {
         }
     }
 
-    /// Create a MetalStorage with a non-zero base offset (T-269 Phase 3c unified arena).
+    /// Create a MetalStorage with a non-zero base offset (unified arena).
     ///
     /// `buffer_offset` -- byte offset of this tensor's data within `buffer`.
     /// Used when multiple tensors share one large backing allocation.
@@ -2130,7 +2130,7 @@ impl MetalStorage {
         let k = k.min(vocab_size).max(1);
 
         const THREADS: usize = 256;
-        // FIX (Yttri 2026-06-30): was `(vocab_size + THREADS - 1) / THREADS` (~970 for
+        // FIX: was `(vocab_size + THREADS - 1) / THREADS` (~970 for
         // vocab=248K). But the kernel strides the WHOLE vocab via `tid` (`i += block_dim`), NOT via
         // `tile_id` -> all ~970 threadgroups did IDENTICAL work (970x redundancy), and the
         // output buffer ballooned to `tile_count*THREADS*k = vocab*k` (~10M elements),
@@ -2291,7 +2291,7 @@ impl MetalStorage {
         // 1. output dtype == lhs dtype (not a comparison op -- those yield U8)
         // 2. both inputs are contiguous (otherwise the strided path needs a separate buffer)
         // 3. strong_count(lhs.buffer) == 1
-        // 4. env flag YTTRI_INPLACE_OPS (default ON, T-269 Phase 5)
+        // 4. env flag CANDLE_INPLACE_OPS (default ON)
         // Metal binary kernel: thread[i] reads lhs[i] and rhs[i] independently ->
         // writes out[i]. lhs[i] is read before writing to out[i] (same address) --
         // no race even when lhs == out.
@@ -2347,7 +2347,7 @@ impl MetalStorage {
     /// Fused SiLU(lhs) * rhs -- direct Metal dispatch without CustomOp2 overhead.
     ///
     /// Requires: both tensors contiguous, same shape, same dtype (F32/F16/BF16).
-    /// Used in Mlp::forward for the SwiGLU gate path (T-275).
+    /// Used in Mlp::forward for the SwiGLU gate path.
     pub fn silu_mul_metal_direct(
         &self,
         rhs: &Self,

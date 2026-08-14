@@ -1,4 +1,4 @@
-// Pre-allocated scratch arena for intermediate Metal buffers (T-269 Phase 2 + Phase 3c).
+// Pre-allocated scratch arena for intermediate Metal buffers.
 //
 // Slot lifecycle:
 // 1. arena.try_acquire(size) -> Some(Arc<Buffer>) if a free slot is found
@@ -9,7 +9,7 @@
 // 5. The next try_acquire sees strong_count == 1 -> reuse is safe.
 //
 // Safety: arena reuse is possible ONLY after an external fence.
-// The caller (Yttri forward()) must call wait_until_completed_fast() BEFORE
+// The caller must call wait_until_completed_fast() BEFORE
 // the next allocate_buffer() so the GPU has finished writing to previous slots.
 // This is guaranteed by the sync-per-4-layers point in the prefill loop.
 

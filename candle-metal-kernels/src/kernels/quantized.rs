@@ -456,7 +456,7 @@ pub fn call_quantized_get_rows(
         GgmlDType::Q6K => "kernel_get_rows_q6_K",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
-        // IQ* variants unsupported on Metal (T-283: wildcard for new GGML dtypes)
+        // IQ* variants unsupported on Metal (wildcard for new GGML dtypes)
         GgmlDType::IQ2XXS
         | GgmlDType::IQ2XS
         | GgmlDType::IQ3XXS
@@ -515,7 +515,7 @@ fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
 
-/// T-275 Phase 3: dispatch for the optimized Q4_K_M + F32 input matmul kernel.
+/// Dispatch for the optimized Q4_K_M + F32 input matmul kernel.
 ///
 /// Uses `kernel_mul_mm_q4_K_f32_opt` with an additional `scales_repacked`
 /// buffer (16 f16 per Q4_K block, layout V1 from `Q4KOptMetadata`).
@@ -630,7 +630,7 @@ pub fn call_quantized_matmul_mm_q4k_opt(
     Ok(())
 }
 
-/// T-278 Phase 0: bridge for kernel_mul_mm_q4_K_f32_v3.
+/// Bridge for kernel_mul_mm_q4_K_f32_v3.
 ///
 /// SKELETON STATE: functionally identical to `call_quantized_matmul_mm_q4k_opt`,
 /// the only difference is the pipeline state name. It will be rewritten in Phase 1 when
@@ -736,10 +736,10 @@ pub fn call_quantized_matmul_mm_q4k_v3(
     Ok(())
 }
 
-/// T-280 Level 3: bridge for kernel_mul_mm_q4_K_f32_v4.
+/// Bridge for kernel_mul_mm_q4_K_f32_v4.
 ///
 /// Full half pipeline kernel: ma+mb+mc all half. Bypasses the F32 limiter (92.28%
-/// in the V3 measurement) via a half mc accumulator. See the T-280 spec for detailed
+/// in the V3 measurement) via a half mc accumulator. See specifications for detailed
 /// rationale + risk model (lossy fp16 accumulation).
 ///
 /// Predicate / contract -- the same as V3 / `_opt`:

@@ -532,7 +532,7 @@ impl ModelWeights {
     /// Phase 7.D #6: zero-copy load from mmap'd GGUF.
     /// Creates ONE Metal NoCopy buffer for the whole mmap; each tensor is
     /// a sub-view via offset (WITHOUT copying into CPU heap or separate
-    /// Metal buffers). Equivalent to Yttri Local LLM `quantized_qwen35::
+    /// Metal buffers). Equivalent to `quantized_qwen35::
     /// from_gguf_zero_copy`.
     ///
     /// On a non-Metal device it falls back to the regular `from_gguf`. 

@@ -6924,25 +6924,24 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 & reg
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-275 Phase 2: dequantize_q4_K_opt — optimized Q4_K dequant с pre-packed scales/mins.
+// dequantize_q4_K_opt -- optimized Q4_K dequant with pre-packed scales/mins.
 //
-// Применённые recipe items (Xcode AI):
-//   1. ✅ Pre-packed dl/ml — обходит get_scale_min_k4_just2 + division by 16
-//   2. ✅ uint32-level unpack — 4 loads × 4 nibbles вместо 16 byte loads
-//   3. ⚠️ Group-level scale — НЕ применено (требует rewriting outer matmul loop,
-//          отдельная задача Phase 2.5)
+// Applied optimizations:
+//   1. Pre-packed dl/ml -- bypasses get_scale_min_k4_just2 + division by 16
+//   2. uint32-level unpack -- 4 loads x 4 nibbles instead of 16 byte loads
+//   3. Group-level scale
 //   4. ✅ Hoisted invariants — `hi`, `sb` computed once per call
-//   5. ✅ half intermediates — half dl × half nibble (вместо float × float)
+//   4. half intermediates -- half dl x half nibble (instead of float x float)
 //
 // scales_repacked layout per block (16 f16 values):
 //   [dl_0, ml_0, dl_1, ml_1, ..., dl_7, ml_7]
-//   где dl_i = d * scales[i], ml_i = dmin * mins[i].
+//   where dl_i = d * scales[i], ml_i = dmin * mins[i].
 //
-// Эквивалентность original `dequantize_q4_K`:
-//   Original применяет /16 factor для il>=2 (high nibble): `d / 16.h`.
+// Equivalence to original `dequantize_q4_K`:
+//   Original applies /16 factor for il>=2 (high nibble): `d / 16.h`.
 //   Combined: `dl_hi * (q & 0xF0) = (d/16 * scale) * (upper * 16) = d * scale * upper`.
-//   Здесь:    `dl * (q >> 4)     = (d * scale)    * upper            = d * scale * upper`.
-//   Одинаковый результат с одним dl per sub-block, без /16. Math saved: 8 divisions.
+//   Here: `dl * (q >> 4) = (d * scale) * upper = d * scale * upper`.
+//   Same result with single dl per sub-block, without /16. Math saved: 8 divisions.
 // ════════════════════════════════════════════════════════════════════════════════
 template <typename type4x4>
 void dequantize_q4_K_opt(
@@ -6951,17 +6950,17 @@ void dequantize_q4_K_opt(
     short il,                              // il in [0..15] (= nl for Q4_K)
     thread type4x4 & reg
 ) {
-    // Hoisted invariants — per-call вычисляются один раз вне inner unpack loop.
+    // Hoisted invariants -- computed once per call outside the inner unpack loop.
     const short sb = il / 2;                       // sub-block index: 0..7
     const half  dl = scales_repacked[sb * 2 + 0];
     const half  ml = scales_repacked[sb * 2 + 1];
     const bool  hi = (il & 2) != 0;                // il in {2,3,6,7,10,11,14,15} → high nibble
 
-    // 16-byte chunk of qs[] для этого il (16 bytes = 16 nibbles в low_path / high_path).
+    // 16-byte chunk of qs[] for this il (16 bytes = 16 nibbles in low_path / high_path).
     device const uchar * q = xb->qs + (il/4) * 32 + 16 * (il&1);
 
     // uint32-level unpack: 16 bytes = 4 × uint32. qs[] aligned to 16-byte boundary
-    // внутри block_q4_K (offset 16 после d/dmin/scales = total 16+128, divisible by 16).
+    // inside block_q4_K (offset 16 after d/dmin/scales = total 16+128, divisible by 16).
     device const uint32_t * q32 = (device const uint32_t *)q;
     const uint32_t p0 = q32[0];
     const uint32_t p1 = q32[1];
@@ -6969,7 +6968,7 @@ void dequantize_q4_K_opt(
     const uint32_t p3 = q32[3];
 
     // 16 elements: 4 chunks × 4 nibbles each. half intermediate, float final.
-    // Compiler разворачивает loop (constant bounds + #pragma unroll даёт fully unrolled).
+    // Compiler unrolls the loop (constant bounds + #pragma unroll gives fully unrolled).
     #pragma unroll(4)
     for (short chunk = 0; chunk < 4; ++chunk) {
         const uint32_t packed = chunk == 0 ? p0 : (chunk == 1 ? p1 : (chunk == 2 ? p2 : p3));
@@ -6977,25 +6976,25 @@ void dequantize_q4_K_opt(
         for (short j = 0; j < 4; ++j) {
             const uchar byte = (packed >> (j * 8)) & 0xFF;
             const uchar nibble = hi ? (byte >> 4) : (byte & 0x0F);
-            // half × half multiply, subtract ml, convert на финальном store.
+            // half x half multiply, subtract ml, convert on final store.
             reg[chunk][j] = float(dl * half(nibble)) - float(ml);
         }
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-277 Phase 2.5: dequantize_q4_K_opt_no_ml — returns dl*nibble БЕЗ ml subtract.
+// dequantize_q4_K_opt_no_ml -- returns dl*nibble WITHOUT ml subtract.
 //
-// Используется в kernel_mul_mm_q4_K_f32_opt_groupscale для group-level scale
-// rewriting (recipe item 3): ml subtract выносится из dequant в финальную
-// коррекцию accumulator'а через `acc -= ml * sum_x` один раз per sub-block.
+// Used in kernel_mul_mm_q4_K_f32_opt_groupscale for group-level scale rewriting.
+// ml subtract is moved from dequant to final accumulator correction.
+// accumulator correction via `acc -= ml * sum_x` once per sub-block.
 //
 // Recipe item 3 (Xcode AI):
 //   Avoid: `deq = scale * (q - zero); acc += deq * x`  ← per element
 //   Prefer: `partial += q * x; sumX += x; acc = scale*partial - ml*sumX`  ← per group
 //
-// Снижает 16 subtracts per dequant call (256 elements / 16 sub-blocks × 16 ops) ⟹ 0 в dequant.
-// Замена: 1 ml*sum_x correction после inner K-loop per sub-block в outer matmul.
+// Saves 16 subtracts per dequant call.
+// Replaced with 1 ml*sum_x correction after inner K-loop.
 // ════════════════════════════════════════════════════════════════════════════════
 template <typename type4x4>
 void dequantize_q4_K_opt_no_ml(
@@ -7004,10 +7003,10 @@ void dequantize_q4_K_opt_no_ml(
     short il,
     thread type4x4 & reg
 ) {
-    // Hoisted invariants — то же что в dequantize_q4_K_opt.
+    // Hoisted invariants -- same as in dequantize_q4_K_opt.
     const short sb = il / 2;
     const half  dl = scales_repacked[sb * 2 + 0];
-    // ml deliberately НЕ читаем — applied at acc-correction time.
+    // ml deliberately not read -- applied at acc-correction time.
     const bool  hi = (il & 2) != 0;
 
     device const uchar * q = xb->qs + (il/4) * 32 + 16 * (il&1);
@@ -7024,7 +7023,7 @@ void dequantize_q4_K_opt_no_ml(
         for (short j = 0; j < 4; ++j) {
             const uchar byte = (packed >> (j * 8)) & 0xFF;
             const uchar nibble = hi ? (byte >> 4) : (byte & 0x0F);
-            // Без ml subtract: только dl * nibble (half intermediate).
+            // Without ml subtract: only dl * nibble (half intermediate).
             reg[chunk][j] = float(dl * half(nibble));
         }
     }
@@ -7364,13 +7363,13 @@ kernel void kernel_get_rows_i32(
     }
 }
 
-// Полная дequantization квантованного буфера в half (F16) на GPU.
-// Каждый поток обрабатывает один блок из 16 элементов (один float4x4/half4x4).
-// Используется для CANDLE_DEQUANTIZE_ALL_F16 — материализация весов в F16
-// без промежуточного F32-копирования (экономия peak в 2 раза при load).
-// MSL: kernel position attributes должны быть consistent vector size.
-// Используем uint3 для tgpig и tptg (обращаемся к .x), uint для tiitg
-// (это допустимо — tiitg это linearized scalar index в threadgroup).
+// Full dequantization of a quantized buffer to half (F16) on GPU.
+// Each thread processes one block of 16 elements (one float4x4/half4x4).
+// Used for CANDLE_DEQUANTIZE_ALL_F16 -- materializes weights in F16 without intermediate F32 copy.
+// without an intermediate F32 copy (2x peak memory savings on load).
+// MSL: kernel position attributes must be consistent vector size.
+// Use uint3 for tgpig and tptg (.x access), uint for tiitg (linearized scalar index in threadgroup).
+// (tiitg is a linearized scalar index in the threadgroup).
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 kernel void kernel_dequantize_q_h(
         device const  void * src0,
@@ -7390,8 +7389,8 @@ kernel void kernel_dequantize_q_h(
     *(((device half4x4 *) dst) + ind) = temp;
 }
 
-// Аналогичный kernel для F32 — на случай явного запроса F32 dequantize на GPU
-// (сейчас в QMetalStorage::dequantize вся материализация идёт через CPU readback).
+// Analogous kernel for F32 -- for explicit F32 GPU dequantize requests.
+// (in QMetalStorage::dequantize materialization goes via CPU readback).
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
 kernel void kernel_dequantize_q_f(
         device const  void * src0,
@@ -7816,7 +7815,7 @@ template [[host_name("kernel_get_rows_iq4_nl")]]  kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get_rows_q<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
 
 //
-// dequantize-to-half (F16) — полная материализация квантованных весов в half на GPU
+// dequantize-to-half (F16) -- full GPU materialization of quantized weights to half
 //
 
 typedef decltype(kernel_dequantize_q_h<block_q4_0, 2, dequantize_q4_0>) dequantize_q_h_t;
@@ -7863,8 +7862,7 @@ template [[host_name("kernel_mul_mm_q4_K_f32")]]    kernel mat_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_q5_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q5_K,    QK_NL, dequantize_q5_K>;
 template [[host_name("kernel_mul_mm_q6_K_f32")]]    kernel mat_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   block_q6_K,    QK_NL, dequantize_q6_K>;
 
-// Fast-path variants: без bounds checking для aligned dimensions
-// (используется Yttri для Qwen3.5-4B где все размерности кратны tile=64×32)
+// Fast-path variants: no bounds checking for aligned dimensions (tile=64x32)
 // F32 input variants
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, true>) mat_mm_t_fast32_q4;
 template [[host_name("kernel_mul_mm_q4_K_f32_fast")]] kernel mat_mm_t_fast32_q4 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, true>;
@@ -7877,16 +7875,15 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_
 template [[host_name("kernel_mul_mm_q6_K_f16_fast")]] kernel mat_mm_t_fast16_q6 kernel_mul_mm<half, half4x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, half, true>;
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-275 Phase 2: kernel_mul_mm_q4_K_f32_opt — standalone optimized matmul kernel.
+// kernel_mul_mm_q4_K_f32_opt -- standalone optimized matmul kernel.
 //
-// Specialized для Q4_K_M weights + F32 input + FAST_PATH (aligned dimensions
-// для Qwen3.5-4B). Использует pre-packed dl/ml metadata через extra parameter
-// `scales_repacked`, обходя on-the-fly Q4_K dequant pipeline.
+// Specialized for Q4_K_M weights + F32 input + FAST_PATH (aligned dimensions).
+// Uses pre-packed dl/ml metadata via extra parameter `scales_repacked`.
+// `scales_repacked`, bypassing the on-the-fly Q4_K dequant pipeline.
 //
-// Ожидаемое снижение ALU: 487 → ~410 instructions per dispatch (≈16% reduction).
+// Expected ALU reduction: 487 -> ~410 instructions per dispatch (~16% reduction).
 //
-// Compatibility: vanilla kernel_mul_mm_q4_K_f32_fast НЕ удалён, остаётся доступен
-// как v1 fallback через ENV var YTTRI_Q4K_KERNEL=v1.
+// Compatibility: vanilla kernel_mul_mm_q4_K_f32_fast remains available as fallback.
 // ════════════════════════════════════════════════════════════════════════════════
 kernel void kernel_mul_mm_q4_K_f32_opt(
     device const  uchar * src0                                                [[buffer(0)]],
@@ -7912,7 +7909,7 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
     uint                  tiitg                                               [[thread_index_in_threadgroup]],
     uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr short BLOCK_Q_NL       = QK_NL;   // = 16 для Q4_K
+    constexpr short BLOCK_Q_NL       = QK_NL;   // = 16 for Q4_K
     constexpr short SCALES_PER_BLOCK = 16;      // 8 sub-blocks × (dl, ml) interleaved
 
     threadgroup half  * sa = (threadgroup half  *)(shared_memory);
@@ -7922,12 +7919,12 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
     const uint r1 = tgpig.x;
     const uint im = tgpig.z;
 
-    // FAST_PATH: dimensions assumed aligned to BLOCK_SIZE_M/N (для Qwen3.5-4B всегда true).
+    // FAST_PATH: dimensions assumed aligned to BLOCK_SIZE_M/N.
     const short n_rows     = BLOCK_SIZE_M;
     const short n_cols     = BLOCK_SIZE_N;
     const short thread_row = ((short)tiitg / THREAD_PER_ROW);
     const short thread_col = ((short)tiitg / THREAD_PER_COL);
-    (void)n_rows; (void)n_cols;  // не используются в FAST_PATH store
+    (void)n_rows; (void)n_cols;  // unused in FAST_PATH store
 
     simdgroup_half8x8  ma[4];
     simdgroup_float8x8 mb[2];
@@ -7943,7 +7940,7 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
     const uint i13 = im / ne12;
 
     uint   offset0 = (i12/r2)*nb02 + (i13/r3)*nb03;
-    ushort offset1 = il / BLOCK_Q_NL;   // = 0 для Q4_K (il < 16 = BLOCK_Q_NL)
+    ushort offset1 = il / BLOCK_Q_NL;   // = 0 for Q4_K (il < 16 = BLOCK_Q_NL)
 
     device const block_q4_K * x = (device const block_q4_K *)(
         src0 + (r0*BLOCK_SIZE_M + thread_row)*nb01 + offset0) + offset1;
@@ -7954,14 +7951,14 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
         + nb10 * (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL)));
 
     // scales_repacked pointer: row-major. blocks_per_row = ne00 / QK_K.
-    // Per block 16 half (= 32 bytes) для 8 sub-blocks × (dl, ml).
+    // Per block 16 half (= 32 bytes) for 8 sub-blocks x (dl, ml).
     const uint blocks_per_row = (uint)ne00 / (uint)QK_K;
     const uint row_idx        = (uint)r0 * BLOCK_SIZE_M + (uint)thread_row;
     device const half * scales = scales_repacked
         + (row_idx * blocks_per_row + (uint)offset1) * SCALES_PER_BLOCK;
 
     for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
-        // Dequant 16 elements через pre-packed dl/ml + uint32 unpack (Recipe items 1, 2, 4, 5).
+        // Dequant 16 elements via pre-packed dl/ml + uint32 unpack.
         half4x4 temp_a;
         dequantize_q4_K_opt(x, scales, il, temp_a);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -7973,12 +7970,12 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        // F32 input: 8 элементов через vectorized float4 load.
+        // F32 input: 8 elements via vectorized float4 load.
         device const float4 * y4 = (device const float4 *) y;
         *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
             = float2x4(y4[0], y4[1]);
 
-        // Increment il + opt: x и scales advance simultaneously (1 block = 16 half).
+        // Increment il + opt: x and scales advance simultaneously (1 block = 16 half).
         const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
         if (il_next < 2) {
             x      += 1;
@@ -7989,7 +7986,7 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Matmul: 8 × simdgroup outer products (как в kernel_mul_mm).
+        // Matmul: 8 x simdgroup outer products (as in kernel_mul_mm).
         threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
         threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
 
@@ -8015,7 +8012,7 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
         }
     }
 
-    // FAST_PATH store: dimensions aligned, прямая запись в dst без bounds check.
+    // FAST_PATH store: dimensions aligned, direct write to dst without bounds check.
     device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
                            + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
     for (short i = 0; i < 8; i++) {
@@ -8024,26 +8021,26 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-279 Level 2: kernel_mul_mm_q4_K_f32_v3 — Half pipeline mb/sb (activation precision).
+
 //
-// T-278 closure обнаружила что threadgroup tile cache pattern уже в _opt (T-275)
-// — Level 1 hypothesis invalidated. РЕАЛЬНОЕ архитектурное отличие к llama.cpp
+
+// Difference from llama.cpp:
 // kernel_mul_mm_q4_K_f32 (ggml-metal.metal:9297) = precision pipeline mb/sb:
 //   - llama.cpp: S1=half, simdgroup_half8x8 mb, threadgroup half sb
-//   - наш _opt:  float, simdgroup_float8x8 mb, threadgroup float sb
+//   - _opt: float, simdgroup_float8x8 mb, threadgroup float sb
 //
-// T-279 = 4 точечные изменения в этом kernel body:
-//   1. sb: threadgroup float → threadgroup half (line ниже)
+
+    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  // float -> half
 //   2. mb: simdgroup_float8x8 → simdgroup_half8x8
-//   3. Activation store: F32 input → half2x4 cast при store в sb
-//   4. lsmb pointer: threadgroup float → threadgroup half
-// Weight pipeline (ma/sa) уже half — не трогаем. Accumulator (mc) остаётся float
-// для финальной precision.
+//   3. Activation store: F32 input -> half2x4 cast on store in sb
+    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  // float -> half
+// Weight pipeline (ma/sa) is already half. Accumulator (mc) stays float
+// for final precision.
 //
 // Expected gain: Float32 cost 67.88% → 40-50%, prefill mail-cat-1200 ≤1950 ms
-// (-10% от T-275 baseline 2167 ms), Memory delta -2048 bytes (sb shrinks 4096→2048).
+// Memory delta -2048 bytes (sb shrinks 4096->2048).
 // Risk: numerical drift fp16 × fp16 matmul intermediates — parity gate
-// relaxed cosine ≥ 0.999 + semantic eq ≥ 9/10 (см. T-279 spec).
+// relaxed cosine >= 0.999.
 // ════════════════════════════════════════════════════════════════════════════════
 kernel void kernel_mul_mm_q4_K_f32_v3(
     device const  uchar * src0                                                [[buffer(0)]],
@@ -8069,14 +8066,14 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
     uint                  tiitg                                               [[thread_index_in_threadgroup]],
     uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
 ) {
-    // T-279: Half pipeline для activation tile (sb) и matmul mb. Weight tile (sa)
-    // остаётся half как в _opt. См. header comment выше для подробного rationale.
+    
+    // stays half as in _opt. See the header comment above for rationale.
 
     constexpr short BLOCK_Q_NL       = QK_NL;
     constexpr short SCALES_PER_BLOCK = 16;
 
     threadgroup half  * sa = (threadgroup half  *)(shared_memory);
-    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  // T-279: float → half
+    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  
 
     const uint r0 = tgpig.y;
     const uint r1 = tgpig.x;
@@ -8089,8 +8086,8 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
     (void)n_rows; (void)n_cols;
 
     simdgroup_half8x8  ma[4];
-    simdgroup_half8x8  mb[2];  // T-279: float → half (matches llama.cpp S1_8x8)
-    simdgroup_float8x8 mc[8];  // accumulator stays float для финальной precision
+    simdgroup_half8x8  mb[2];  
+    simdgroup_float8x8 mc[8];  // accumulator stays float for final precision
 
     for (short i = 0; i < 8; i++) {
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
@@ -8129,7 +8126,7 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
             +                     (tiitg/THREAD_PER_ROW)%8  + (i&7)*8) = temp_a[i/4][i%4];
         }
 
-        // T-279: F32 input → half cast при store в sb (matches llama.cpp pattern)
+        
         device const float4 * y4 = (device const float4 *) y;
         *(threadgroup half2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
             = half2x4(half4(y4[0]), half4(y4[1]));
@@ -8145,7 +8142,7 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup half  * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
-        threadgroup half  * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));  // T-279: float → half
+        threadgroup half  * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));  
 
         #pragma unroll(4)
         for (short ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
@@ -8177,14 +8174,14 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-280 Level 3: kernel_mul_mm_q4_K_f32_v4 — Full Half Pipeline (final piece).
+
 //
-// T-279 closure обнаружил что F32 Limiter = 92.28% (V3 measurement) — kernel
+
 // throughput limited by fp32 accumulator (mc) MMA throughput. mb half conversion
-// (T-279) дало bit-exact но no gain потому что mc остаётся fp32.
+// Bit-exact, but mc remains fp32.
 //
-// T-280 = final architectural change: mc accumulator → HALF.
-// 3 точечные изменения относительно V3:
+
+// 3 changes relative to V3:
 //   1. mc: simdgroup_float8x8 → simdgroup_half8x8
 //   2. mc init: make_filled_simdgroup_matrix<float,8>(0.f) → <half,8>((half)0.0)
 //   3. simdgroup_store: half mc → float* dst (Metal auto-conversion verified)
@@ -8192,13 +8189,13 @@ kernel void kernel_mul_mm_q4_K_f32_v3(
 // Expected gain:
 //   - F32 Limiter 92.28% → ≤40% (target ≤25%)
 //   - F16 Limiter 3.05% → ≥50% (new dominant limiter)
-//   - Prefill mail-1200 ≤ 1700 ms (-15%+ от T-275 baseline 2167 ms)
+//   - Optimized prefill latency
 // Risks:
-//   - fp16 accumulator over K=2560-9216 → rounding drift (особенно GatedAttention)
-//   - fp16 max=65504 — edge case overflow possible на larger activations
+//   - fp16 accumulator over K=2560-9216 -> potential rounding drift
+//   - fp16 max=65504 -- edge case overflow possible on larger activations
 // Mitigation:
-//   - Cosine V4 vs V2 ≥ 0.99 + semantic eq ≥ 8/10 (relaxed gate per T-280 spec)
-//   - Automatic fallback к V3/V2 через dispatch_q4k_matmul (T-280 spec FR-010)
+//   - Cosine V4 vs V2 ≥ 0.99 + semantic eq ≥ 8/10 (relaxed gate per  spec)
+//   - Fallback to V3/V2 via dispatch_q4k_matmul
 // ════════════════════════════════════════════════════════════════════════════════
 kernel void kernel_mul_mm_q4_K_f32_v4(
     device const  uchar * src0                                                [[buffer(0)]],
@@ -8224,7 +8221,7 @@ kernel void kernel_mul_mm_q4_K_f32_v4(
     uint                  tiitg                                               [[thread_index_in_threadgroup]],
     uint                  sgitg                                               [[simdgroup_index_in_threadgroup]]
 ) {
-    // T-280: Full half pipeline. Body identical to V3 except mc accumulator
+    
     // — ma/sa/mb/sb inherited unchanged from V3.
 
     constexpr short BLOCK_Q_NL       = QK_NL;
@@ -8245,10 +8242,10 @@ kernel void kernel_mul_mm_q4_K_f32_v4(
 
     simdgroup_half8x8  ma[4];
     simdgroup_half8x8  mb[2];
-    simdgroup_half8x8  mc[8];  // T-280: float → half (bypass F32 Limiter)
+    simdgroup_half8x8  mc[8];  
 
     for (short i = 0; i < 8; i++) {
-        mc[i] = make_filled_simdgroup_matrix<half, 8>((half)0.0);  // T-280: half init
+        mc[i] = make_filled_simdgroup_matrix<half, 8>((half)0.0);  
     }
 
     short il = (tiitg % THREAD_PER_ROW);
@@ -8318,21 +8315,21 @@ kernel void kernel_mul_mm_q4_K_f32_v4(
 
             #pragma unroll(8)
             for (short i = 0; i < 8; i++){
-                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);  // T-280: half × half → half acc
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);  
             }
         }
     }
 
-    // T-280: half mc → float* dst conversion path.
-    // Metal `simdgroup_store` НЕ поддерживает implicit half → float type conversion
+    
+    // Metal `simdgroup_store` does NOT support implicit half -> float type conversion
     // (template T deduction conflict — error confirmed Phase 1 smoke). Manual path:
     //   1. simdgroup_store half mc → threadgroup half buffer (per-simdgroup slot)
     //   2. simdgroup_barrier (sync threads within simdgroup)
     //   3. Per-thread half→float conversion + write to device dst
     //
-    // Memory: 4 simdgroups × 64 halves = 512 bytes threadgroup (fits в spare budget).
-    // Each thread в simdgroup пишет 2 элемента (32 threads × 2 = 64 elements per matrix).
-    threadgroup half mc_tile_buf[4 * 64];  // T-280: per-simdgroup half storage for conversion
+    // Memory: 4 simdgroups x 64 halves = 512 bytes threadgroup (fits in budget).
+    // Each thread in a simdgroup writes 2 elements (32 threads x 2 = 64 elements per matrix).
+    threadgroup half mc_tile_buf[4 * 64];  
 
     device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
                            + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
@@ -8351,20 +8348,20 @@ kernel void kernel_mul_mm_q4_K_f32_v4(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// T-277 Phase 2.5: kernel_mul_mm_q4_K_f32_opt_groupscale — group-level scale rewriting.
+// kernel_mul_mm_q4_K_f32_opt_groupscale -- group-level scale rewriting.
 //
-// SKELETON STATE (commit TBD после Xcode AI consultation на math details):
+// SKELETON STATE:
 //   ✅ Structure: copy of kernel_mul_mm_q4_K_f32_opt
-//   ✅ dequantize_q4_K_opt_no_ml вместо dequantize_q4_K_opt
-//   ⏳ TODO 1: Дополнительный accumulator для sum_x per N-tile
-//   ⏳ TODO 2: ml lookup отдельно (НЕ через dequant, на correction step)
-//   ⏳ TODO 3: Финальная коррекция `mc -= ml * sum_x` per sub-block
-//   ⏳ TODO 4: simdgroup primitive для column sum (sum_x) — efficient reduction
+//   - dequantize_q4_K_opt_no_ml instead of dequantize_q4_K_opt
+//   - TODO 1: Additional accumulator for sum_x per N-tile
+//   - TODO 2: ml lookup separately (not via dequant, on correction step)
+//   - TODO 3: Final correction `mc -= ml * sum_x` per sub-block
+//   - TODO 4: simdgroup primitive for column sum (sum_x) -- efficient reduction
 //
-// Expected gain после math fill-in: ALU 482 → ~400 (-16%), prefill +10-15%.
-// Risk: numerical drift из-за reordering FP accumulation — parity test (cosine>0.999) gate.
+// Expected gain after math fill-in: ALU 482 -> ~400 (-16%).
+// Risk: numerical drift due to reordered FP accumulation.
 // ════════════════════════════════════════════════════════════════════════════════
-kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
+// kernel_mul_mm_q4_K_f32_opt_groupscale -- group-level scale rewriting.
     device const  uchar * src0                                                [[buffer(0)]],
     device const  half  * scales_repacked                                     [[buffer(1)]],
     device const  uchar * src1                                                [[buffer(2)]],
@@ -8408,10 +8405,10 @@ kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
     simdgroup_float8x8 mb[2];
     simdgroup_float8x8 mc[8];
 
-    // TODO 1: Add accumulators для sum_x corrections.
-    //   - Один simdgroup_float8x8 m_sumx[2] (matches mb shape) для column sum of input X
-    //   - Или per-mc correction вектор (8 × float scalar — column sum per output column)
-    //   Решение зависит от Xcode AI рекомендации (Q1, Q3 в промпте).
+    // TODO 1: Add accumulators for sum_x corrections.
+    //   - One simdgroup_float8x8 m_sumx[2] (matches mb shape) for column sum of input X
+    //   - Or a per-mc correction vector (8 x float scalar -- column sum per output column)
+    //   Implementation details TBD.
     //
     //   Tentative skeleton:
     //   simdgroup_float8x8 m_sumx[2];     // accumulates raw column sums of B tile
@@ -8445,7 +8442,7 @@ kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
         + (row_idx * blocks_per_row + (uint)offset1) * SCALES_PER_BLOCK;
 
     for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
-        // Dequant БЕЗ ml subtract (just dl * nibble).
+        // Dequant without ml subtract (just dl * nibble).
         half4x4 temp_a;
         dequantize_q4_K_opt_no_ml(x, scales, il, temp_a);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -8461,10 +8458,10 @@ kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
         *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL))
             = float2x4(y4[0], y4[1]);
 
-        // TODO 2: Read ml для текущего sub-block (one ml per il/2 step).
+        // Read ml for the current sub-block.
         //   const short sb = il / 2;
         //   const half ml = scales[sb * 2 + 1];
-        //   Это short scope: используется в correction step ниже.
+        //   Used in the correction step below.
 
         const short il_next = (il + 2 < BLOCK_Q_NL) ? il + 2 : il % 2;
         if (il_next < 2) {
@@ -8496,30 +8493,30 @@ kernel void kernel_mul_mm_q4_K_f32_opt_groupscale(
 
             #pragma unroll(8)
             for (short i = 0; i < 8; i++){
-                // mc accumulates dl*q*x (без ml correction).
+                // mc accumulates dl*q*x (without ml correction).
                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
 
-                // TODO 3: Параллельно accumulate sum_x для correction.
-                //   Идея A — sum_x as separate simdgroup matrix accumulation:
+                // TODO 3: Concurrently accumulate sum_x for correction.
+                //   Option A -- sum_x as separate simdgroup matrix accumulation:
                 //     simdgroup_multiply_accumulate(m_sumx[i%4], mb[i/4], ones_matrix, m_sumx[i%4]);
-                //   Идея B — column sum через simdgroup_reduce (если есть primitive):
+                //   Option B -- column sum via simdgroup_reduce:
                 //     simdgroup_reduce_add(mb[i/4]) → scalar per column
                 //
                 // TODO 4: Accumulate ml correction:
                 //   m_ml_corr[i] += ml * sum_x_contribution
-                //   Это нужно делать **per sub-block transition** (когда il/2 changes),
-                //   а не каждую ik iteration. Точное место — TBD.
+                //   This should be done per sub-block transition (when il/2 changes),
+                //   not on every ik iteration.
             }
         }
     }
 
-    // TODO 5: Финальная коррекция mc → mc - m_ml_corr.
+    // TODO 5: Final correction mc -> mc - m_ml_corr.
     //   for (short i = 0; i < 8; i++) {
     //       // subtract correction matrix from mc
-    //       // — exact API simdgroup_matrix subtract нужно проверить
+    //       // simdgroup_matrix subtract API
     //   }
 
-    // Store: пока identical с _opt kernel (skeleton state).
+    // Store: identical to the _opt kernel (skeleton state).
     device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg & 1)) \
                            + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
     for (short i = 0; i < 8; i++) {

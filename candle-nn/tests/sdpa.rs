@@ -187,7 +187,7 @@ mod metal_sdpa_tests {
 }
 
 mod cpu_sdpa_tests {
-    // T-286: CPU SDPA -- critical for Windows embeddings + ASR on machines
+    // CPU SDPA -- critical for embeddings + ASR on machines
     // without working CUDA. Tests verify correctness against a naive implementation
     // via matmul + softmax.
     use candle::{DType, Device, Result, Shape, Tensor};
@@ -284,7 +284,7 @@ mod cpu_sdpa_tests {
 
     #[test]
     fn cpu_sdpa_gqa_f32() -> Result<()> {
-        // Yttri Qwen3.5-4B attention layers: n_q=16, n_kv=4, group=4.
+        // Qwen3.5-4B attention layers: n_q=16, n_kv=4, group=4.
         const BS: usize = 1;
         const N_Q: usize = 16;
         const N_KV: usize = 4;

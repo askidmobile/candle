@@ -1,4 +1,4 @@
-//! Pre-repacked Q4_K metadata for the optimized matmul kernel (Yttri T-275).
+//! Pre-repacked Q4_K metadata for the optimized matmul kernel.
 //!
 //! Background: the original `block_q4_K` stores scales/mins in a packed 6-bit format
 //! (12 bytes for 8 sub-blocks). The hot path Metal kernel spends ~9-13% of ALU
@@ -172,7 +172,7 @@ mod metal_impl {
         }
     }
 
-    /// T-275 Phase 4: dispatch the optimized Q4_K_M matmul directly (bypassing the CustomOp1 path).
+    /// Dispatch the optimized Q4_K_M matmul directly (bypassing the CustomOp1 path).
     ///
     /// Equivalent to `qmatmul.forward(xs)` but via `kernel_mul_mm_q4_K_f32_opt` with
     /// a pre-packed `scales_repacked` buffer.

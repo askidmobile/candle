@@ -15,7 +15,7 @@ pub struct MoeCfg {
 }
 
 // Dense FusedMoe (FFI moe_gemm) is removed: libmoe.a is not built under
-// dynamic-loading (T-331), and there is no alternative PTX path for dense MoE.
+// dynamic-loading, and there is no alternative PTX path for dense MoE.
 // Dense MoE models (qwen3-moe) use the naive expert-loop via standard matmul
 // (see Qwen3SparseMoeBlock). Quantized GGUF MoE -- FusedMoeGGUF below
 // (PTX path via QTensor::indexed_moe_forward).

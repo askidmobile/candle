@@ -1,7 +1,7 @@
 // Adapted from https://github.com/guoqingbao/attention.rs/blob/main/src/moe.rs
 //
 // FFI CUDA-GEMM path (`moe_gemm_wmma`/`moe_gemm_gguf[_prefill]`) is removed:
-// host symbols lived in `libmoe.a`, which is not built under T-331 dynamic-loading
+// host symbols lived in `libmoe.a`, which is not built under dynamic-loading
 // (see candle-kernels/build.rs). Any build linking this FFI failed at link time
 // with unresolved external symbol. The working MoE path on CUDA is
 // `QTensor::indexed_moe_forward` (PTX runtime, dynamic-loading-compatible;

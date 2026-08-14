@@ -22,11 +22,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use libc;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WeightResidencySet — MTLResidencySet lifecycle management (T-271 Phase 4 redux)
+// WeightResidencySet -- MTLResidencySet lifecycle management
 //
 // Goal: tell macOS that weight buffers (GGUF mmaps) are needed by the GPU permanently
 // and must not be evicted into compressed memory. This closes the 5.7x RSS gap
-// between Yttri (2.5 GB) and llama.cpp (434 MB) for the same model.
+// between default allocation and llama.cpp for the same model.
 //
 // Pattern from llama.cpp ggml-metal-device.m:
 // - A per-buffer residency set is created at the init of each Metal buffer
@@ -43,7 +43,7 @@ use libc;
 // - Drop calls endResidency() + removeAllAllocations() and joins the thread
 //
 // macOS version: MTLResidencySet is available since macOS 15.0. Checked at runtime
-// via sysctl kern.osproductversion. If < 15 or env YTTRI_DISABLE_RESIDENCY_SET=1
+// via sysctl kern.osproductversion. If < 15 or env CANDLE_DISABLE_RESIDENCY_SET=1
 // it returns None and behavior is unchanged.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -64,7 +64,7 @@ fn supports_residency_set() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         // Fast path via env override
-        if std::env::var("YTTRI_DISABLE_RESIDENCY_SET")
+        if std::env::var("CANDLE_DISABLE_RESIDENCY_SET").or_else(|_| std::env::var("YTTRI_DISABLE_RESIDENCY_SET"))
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
         {
@@ -156,13 +156,13 @@ unsafe impl Sync for WeightResidencySet {}
 
 impl WeightResidencySet {
     /// Create a new WeightResidencySet on the given MTLDevice.
-    /// Returns None if macOS < 15 or YTTRI_DISABLE_RESIDENCY_SET=1.
+    /// Returns None if macOS < 15 or CANDLE_DISABLE_RESIDENCY_SET=1.
     pub fn new(device: &Device) -> Option<Arc<Self>> {
         if !supports_residency_set() {
             return None;
         }
         let desc = MTLResidencySetDescriptor::new();
-        desc.setLabel(Some(&NSString::from_str("yttri-weights")));
+        desc.setLabel(Some(&NSString::from_str("weights-residency")));
         let raw_device: &ProtocolObject<dyn MTLDeviceProtocol> =
             ProtocolObject::from_ref(device.as_ref());
         let rset = raw_device.newResidencySetWithDescriptor_error(&desc).ok()?;
@@ -177,10 +177,10 @@ impl WeightResidencySet {
         // macOS may "forget" the residency under memory pressure; the heartbeat
         // periodically reminds the OS that the buffers are needed by the GPU.
         // The heartbeat thread requests requestResidency() every 30s
-        // only if YTTRI_WIRE_WEIGHTS=1. Otherwise the thread sleeps forever.
-        let wire_weights = std::env::var("YTTRI_WIRE_WEIGHTS").map(|v| v == "1").unwrap_or(false);
+        // only if CANDLE_WIRE_WEIGHTS=1. Otherwise the thread sleeps forever.
+        let wire_weights = std::env::var("CANDLE_WIRE_WEIGHTS").or_else(|_| std::env::var("YTTRI_WIRE_WEIGHTS")).map(|v| v == "1").unwrap_or(false);
         let handle = std::thread::Builder::new()
-            .name("yttri-residency-heartbeat".to_string())
+            .name("residency-heartbeat".to_string())
             .spawn(move || {
                 if !wire_weights {
                     // By default the heartbeat is inactive -- requestResidency is not called.
@@ -230,15 +230,15 @@ impl WeightResidencySet {
             // It wires memory into the GPU (non-evictable), increasing Physical footprint by ~500 MB.
             // Instead macOS manages eviction itself -- pages become resident
             // on demand at first GPU access.
-            // For explicit wiring: YTTRI_WIRE_WEIGHTS=1 (see request_residency()).
-            if std::env::var("YTTRI_WIRE_WEIGHTS").map(|v| v == "1").unwrap_or(false) {
+            // For explicit wiring: CANDLE_WIRE_WEIGHTS=1 (see request_residency()).
+            if std::env::var("CANDLE_WIRE_WEIGHTS").or_else(|_| std::env::var("YTTRI_WIRE_WEIGHTS")).map(|v| v == "1").unwrap_or(false) {
                 inner.rset.requestResidency();
                 inner.resident = true;
             }
             let alloc_size = inner.rset.allocatedSize();
             let alloc_mb = alloc_size / (1024 * 1024);
             eprintln!(
-                "[yttri] MTLResidencySet committed: {} allocations, ~{} MB tracked",
+                "[residency] MTLResidencySet committed: {} allocations, ~{} MB tracked",
                 inner.rset.allocationCount(),
                 alloc_mb,
             );
@@ -282,7 +282,7 @@ impl Drop for WeightResidencySet {
 use super::MetalError;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Allocation tracing API (T-269 Phase 1)
+// Allocation tracing API
 //
 // Default off -- no overhead in the hot path when tracing is inactive.
 // Activated via begin_allocation_trace() only during a calibration
@@ -340,7 +340,7 @@ fn record_trace(size: usize, rounded: usize, from_pool: bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scratch arena thread_local activation (T-269 Phase 2)
+// Scratch arena thread_local activation
 //
 // ACTIVE_ARENA holds the current scratch arena for this thread (if active).
 // It is activated via MetalDevice::activate_scratch_arena() before the prefill loop,
@@ -422,10 +422,10 @@ pub struct MetalDevice {
     pub(crate) seed_value: Arc<RwLock<u64>>,
     pub(crate) completion_aware_pool: bool,
 
-    /// MTLResidencySet for weight buffers (T-271 Phase 4 redux).
+    /// MTLResidencySet for weight buffers.
     ///
     /// Created via `new_weight_residency_set()` after device init.
-    /// None = macOS < 15 or YTTRI_DISABLE_RESIDENCY_SET=1.
+    /// None = macOS < 15 or CANDLE_DISABLE_RESIDENCY_SET=1.
     /// `new_buffer_no_copy` automatically adds buffers to this set.
     ///
     /// Arc<Mutex<>> so it can be mutated via &self (MetalDevice is Clone).
@@ -643,7 +643,7 @@ impl MetalDevice {
 
     /// Commit any pending command buffers to the GPU **without** waiting for
     /// completion. Enables CPU↔GPU pipelining when used inside hot loops
-    /// (e.g. Yttri Qwen3.5 prefill periodic flush at every N layers): CPU
+    /// (e.g. periodic flush at every N layers in prefill loop): CPU
     /// continues encoding the next batch of ops while GPU executes the
     /// committed work in parallel.
     ///
@@ -725,7 +725,7 @@ impl MetalDevice {
     /// MUST call `wait_until_completed_fast()` before reading any GPU outputs
     /// from CPU, or before any operation that might reuse buffers from this scope.
     ///
-    /// Designed for Yttri's multi-CB prefill: the prefill loop encodes all 32
+    /// Designed for multi-CB prefill: the prefill loop encodes all 32
     /// layers into one CB, then the caller waits once at the very end. This
     /// removes ~6 unnecessary commit→swap cycles during the prefill encoding
     /// phase, reducing CPU dispatch overhead.
@@ -772,7 +772,7 @@ impl MetalDevice {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // WeightResidencySet API (T-271 Phase 4 redux)
+    // WeightResidencySet API
     // ─────────────────────────────────────────────────────────────────────
 
     /// Create a WeightResidencySet for this device and set it as active.
@@ -782,7 +782,7 @@ impl MetalDevice {
     /// Returns an `Arc<WeightResidencySet>` -- keep it alive while the model lives.
     /// Call `commit_weight_residency()` after all weights are loaded.
     ///
-    /// If macOS < 15 or YTTRI_DISABLE_RESIDENCY_SET=1 -- returns None.
+    /// If macOS < 15 or CANDLE_DISABLE_RESIDENCY_SET=1 -- returns None.
     pub fn new_weight_residency_set(&self) -> Option<Arc<WeightResidencySet>> {
         let rset = WeightResidencySet::new(&self.device)?;
         if let Ok(mut guard) = self.weight_residency.lock() {
@@ -901,7 +901,7 @@ impl MetalDevice {
     /// The buffer is NOT added to the MetalDevice buffer pool -- it is tied to the mmap
     /// and must not be reused by other operations.
     ///
-    /// T-271 Phase 4 redux: if a `weight_residency` set is installed,
+    /// If a `weight_residency` set is installed,
     /// the buffer is automatically added via `addAllocation()` (uncommitted).
     /// Call `commit_weight_residency()` after all weights are loaded.
     ///
@@ -954,7 +954,7 @@ impl MetalDevice {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Scratch arena API (T-269 Phase 2)
+    // Scratch arena API
     // ─────────────────────────────────────────────────────────────────────
 
     /// Create a scratch arena with the given slot sizes.
@@ -972,7 +972,7 @@ impl MetalDevice {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // UnifiedScratchArena API (T-269 Phase 3c)
+    // UnifiedScratchArena API
     // ─────────────────────────────────────────────────────────────────────
 
     /// Create a UnifiedScratchArena (one big MTLBuffer + bump allocator).
@@ -1094,7 +1094,7 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
-        // ─── SCRATCH ARENA FAST PATH (T-269 Phase 2) ───────────────────
+        // ─── SCRATCH ARENA FAST PATH ───────────────────
         // Check the arena BEFORE the pool lock. Lock-free: only an atomic
         // strong_count check inside try_acquire.
         // Default off: ACTIVE_ARENA holds None -> a free borrow().
