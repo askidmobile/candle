@@ -8030,10 +8030,9 @@ kernel void kernel_mul_mm_q4_K_f32_opt(
 //   - _opt: float, simdgroup_float8x8 mb, threadgroup float sb
 //
 
-    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  // float -> half
+//   1. sb: threadgroup float -> threadgroup half
 //   2. mb: simdgroup_float8x8 → simdgroup_half8x8
 //   3. Activation store: F32 input -> half2x4 cast on store in sb
-    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);  // float -> half
 // Weight pipeline (ma/sa) is already half. Accumulator (mc) stays float
 // for final precision.
 //
