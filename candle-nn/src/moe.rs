@@ -10,8 +10,8 @@ use candle::{Result, Tensor};
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, LaunchConfig};
-    use candle::cuda_backend::CudaDType;
+    use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, LaunchConfig};
+    use candle::cuda_backend::WrapErr;
     use candle::quantized::GgmlDType;
     use candle::{CudaDevice, CudaStorage, DType, Storage};
     use half::{bf16, f16};
@@ -30,28 +30,32 @@ mod cuda {
         // 1. Count tokens per expert
         let threads = 256;
         let blocks = CEILDIV(size_m, threads);
-        let count_func = dev.get_or_load_func("count_tokens_per_expert_kernel", &candle_kernels::MOE)?;
+        let count_func = dev.get_or_load_func("count_tokens_per_expert_kernel", &candle::cuda_backend::kernels::MOE)?;
         let count_cfg = LaunchConfig {
             grid_dim: (blocks as u32, 1, 1),
             block_dim: (threads as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe {
-            count_func.launch(count_cfg, (expert_ids, &expert_counts, size_m as i32))
-        }?;
+        let mut builder = count_func.builder();
+        builder.arg(expert_ids);
+        builder.arg(&expert_counts);
+        builder.arg(size_m as i32);
+        unsafe { builder.launch(count_cfg) }.w()?;
 
         // 2. Prefix sum to get expert offsets (supports up to 65536 experts via chunked scan)
         let scan_threads = (num_experts.next_power_of_two()).clamp(32, 1024);
         let smem_size = (scan_threads * std::mem::size_of::<i32>()) as u32;
-        let scan_func = dev.get_or_load_func("expert_prefix_sum_kernel", &candle_kernels::MOE)?;
+        let scan_func = dev.get_or_load_func("expert_prefix_sum_kernel", &candle::cuda_backend::kernels::MOE)?;
         let scan_cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (scan_threads as u32, 1, 1),
             shared_mem_bytes: smem_size,
         };
-        unsafe {
-            scan_func.launch(scan_cfg, (&expert_counts, &expert_offsets, num_experts as i32))
-        }?;
+        let mut builder = scan_func.builder();
+        builder.arg(&expert_counts);
+        builder.arg(&expert_offsets);
+        builder.arg(num_experts as i32);
+        unsafe { builder.launch(scan_cfg) }.w()?;
 
         Ok(expert_offsets)
     }
@@ -65,7 +69,7 @@ mod cuda {
         topk: usize,
         is_prefill: bool,
     ) -> Result<Tensor> {
-        fn cuda_fwd<T: CudaDType + DeviceRepr>(
+        fn cuda_fwd<T: candle::cuda_backend::CudaDType>(
             input: &Tensor,
             weights: &Tensor,
             topk_weights: &Option<Tensor>,
@@ -122,7 +126,7 @@ mod cuda {
                 (true, false) => "moe_gemm_wmma_bf16_decode",
             };
 
-            let func = dev.get_or_load_func(kernel_name, &candle_kernels::MOE)?;
+            let func = dev.get_or_load_func(kernel_name, &candle::cuda_backend::kernels::MOE)?;
 
             let grid_n = CEILDIV(size_n, 32);
             let grid = (num_experts as u32, grid_n as u32, 1);
@@ -149,44 +153,24 @@ mod cuda {
                 None
             };
 
-            unsafe {
-                if let Some(tw) = topk_w_slice {
-                    func.launch(
-                        cfg,
-                        (
-                            input_slice,
-                            weights_slice,
-                            sorted_ids_slice,
-                            &expert_offsets,
-                            tw,
-                            &output_slice,
-                            num_experts as i32,
-                            topk as i32,
-                            size_m as i32,
-                            size_n as i32,
-                            size_k as i32,
-                        ),
-                    )
-                } else {
-                    let null_ptr: u64 = 0;
-                    func.launch(
-                        cfg,
-                        (
-                            input_slice,
-                            weights_slice,
-                            sorted_ids_slice,
-                            &expert_offsets,
-                            null_ptr,
-                            &output_slice,
-                            num_experts as i32,
-                            topk as i32,
-                            size_m as i32,
-                            size_n as i32,
-                            size_k as i32,
-                        ),
-                    )
-                }
-            }?;
+            let mut builder = func.builder();
+            builder.arg(input_slice);
+            builder.arg(weights_slice);
+            builder.arg(sorted_ids_slice);
+            builder.arg(&expert_offsets);
+            if let Some(tw) = topk_w_slice {
+                builder.arg(tw);
+            } else {
+                builder.arg(&0u64);
+            }
+            builder.arg(&output_slice);
+            builder.arg(num_experts as i32);
+            builder.arg(topk as i32);
+            builder.arg(size_m as i32);
+            builder.arg(size_n as i32);
+            builder.arg(size_k as i32);
+
+            unsafe { builder.launch(cfg) }.w()?;
 
             let output = CudaStorage::wrap_cuda_slice(output_slice, dev.clone());
             Ok(Tensor::from_storage(
@@ -274,9 +258,9 @@ mod cuda {
             let input_act = input.to_dtype(dtype)?;
             let (act_storage, _) = input_act.storage_and_layout();
 
-            let type_str = if dtype == DType::F16 { "half" } else { "__nv_bfloat16" };
+            let type_str = if dtype == DType::F16 { "f16" } else { "bf16" };
             let kernel_name = format!("moe_gemm_gguf_prefill_{type_str}_{quant_name}");
-            let func = dev.get_or_load_func(&kernel_name, &candle_kernels::MOE)?;
+            let func = dev.get_or_load_func(&kernel_name, &candle::cuda_backend::kernels::MOE)?;
 
             let grid = (num_experts as u32, CEILDIV(size_n, 32) as u32, 1);
             let wrap_size = if matches!(weights.dtype(), GgmlDType::Q8_0 | GgmlDType::Q4K) { 32 } else { 64 };
@@ -298,50 +282,33 @@ mod cuda {
 
             let weight_dev_ptr = weight_ptr as u64;
 
-            unsafe {
-                match &*act_storage {
-                    Storage::Cuda(c) => {
-                        let act_ptr = c.as_cuda_slice::<u8>()?.device_ptr(&c.stream()).0;
-                        if let Some(tw) = topk_w_slice {
-                            func.launch(
-                                cfg,
-                                (
-                                    act_ptr,
-                                    weight_dev_ptr,
-                                    sorted_ids_slice,
-                                    &expert_offsets,
-                                    tw,
-                                    &output_slice,
-                                    num_experts as i32,
-                                    topk as i32,
-                                    size_m as i32,
-                                    size_n as i32,
-                                    size_k as i32,
-                                ),
-                            )
-                        } else {
-                            let null_ptr: u64 = 0;
-                            func.launch(
-                                cfg,
-                                (
-                                    act_ptr,
-                                    weight_dev_ptr,
-                                    sorted_ids_slice,
-                                    &expert_offsets,
-                                    null_ptr,
-                                    &output_slice,
-                                    num_experts as i32,
-                                    topk as i32,
-                                    size_m as i32,
-                                    size_n as i32,
-                                    size_k as i32,
-                                ),
-                            )
-                        }
+            let mut builder = func.builder();
+            match &*act_storage {
+                Storage::Cuda(c) => {
+                    if dtype == DType::F16 {
+                        builder.arg(c.as_cuda_slice::<f16>()?);
+                    } else {
+                        builder.arg(c.as_cuda_slice::<bf16>()?);
                     }
-                    _ => candle::bail!("input must be a cuda tensor"),
                 }
-            }?;
+                _ => candle::bail!("input must be a cuda tensor"),
+            }
+            builder.arg(&weight_dev_ptr);
+            builder.arg(sorted_ids_slice);
+            builder.arg(&expert_offsets);
+            if let Some(tw) = topk_w_slice {
+                builder.arg(tw);
+            } else {
+                builder.arg(&0u64);
+            }
+            builder.arg(&output_slice);
+            builder.arg(num_experts as i32);
+            builder.arg(topk as i32);
+            builder.arg(size_m as i32);
+            builder.arg(size_n as i32);
+            builder.arg(size_k as i32);
+
+            unsafe { builder.launch(cfg) }.w()?;
         } else {
             // Decode path: Quantize input to Q8_1
             let (input_storage, _) = input.storage_and_layout();
@@ -356,19 +323,22 @@ mod cuda {
             let q8_1_size = m_quant * (k_padded / 32 * std::mem::size_of::<candle::quantized::k_quants::BlockQ8_1>());
             let mut y_q8_1 = dev.alloc_zeros::<u8>(q8_1_size)?;
 
-            let quant_func = dev.get_or_load_func("quantize_q8_1", &candle_kernels::QUANTIZED)?;
+            let quant_func = dev.get_or_load_func("quantize_q8_1", &candle::cuda_backend::kernels::QUANTIZED)?;
             let num_blocks = (k_padded + 255) / 256;
             let quant_cfg = LaunchConfig {
                 grid_dim: (num_blocks as u32, m_quant as u32, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe {
-                quant_func.launch(quant_cfg, (input_slice, &mut y_q8_1, size_k as i32, k_padded as i32))
-            }?;
+            let mut quant_builder = quant_func.builder();
+            quant_builder.arg(input_slice);
+            quant_builder.arg(&mut y_q8_1);
+            quant_builder.arg(size_k as i32);
+            quant_builder.arg(k_padded as i32);
+            unsafe { quant_builder.launch(quant_cfg) }.w()?;
 
             let kernel_name = format!("moe_gemm_gguf_{quant_name}");
-            let func = dev.get_or_load_func(&kernel_name, &candle_kernels::MOE)?;
+            let func = dev.get_or_load_func(&kernel_name, &candle::cuda_backend::kernels::MOE)?;
 
             let n_warps = 4;
             let grid_dim = (CEILDIV(size_n, n_warps) as u32, size_m as u32, 1);
@@ -385,46 +355,25 @@ mod cuda {
 
             let weight_dev_ptr = weight_ptr as u64;
 
-            unsafe {
-                if let Some(tw) = topk_w_slice {
-                    func.launch(
-                        cfg,
-                        (
-                            weight_dev_ptr,
-                            &y_q8_1,
-                            sorted_ids_slice,
-                            expert_ids_slice,
-                            tw,
-                            &output_slice,
-                            num_experts as i32,
-                            topk as i32,
-                            size_m as i32,
-                            size_n as i32,
-                            size_k as i32,
-                            k_padded as i32,
-                        ),
-                    )
-                } else {
-                    let null_ptr: u64 = 0;
-                    func.launch(
-                        cfg,
-                        (
-                            weight_dev_ptr,
-                            &y_q8_1,
-                            sorted_ids_slice,
-                            expert_ids_slice,
-                            null_ptr,
-                            &output_slice,
-                            num_experts as i32,
-                            topk as i32,
-                            size_m as i32,
-                            size_n as i32,
-                            size_k as i32,
-                            k_padded as i32,
-                        ),
-                    )
-                }
-            }?;
+            let mut builder = func.builder();
+            builder.arg(&weight_dev_ptr);
+            builder.arg(&y_q8_1);
+            builder.arg(sorted_ids_slice);
+            builder.arg(expert_ids_slice);
+            if let Some(tw) = topk_w_slice {
+                builder.arg(tw);
+            } else {
+                builder.arg(&0u64);
+            }
+            builder.arg(&output_slice);
+            builder.arg(num_experts as i32);
+            builder.arg(topk as i32);
+            builder.arg(size_m as i32);
+            builder.arg(size_n as i32);
+            builder.arg(size_k as i32);
+            builder.arg(k_padded as i32);
+
+            unsafe { builder.launch(cfg) }.w()?;
         }
 
         let output = CudaStorage::wrap_cuda_slice(output_slice, dev.clone());
