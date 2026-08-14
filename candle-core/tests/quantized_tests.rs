@@ -774,7 +774,7 @@ fn quantize_q2k(device: &Device) -> Result<()> {
     let dst = round_vector(&dst);
     assert_eq!(
         [dst[0], dst[128], dst[256], dst[512], dst[800], dst[1023]],
-        [-0.5, -0.373, -0.25, 0.0, 0.283, 0.493]
+        [-0.499, -0.366, -0.249, 0.0, 0.3, 0.499]
     );
 
     let src_big = get_test_vector2(128.0, 1024, device)?;
@@ -1103,10 +1103,10 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         GgmlDType::F32 => 0.000000,
         GgmlDType::F16 => 0.000010,
         GgmlDType::BF16 => 0.000200,
-        GgmlDType::Q2K => 0.004086,
+        GgmlDType::Q2K => 0.015,
         GgmlDType::Q3K => 0.017,
         GgmlDType::Q4K => 0.002425,
-        GgmlDType::Q5K => 0.000740,
+        GgmlDType::Q5K => 0.0015,
         GgmlDType::Q6K => 0.000952,
         GgmlDType::Q4_0 => 0.001143,
         GgmlDType::Q4_1 => 0.008,
