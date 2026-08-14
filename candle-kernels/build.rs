@@ -30,6 +30,25 @@ fn main() -> Result<()> {
 
     let bindings = builder.build_ptx()?;
 
+    // Normalize PTX version if compiled with bleeding-edge CUDA Toolkit (e.g. 13.2 writing .version 9.2)
+    // so that installed NVIDIA driver JIT compilers accepting PTX ISA 8.x can load the modules seamlessly.
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "ptx") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if content.contains(".version 9.") {
+                        let normalized = content
+                            .replace(".version 9.2", ".version 8.6")
+                            .replace(".version 9.1", ".version 8.6")
+                            .replace(".version 9.0", ".version 8.6");
+                        let _ = std::fs::write(&path, normalized);
+                    }
+                }
+            }
+        }
+    }
+
     bindings.write(&ptx_path)?;
 
     // Phase 0 (dynamic-loading): MoE kernels (libmoe.a) and the associated
