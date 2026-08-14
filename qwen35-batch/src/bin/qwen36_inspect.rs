@@ -23,6 +23,16 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+const TOKEN_IDS: [(&str, u32); 7] = [
+    ("<|endoftext|>", 248044),
+    ("<|im_start|>", 248045),
+    ("<|im_end|>", 248046),
+    ("<|vision_start|>", 248053),
+    ("<|vision_end|>", 248054),
+    ("<|image_pad|>", 248056),
+    ("<|video_pad|>", 248057),
+];
+
 fn dtype_name(d: GgmlDType) -> &'static str {
     match d {
         GgmlDType::F32 => "F32",
@@ -50,6 +60,67 @@ fn dtype_name(d: GgmlDType) -> &'static str {
         GgmlDType::IQ4XS => "IQ4_XS",
         GgmlDType::IQ1M => "IQ1_M",
     }
+}
+
+fn component_kind(metadata: &BTreeMap<String, Value>, tensor_names: &[String]) -> &'static str {
+    if tensor_names.iter().any(|name| name.starts_with("v."))
+        || metadata.contains_key("clip.projector_type")
+    {
+        "vision"
+    } else if tensor_names.iter().any(|name| name.starts_with("blk.32."))
+        || metadata.keys().any(|name| name.contains("nextn"))
+    {
+        "mtp"
+    } else {
+        "text"
+    }
+}
+
+fn token_string(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(token) => Some(token),
+        _ => None,
+    }
+}
+
+fn tokenizer_ids(metadata: &BTreeMap<String, Value>) -> JsonValue {
+    let token_array = metadata.get("tokenizer.ggml.tokens");
+    let tokens = match token_array {
+        Some(Value::Array(tokens)) => Some(tokens),
+        _ => None,
+    };
+    let mut values = Map::new();
+    for (token, expected) in TOKEN_IDS {
+        let actual = tokens.and_then(|items| {
+            items
+                .iter()
+                .position(|value| token_string(value) == Some(token))
+                .and_then(|index| u32::try_from(index).ok())
+        });
+        values.insert(
+            token.to_string(),
+            json!({
+                "actual": actual,
+                "expected": expected,
+                "matches": actual == Some(expected),
+            }),
+        );
+    }
+    values.insert(
+        "chat_eos_metadata".to_string(),
+        json!({
+            "actual": metadata.get("tokenizer.ggml.eos_token_id").and_then(|value| value.to_u32().ok()),
+            "expected": 248046,
+        }),
+    );
+    values.insert(
+        "pad_metadata".to_string(),
+        json!({
+            "actual": metadata.get("tokenizer.ggml.padding_token_id").and_then(|value| value.to_u32().ok()),
+            "expected": 248044,
+        }),
+    );
+    JsonValue::Object(values)
 }
 
 fn magic_name(m: &VersionedMagic) -> &'static str {
@@ -162,10 +233,10 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
                 std::process::exit(0);
             }
             "--output" | "-o" => {
-                output = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| anyhow!("--output requires a path argument"))?,
-                ));
+                output =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow!("--output requires a path argument")
+                    })?));
             }
             other if other.starts_with('-') => {
                 return Err(anyhow!("unknown flag: {other}"));
@@ -193,8 +264,8 @@ fn run() -> Result<()> {
         .with_context(|| format!("stat GGUF: {}", gguf_path.display()))?
         .len();
 
-    let file = File::open(&gguf_path)
-        .with_context(|| format!("open GGUF: {}", gguf_path.display()))?;
+    let file =
+        File::open(&gguf_path).with_context(|| format!("open GGUF: {}", gguf_path.display()))?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
         .with_context(|| format!("mmap GGUF: {}", gguf_path.display()))?;
 
@@ -251,6 +322,9 @@ fn run() -> Result<()> {
         dtypes
     };
 
+    let tensor_names: Vec<String> = tensor_entries.iter().map(|entry| entry.0.clone()).collect();
+    let component = component_kind(&metadata_sorted, &tensor_names);
+    let tokens = tokenizer_ids(&metadata_sorted);
     let fingerprint = build_fingerprint(&metadata_sorted, &tensor_entries, file_size);
 
     // Tensor count + total tensor bytes.
@@ -272,7 +346,8 @@ fn run() -> Result<()> {
         .collect();
 
     let manifest = json!({
-        "schema_version": "qwen36-inspect-v1",
+        "schema_version": "qwen36-inspect-v2",
+        "component": component,
         "gguf_magic": magic_name(&ct.magic),
         "tensor_data_offset": ct.tensor_data_offset,
         "file_size_bytes": file_size,
@@ -281,6 +356,7 @@ fn run() -> Result<()> {
         "total_tensor_bytes": total_tensor_bytes,
         "quant_set": quant_set,
         "overlap_warnings": overlap_warnings,
+        "tokenizer_ids": tokens,
         "metadata": metadata_json,
         "tensors": tensors_json,
     });
@@ -288,8 +364,8 @@ fn run() -> Result<()> {
     let manifest_str = serde_json::to_string_pretty(&manifest)?;
     match output_path {
         Some(path) => {
-            let mut f =
-                File::create(&path).with_context(|| format!("create output: {}", path.display()))?;
+            let mut f = File::create(&path)
+                .with_context(|| format!("create output: {}", path.display()))?;
             f.write_all(manifest_str.as_bytes())
                 .with_context(|| format!("write output: {}", path.display()))?;
             eprintln!(

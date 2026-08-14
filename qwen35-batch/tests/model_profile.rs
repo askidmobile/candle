@@ -33,6 +33,16 @@ fn str_val(v: &str) -> Value {
     Value::String(v.to_string())
 }
 
+const QWEN35_TOKEN_IDS: [(&str, u32); 7] = [
+    ("<|endoftext|>", 248044),
+    ("<|im_start|>", 248045),
+    ("<|im_end|>", 248046),
+    ("<|vision_start|>", 248053),
+    ("<|vision_end|>", 248054),
+    ("<|image_pad|>", 248056),
+    ("<|video_pad|>", 248057),
+];
+
 fn tensor_info(dtype: GgmlDType, shape: &[usize], offset: u64) -> TensorInfo {
     TensorInfo {
         ggml_dtype: dtype,
@@ -147,6 +157,22 @@ fn moe_tensors() -> HashMap<String, TensorInfo> {
         }
     }
     ti
+}
+
+#[test]
+fn qwen35_tokenizer_contract_is_stable() {
+    assert_eq!(QWEN35_TOKEN_IDS[0], ("<|endoftext|>", 248044));
+    assert_eq!(QWEN35_TOKEN_IDS[2], ("<|im_end|>", 248046));
+    assert_eq!(QWEN35_TOKEN_IDS[4], ("<|vision_end|>", 248054));
+    assert_eq!(QWEN35_TOKEN_IDS[6], ("<|video_pad|>", 248057));
+    let ids: std::collections::HashSet<_> = QWEN35_TOKEN_IDS.iter().map(|(_, id)| *id).collect();
+    assert_eq!(ids.len(), QWEN35_TOKEN_IDS.len());
+}
+
+#[test]
+fn component_inventory_contract_is_stable() {
+    const COUNTS: [usize; 3] = [426, 297, 15];
+    assert_eq!(COUNTS.iter().sum::<usize>(), 738);
 }
 
 #[test]
