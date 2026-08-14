@@ -516,7 +516,6 @@ fn indexed_moe_forward_fused_q8_1_input(
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
 
-:
     let topk = idx_shape.dims()[1];
     if batch != idx_shape.dims()[0] {
         crate::bail!(
@@ -591,7 +590,6 @@ fn indexed_moe_forward_fused_q8_1_input(
 }
 
 impl QCudaStorage {
-:
     pub fn indexed_moe_forward(
         &self,
         self_shape: &crate::Shape, //[num_experts, n, k]
