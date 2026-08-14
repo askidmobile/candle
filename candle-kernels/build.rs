@@ -11,13 +11,24 @@ fn main() -> Result<()> {
     // Build for PTX
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
-    let bindings = KernelBuilder::new()
+    let mut builder = KernelBuilder::new();
+    builder = builder
         .source_dir("src") // Scan src/ for .cu files
         .exclude(&["moe/*", "mmvq_gguf.cu", "mmq_*.cu"]) // Exclude statically compiled kernels from ptx build
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
-        .arg("-O3")
-        .build_ptx()?;
+        .arg("-O3");
+
+    if let Ok(target) = std::env::var("TARGET") {
+        if target.contains("msvc") {
+            builder = builder
+                .arg("-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING")
+                .arg("-Xcompiler")
+                .arg("/Zc:preprocessor");
+        }
+    }
+
+    let bindings = builder.build_ptx()?;
 
     bindings.write(&ptx_path)?;
 
