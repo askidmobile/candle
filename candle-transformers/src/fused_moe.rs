@@ -219,7 +219,7 @@ impl FusedMoeGGUF {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
         let (batch, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
         let (num_tokens, hidden_dim) = xs.dims2()?;
@@ -246,54 +246,26 @@ impl FusedMoeGGUF {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
         }
 
-        let (expert_ids, sorted_token_ids) = if is_prefill {
-            // For long-context (32K+), need to use custom sort kernel
-            // #[cfg(feature = "cuda")]
-            // {
-            //     use attention_rs::sort::ArgSortOp;
-            //     topk_ids.flatten_all()?.sort(true)?
-            // }
-            // #[cfg(not(feature = "cuda"))]
-            topk_ids.flatten_all()?.sort_last_dim(true)?
-        } else {
-            topk_ids.flatten_all()?.sort_last_dim(true)?
-        };
-
         let ys = {
-            let gate = moe::moe_gemm_gguf(
-                &xs,
-                &self.gate_experts,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                is_prefill,
-                self.dtype,
-            )?;
-            let up = moe::moe_gemm_gguf(
-                &xs,
-                &self.up_experts,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                is_prefill,
-                self.dtype,
-            )?;
+            // PTX-путь: QTensor::indexed_moe_forward (dynamic-loading-совместимый).
+            // ids = topk_ids [num_tokens, topk] — expert id для каждого (token, topk-slot).
+            // Сортировка sorted_token_ids не нужна — ядро индексирует weights через ids напрямую.
+            // input [num_tokens, 1, hidden] (input_dim1=1 → broadcast: все topk используют тот же input).
+            let xs_3d = xs.reshape((num_tokens, 1, hidden_dim))?;
+            let gate = self.gate_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
+            let up = self.up_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
 
+            // down_inputs [num_tokens, topk, intermediate] (input_dim1=topk → каждая
+            // (token, topk) позиция использует свой input).
             let down_inputs = (up * gate.apply(&self.act)?)?;
-            moe::moe_gemm_gguf(
-                &down_inputs,
-                &self.down_experts,
-                &Some(topk_weights),
-                &sorted_token_ids,
-                &expert_ids,
-                self.num_experts_per_tok,
-                is_prefill,
-                self.dtype,
-            )?
+            let down = self.down_experts.indexed_moe_forward(&down_inputs, &topk_ids)?;
+
+            // Применяем topk_weights [num_tokens, topk] поверх [num_tokens, topk, hidden]
+            // (FFI-путь делал это внутри ядра). sum по topk dim → [num_tokens, hidden].
+            let topk_w = topk_weights.unsqueeze(D::Minus1)?;
+            (down * topk_w)?
         };
-        let mut ys = ys.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)?;
+        let mut ys = ys.sum(D::Minus2)?;
         if ys.dtype() != original_dtype {
             ys = ys.to_dtype(original_dtype)?;
         }

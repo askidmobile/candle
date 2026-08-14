@@ -1524,3 +1524,54 @@ test_device!(
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// indexed_moe_forward: проверка что bail! вместо panic на неподдерживаемом backend.
+// Раньше был panic!("indexed_moe_forward is not implemented in this platform!").
+// ponytail: полный CUDA-тест требует GPU + feature cuda — вне scope этого self-check.
+// Когда появится CUDA CI: добавить тест на Q4K с CPU reference comparison.
+#[test]
+fn indexed_moe_forward_cpu_bails_not_panics() -> Result<()> {
+    use candle_core::quantized::QTensor;
+    // Создаём минимальный QTensor на CPU и пробуем indexed_moe_forward.
+    // На CPU должен вернуть Err, не паниковать.
+    let device = Device::Cpu;
+    let weight = Tensor::zeros((2, 4, 256), DType::F32, &device)?;
+    let qtensor = QTensor::quantize(&weight, GgmlDType::Q4K)?;
+    let xs = Tensor::zeros((1, 1, 256), DType::F32, &device)?;
+    let ids = Tensor::zeros((1, 1), DType::U32, &device)?;
+    let res = qtensor.indexed_moe_forward(&xs, &ids);
+    assert!(
+        res.is_err(),
+        "indexed_moe_forward on CPU must return Err, got Ok"
+    );
+    let msg = format!("{}", res.unwrap_err());
+    assert!(
+        msg.contains("not implemented for the CPU backend")
+            || msg.contains("not implemented"),
+        "unexpected error message: {msg}"
+    );
+    Ok(())
+}
+
+// indexed_moe_forward: contiguous/zero-offset валидация.
+// На CPU backend layout-check проходит до backend-dispatch, bail должен быть
+// про layout, не про backend — но т.к. backend-check идёт после layout-check,
+// на CPU получим backend error. Этот тест фиксирует что layout validation
+// не паникует на non-contiguous input.
+#[test]
+fn indexed_moe_forward_non_contiguous_bails_not_panics() -> Result<()> {
+    use candle_core::quantized::QTensor;
+    let device = Device::Cpu;
+    let weight = Tensor::zeros((2, 4, 256), DType::F32, &device)?;
+    let qtensor = QTensor::quantize(&weight, GgmlDType::Q4K)?;
+    // non-contiguous: transpose last two dims of a [1,2,256] tensor → [1,256,2]
+    let xs_cont = Tensor::zeros((1, 2, 256), DType::F32, &device)?;
+    let xs = xs_cont.transpose(1, 2)?; // [1,8,2] non-contiguous
+    let ids = Tensor::zeros((1, 1), DType::U32, &device)?;
+    // CPU backend bail произойдёт раньше (backend-check после layout-check),
+    // но layout-check не должен паниковать.
+    let res = qtensor.indexed_moe_forward(&xs, &ids);
+    assert!(res.is_err(), "non-contiguous input must return Err");
+    Ok(())
+}

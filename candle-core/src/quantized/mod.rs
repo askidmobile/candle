@@ -929,6 +929,21 @@ impl QTensor {
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        // Layout safety: PTX-путь (`indexed_moe_forward_fused_q8_1_input`) читает
+        // input/ids через `as_cuda_slice` без применения layout offset/strides,
+        // поэтому требуем contiguous c-contiguous и нулевой start_offset.
+        if !x.layout().is_contiguous() {
+            crate::bail!("indexed_moe_forward requires contiguous input tensor");
+        }
+        if x.layout().start_offset() != 0 {
+            crate::bail!("indexed_moe_forward requires zero-offset input tensor");
+        }
+        if !ids.layout().is_contiguous() {
+            crate::bail!("indexed_moe_forward requires contiguous ids tensor");
+        }
+        if ids.layout().start_offset() != 0 {
+            crate::bail!("indexed_moe_forward requires zero-offset ids tensor");
+        }
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
                 (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
@@ -946,13 +961,16 @@ impl QTensor {
                         false,
                     ))
                 }
-                _ => {
-                    panic!("Non-cuda indexed_moe_forward is not implemented!");
-                }
+                _ => crate::bail!(
+                    "indexed_moe_forward requires CUDA tensors for input and ids"
+                ),
             },
-            _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
-            }
+            QStorage::Metal(_) => crate::bail!(
+                "indexed_moe_forward is not implemented for the Metal backend"
+            ),
+            QStorage::Cpu(_) => crate::bail!(
+                "indexed_moe_forward is not implemented for the CPU backend"
+            ),
         }
     }
 
@@ -1050,9 +1068,10 @@ impl QMatMul {
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => t.indexed_moe_forward(x, ids),
-            _ => {
-                panic!("Not implemented!")
-            }
+            _ => crate::bail!(
+                "indexed_moe_forward is only supported for QTensor-backed QMatMul, \
+                 not for dequantized Tensor/TensorF16 variants"
+            ),
         }
     }
 

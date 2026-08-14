@@ -34,11 +34,6 @@ criterion = { workspace = true }
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
 cuda = ["candle/cuda"]
-# MoE CUDA-GEMM (moe_gemm/moe_gemm_gguf через FFI в libmoe.a). OFF по умолчанию:
-# T-331 Фаза 0 удалила libmoe.a (dynamic-loading) → FFI-символы не резолвятся.
-# Включать только вместе с восстановлением libmoe.a в candle-kernels под
-# dynamic-loading-совместимой схемой. См. candle-nn/src/moe.rs.
-cuda_moe = ["cuda"]
 cudnn = ["candle/cudnn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl"]
 metal = ["candle/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]

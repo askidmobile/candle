@@ -25,24 +25,18 @@ fn main() -> Result<()> {
     // `rustc-link-lib=dylib=cudart` УДАЛЕНЫ. cudart-линк здесь делал exe жёстко
     // зависимым от cudart64_*.dll на старте (STATUS_ENTRYPOINT_NOT_FOUND на
     // машинах без CUDA), что подрывает цель dynamic-loading (cudarc грузит CUDA-
-    // либы в рантайме через LoadLibrary). MoE-путь (`indexed_moe_forward`) грузит
-    // ядра через `get_or_load_func` (PTX-рантайм), НЕ через FFI в libmoe.a, так что
-    // link-time зависимости от libmoe.a нет. Целевые модели Yttri — dense (Qwen3.5-4B),
-    // не MoE.
+    // либы в рантайме через LoadLibrary). Quantized MoE-путь (`indexed_moe_forward`)
+    // грузит ядра через `get_or_load_func` (PTX-рантайм), НЕ через FFI в libmoe.a,
+    // так что link-time зависимости от libmoe.a нет.
     //
-    // ⚠️ ЛАТЕНТНАЯ МИНА (review T-331): upstream в #3855 и связанных коммитах
-    // добавил новые MoE-ядра (moe_gguf, moe_wmma, mmq_quantize и т.д.) в libmoe.a.
-    // Мы этот builder ОТКЛЮЧЕН. СУЩЕСТВУЕТ ВТОРОЙ MoE-путь — `extern "C"` FFI
-    // `moe_gemm_wmma`/`moe_gemm_gguf`/`moe_gemm_gguf_prefill` (candle-kernels
-    // `src/ffi.rs`), вызываемый из `candle-nn::moe` (#[cfg(feature="cuda")]) и далее
-    // `candle-transformers::fused_moe` → `quantized_qwen3_moe`. Host-символы этих
-    // функций жили ТОЛЬКО в libmoe.a (PTX-рантайм их НЕ даёт). Сейчас сборка
-    // зелёная только из-за dead-code elimination: Yttri-бинарь не ссылается ни на
-    // один из этих символов. ЛЮБОЙ бинарь с feature="cuda", инстанцирующий
-    // `FusedMoeGGUF::forward` / `moe_gemm_*`, упадёт на финальном линке с unresolved
-    // external symbol. Прежде чем включать MoE на CUDA — вернуть libmoe.a под
-    // dynamic-loading-совместимой схемой (cudart через cudarc, без hard-link) ЛИБО
-    // cfg-выключить cuda-ветку `candle-nn::moe` + `ffi.rs`.
+    // upstream в #3855 и связанных коммитах добавил новые MoE-ядра (moe_gguf,
+    // moe_wmma, mmq_quantize и т.д.) в libmoe.a. Мы этот builder ОТКЛЮЧЕН.
+    // Соответственно FFI-обёртки `moe_gemm_wmma`/`moe_gemm_gguf[_prefill]`
+    // (candle-kernels `src/ffi.rs`) недоступны: их host-символы жили ТОЛЬКО в
+    // libmoe.a (PTX-рантайм их НЕ даёт). `candle-nn::moe::{moe_gemm,
+    // moe_gemm_gguf}` поэтому заменены на bail-заглушки (feature `cuda_moe`
+    // удалена). Рабочий quantized MoE на CUDA — `QTensor::indexed_moe_forward`
+    // (PTX-рантайм, dynamic-loading-совместимый).
     //
     // TODO(upstream-sync): при реэндейле MoE добавить недостающие ядра из upstream
     // builder выше (moe_gguf, moe_wmma_gguf, mmq_quantize, mmq_instance_q*_k) —

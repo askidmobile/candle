@@ -516,8 +516,15 @@ fn indexed_moe_forward_fused_q8_1_input(
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
 
+:
     let topk = idx_shape.dims()[1];
-    assert!(batch == idx_shape.dims()[0], "batch dim not match!");
+    if batch != idx_shape.dims()[0] {
+        crate::bail!(
+            "indexed_moe_forward batch mismatch: input batch {} vs ids batch {}",
+            batch,
+            idx_shape.dims()[0]
+        );
+    }
 
     // Quantize input into q8_1.
     let total_rows = batch * input_dim1;
@@ -584,6 +591,7 @@ fn indexed_moe_forward_fused_q8_1_input(
 }
 
 impl QCudaStorage {
+:
     pub fn indexed_moe_forward(
         &self,
         self_shape: &crate::Shape, //[num_experts, n, k]
@@ -592,6 +600,28 @@ impl QCudaStorage {
         ids: &CudaStorage, //[batch, topk]
         ids_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        // Shape validation (раньше это был assert, что падало process-level).
+        let in_dims = input_l.shape().dims();
+        if in_dims.len() != 3 {
+            crate::bail!(
+                "indexed_moe_forward expects input rank 3 [batch, topk_or_1, k], got {:?}",
+                in_dims
+            );
+        }
+        let id_dims = ids_l.shape().dims();
+        if id_dims.len() != 2 {
+            crate::bail!(
+                "indexed_moe_forward expects ids rank 2 [batch, topk], got {:?}",
+                id_dims
+            );
+        }
+        if in_dims[0] != id_dims[0] {
+            crate::bail!(
+                "indexed_moe_forward batch mismatch: input batch {} vs ids batch {}",
+                in_dims[0],
+                id_dims[0]
+            );
+        }
         if matches!(
             self.dtype(),
             GgmlDType::Q8_0
