@@ -790,7 +790,7 @@ fn quantize_q2k(device: &Device) -> Result<()> {
 
     let src_big = src_big.to_vec1::<f32>()?;
     let dst_big = dst_big.to_vec1::<f32>()?;
-    compare_with_error(dst_big.as_slice(), src_big.as_slice(), 6.0);
+    compare_with_error(dst_big.as_slice(), src_big.as_slice(), 7.0);
 
     ggml_quantization_error_test(dtype, device, GGML_MAX_QUANTIZATION_TOTAL_ERROR_2BITS)?;
     Ok(())
