@@ -1,6 +1,6 @@
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::Activation;
-use candle_transformers::fused_moe::{FusedMoe, MoeCfg};
+use candle_transformers::fused_moe::{FusedMoe, FusedMoeGGUF, MoeCfg};
 use candle_nn::VarBuilder;
 
 #[test]
@@ -68,6 +68,69 @@ fn test_fused_moe_dense_cuda_execution() -> Result<()> {
     let out_prefill = moe.forward(&xs_prefill, true)?;
     assert_eq!(out_prefill.dims(), &[2, 4, 64]);
     println!("CUDA Dense MoE prefill forward succeeded: shape {:?}", out_prefill.dims());
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_fused_moe_gguf_cuda_execution() -> Result<()> {
+    use candle::quantized::{GgmlDType, QTensor};
+    use std::sync::Arc;
+
+    if !candle::utils::cuda_is_available() {
+        println!("CUDA not available, skipping CUDA GGUF MoE test");
+        return Ok(());
+    }
+    let device = Device::new_cuda(0)?;
+    let dtype = DType::F32;
+
+    let num_experts = 4;
+    let hidden_size = 256;
+    let intermediate_size = 256;
+
+    let cfg = MoeCfg {
+        hidden_size,
+        num_experts,
+        num_experts_per_tok: 2,
+        moe_intermediate_size: intermediate_size,
+        norm_topk_prob: true,
+        act: Activation::Silu,
+        decoder_sparse_step: None,
+    };
+
+    // Build quantized mock tensors
+    let mut data = std::collections::HashMap::new();
+    let gate_inp = Tensor::zeros((num_experts, hidden_size), DType::F32, &device)?;
+    let gate_inp_q = QTensor::quantize(&gate_inp, GgmlDType::Q8_0)?;
+    data.insert("ffn_gate_inp.weight".to_string(), Arc::new(gate_inp_q));
+
+    let gate_exps = Tensor::zeros((num_experts, intermediate_size, hidden_size), DType::F32, &device)?;
+    let gate_exps_q = QTensor::quantize(&gate_exps, GgmlDType::Q4K)?;
+    data.insert("ffn_gate_exps.weight".to_string(), Arc::new(gate_exps_q));
+
+    let up_exps = Tensor::zeros((num_experts, intermediate_size, hidden_size), DType::F32, &device)?;
+    let up_exps_q = QTensor::quantize(&up_exps, GgmlDType::Q4K)?;
+    data.insert("ffn_up_exps.weight".to_string(), Arc::new(up_exps_q));
+
+    let down_exps = Tensor::zeros((num_experts, hidden_size, intermediate_size), DType::F32, &device)?;
+    let down_exps_q = QTensor::quantize(&down_exps, GgmlDType::Q4K)?;
+    data.insert("ffn_down_exps.weight".to_string(), Arc::new(down_exps_q));
+
+    let qvb = candle_transformers::quantized_var_builder::VarBuilder::from_tensors_map(data, &device);
+    let moe_gguf = FusedMoeGGUF::new(&cfg, qvb, dtype)?;
+
+    // 1. Test decode (batch=1, seq=1)
+    let xs_decode = Tensor::zeros((1, 1, hidden_size), DType::F32, &device)?;
+    let out_decode = moe_gguf.forward(&xs_decode, false)?;
+    assert_eq!(out_decode.dims(), &[1, 1, hidden_size]);
+    println!("CUDA GGUF MoE decode forward succeeded: shape {:?}", out_decode.dims());
+
+    // 2. Test prefill (batch=2, seq=4)
+    let xs_prefill = Tensor::zeros((2, 4, hidden_size), DType::F32, &device)?;
+    let out_prefill = moe_gguf.forward(&xs_prefill, true)?;
+    assert_eq!(out_prefill.dims(), &[2, 4, hidden_size]);
+    println!("CUDA GGUF MoE prefill forward succeeded: shape {:?}", out_prefill.dims());
 
     Ok(())
 }
