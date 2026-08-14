@@ -53,7 +53,7 @@ namespace vllm_rs {
  * @param k_padded            Padded K dimension for GGUF stride
 */
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
-__global__ void moe_gemm_gguf_kernel(
+__device__ void moe_gemm_gguf_kernel(
     const void * __restrict__ all_weights,       // [num_experts, N, K] (quantized)
     const void * __restrict__ all_inputs,        // [M_total, K] (quantized, M_total is total tokens)
     const int32_t* __restrict__ sorted_token_ids,// [M] (M = num tokens processed)
@@ -134,9 +134,7 @@ __global__ void moe_gemm_gguf_kernel(
 }
 
 #define LAUNCH_MOE_GGUF(qk, qi, block_q_t, vdr, vec_dot_q_cuda) \
-    const int shared_bytes = size_k / qk * sizeof(block_q_t) * nWraps + 1024;\
-    vllm_rs::moe_gemm_gguf_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda> \
-        <<<grid_dim, block_dim, shared_bytes, stream>>>(\
+    vllm_rs::moe_gemm_gguf_kernel<qk, qi, block_q_t, vdr, vec_dot_q_cuda>(\
         weights, y_q8_1,\
         sorted_token_ids, expert_ids, topk_weights,\
         outputs,\
@@ -145,72 +143,30 @@ __global__ void moe_gemm_gguf_kernel(
         kx_padded\
     );\
 
-
-extern "C" void moe_gemm_gguf(
-    const float* inputs, //must be float
-    const void* weights,
-    const int32_t* sorted_token_ids,
-    const int32_t* expert_ids,
-    const float* topk_weights,
-    float* outputs,
-    int num_experts,
-    int topk,
-    int size_m,         // M (num tokens to process)
-    int size_n,         // N (output dim)
-    int size_k,         // K (input dim)
-    int quant_type,     // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
-    cudaStream_t stream
-) {
-    const int QUANTIZE_BLOCK_SIZE = CUDA_QUANTIZE_BLOCK_SIZE;
-    const int kx_padded = pad(size_k, MATRIX_ROW_PADDING);
-    const int num_blocks = ceil_div(kx_padded, QUANTIZE_BLOCK_SIZE);
-    int m = topk_weights ? size_m : size_m / topk;
-    dim3 grid_dim_quant(num_blocks, m, 1);
-    dim3 block_dim_quant(QUANTIZE_BLOCK_SIZE, 1, 1);
-    int y_size_in_bytes =
-        m * (kx_padded / QK8_1 * sizeof(block_q8_1));
-    void* y_q8_1 = nullptr;
-    cudaMallocAsync(&y_q8_1, y_size_in_bytes, stream);
-    quantize_q8_1<<<grid_dim_quant, block_dim_quant, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
-
-    const int nWraps = 4;
-    dim3 grid_dim(ceil_div(size_n, nWraps), size_m, 1);
-    dim3 block_dim(WARP_SIZE, nWraps, 1);
-
-    //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
-    switch (quant_type) {
-        case 0: // Q8_0
-        {
-            LAUNCH_MOE_GGUF(QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1);
-            break;
-        }
-        case 1: // Q4K
-        {
-            LAUNCH_MOE_GGUF(QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1);
-            break;
-        }
-        case 2: // Q2_K
-        {
-            LAUNCH_MOE_GGUF(QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1);
-            break;
-        }
-        case 3: // Q3_K
-        {
-            LAUNCH_MOE_GGUF(QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1);
-            break;
-        }
-        case 4: // Q5_K
-        {
-            LAUNCH_MOE_GGUF(QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1);
-            break;
-        }
-        case 5: // Q6K
-        {
-            LAUNCH_MOE_GGUF(QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
-            break;
-        }
-        default:
-            break;
-    }
-    cudaFreeAsync(y_q8_1, stream);
+// Quantized GGUF MoE decode kernels (dynamic PTX entry points).
+// Inputs are already quantized to Q8_1 by the caller (quantize_q8_1).
+// Weights are GGUF-quantized expert matrices.
+#define DEFINE_MOE_GGUF_DECODE(NAME, QK, QI, BLOCK_T, VDR, VEC_DOT) \
+extern "C" __global__ void moe_gemm_gguf_##NAME( \
+    const void * __restrict__ weights, \
+    const void * __restrict__ y_q8_1, \
+    const int32_t* __restrict__ sorted_token_ids, \
+    const int32_t* __restrict__ expert_ids, \
+    const float* __restrict__ topk_weights, \
+    float * __restrict__ outputs, \
+    int num_experts, int topk, \
+    int size_m, int size_n, int size_k, \
+    int kx_padded \
+) { \
+    vllm_rs::moe_gemm_gguf_kernel<QK, QI, BLOCK_T, VDR, VEC_DOT>( \
+        weights, y_q8_1, sorted_token_ids, expert_ids, topk_weights, outputs, \
+        num_experts, topk, size_m, size_n, size_k, kx_padded \
+    ); \
 }
+
+DEFINE_MOE_GGUF_DECODE(q8_0, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+DEFINE_MOE_GGUF_DECODE(q4_k, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q2_k, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q3_k, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q5_k, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+DEFINE_MOE_GGUF_DECODE(q6_k, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)

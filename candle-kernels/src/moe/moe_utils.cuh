@@ -1,9 +1,8 @@
 #undef __CUDA_FP8_TYPES_EXIST__
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/scan.h>
-#include <thrust/execution_policy.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 /**
  * @brief Counts the number of tokens assigned to each expert.
@@ -13,7 +12,7 @@
  * (must be pre-initialized to zero).
  * @param size_m         Total number of tokens.
  */
-static __global__ void count_tokens_per_expert_kernel(
+extern "C" __global__ void count_tokens_per_expert_kernel(
     const int32_t* expert_ids, 
     int32_t* expert_counts, 
     int size_m) 
@@ -36,51 +35,9 @@ static __global__ void count_tokens_per_expert_kernel(
  * @param num_experts      Number of experts.
  * @param stream           CUDA stream.
  */
-static void calculate_expert_offsets(
-    const int32_t* d_expert_ids,
-    int size_m,
-    int32_t* d_expert_counts,
-    int32_t* d_expert_offsets,
-    int num_experts,
-    cudaStream_t stream
-) {
-    // 1. Zero-initialize the counts buffer
-    cudaMemsetAsync(d_expert_counts, 0, num_experts * sizeof(int32_t), stream);
-
-    // 2. Launch kernel to count tokens per expert
-    int threads = 256;
-    int blocks = (size_m + threads - 1) / threads;
-    count_tokens_per_expert_kernel<<<blocks, threads, 0, stream>>>(
-        d_expert_ids, d_expert_counts, size_m
-    );
-
-    // 3. Perform prefix sum (scan)
-    // We will use inclusive_scan on [counts] and store results in [offsets + 1]
-    // This is a common and efficient pattern.
-
-    // Wrap raw pointers for Thrust
-    thrust::device_ptr<const int32_t> d_counts_ptr(d_expert_counts);
-    thrust::device_ptr<int32_t> d_offsets_ptr(d_expert_offsets);
-
-    // Run inclusive scan.
-    // Input:  [c0, c1, c2, ...] (size num_experts)
-    // Output: [c0, c0+c1, c0+c1+c2, ...] (stored at offsets[1])
-    thrust::inclusive_scan(
-        thrust::cuda::par.on(stream), // Execute on the specified stream
-        d_counts_ptr,                 // Input start
-        d_counts_ptr + num_experts,   // Input end
-        d_offsets_ptr + 1             // Output start (shifted by 1)
-    );
-
-    // 4. Set the first offset (offsets[0]) to 0
-    // This completes the exclusive scan.
-    cudaMemsetAsync(d_expert_offsets, 0, sizeof(int32_t), stream);
-}
-
-
 // This performs an EXCLUSIVE scan: [c0, c1] -> [0, c0, c0+c1]
 // Assumptions: num_experts <= 1024 (fits in one block)
-static __global__ void expert_prefix_sum_kernel(
+extern "C" __global__ void expert_prefix_sum_kernel(
     const int32_t* __restrict__ counts,
     int32_t* __restrict__ offsets,
     int num_experts

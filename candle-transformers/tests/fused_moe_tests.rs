@@ -1,15 +1,35 @@
-// Phase 3: dense FusedMoe (FFI) is removed. Quantized GGUF MoE works via
-// FusedMoeGGUF + QTensor::indexed_moe_forward (PTX path). Dense MoE models
-// (qwen3_moe) use the naive expert-loop (Qwen3SparseMoeBlock, matmul).
-//
-// ponytail: a full CUDA/GGUF test requires a GPU + GGUF weights -- out of scope for this self-check.
-// When CUDA CI is available: add a Q4K MoE test with a CPU reference comparison
-// via FusedMoeGGUF + QTensor::indexed_moe_forward, and a naive dense MoE test
-// (Qwen3SparseMoeBlock) with a CPU reference.
+use candle::{DType, Device, Result, Tensor};
+use candle_nn::Activation;
+use candle_transformers::fused_moe::{FusedMoe, MoeCfg};
+use candle_nn::VarBuilder;
 
 #[test]
-fn placeholder_no_dense_fused_moe() {
-    // Dense FusedMoe is removed; the naive expert-loop is tested indirectly via
-    // qwen3_moe model tests. This file is kept as a marker for future MoE tests.
-    assert!(true);
+fn fused_moe_dense_cpu_bails_not_panics() -> Result<()> {
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+    let vb = VarBuilder::zeros(dtype, &device);
+
+    let cfg = MoeCfg {
+        hidden_size: 16,
+        num_experts: 2,
+        num_experts_per_tok: 1,
+        moe_intermediate_size: 16,
+        norm_topk_prob: true,
+        act: Activation::Silu,
+        decoder_sparse_step: None,
+    };
+
+    let moe = FusedMoe::new(&cfg, vb, dtype)?;
+    let xs = Tensor::zeros((1, 1, 16), dtype, &device)?;
+    let res = moe.forward(&xs, false);
+    assert!(
+        res.is_err(),
+        "FusedMoe::forward (dense) must Err on CPU -- moe_gemm is CUDA-only"
+    );
+    let msg = format!("{}", res.unwrap_err());
+    assert!(
+        msg.contains("moe_gemm") || msg.contains("CUDA"),
+        "unexpected error: {msg}"
+    );
+    Ok(())
 }

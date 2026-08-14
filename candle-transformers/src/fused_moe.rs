@@ -1,7 +1,7 @@
 // Adapted from: https://github.com/guoqingbao/vllm.rs/blob/main/src/models/layers/moe.rs
 use candle::Module;
 use candle::{quantized::QTensor, DType, Result, Tensor, D};
-use candle_nn::{Activation, Linear};
+use candle_nn::{linear_no_bias, moe, Activation, Linear, VarBuilder};
 use std::sync::Arc;
 
 pub struct MoeCfg {
@@ -14,11 +14,131 @@ pub struct MoeCfg {
     pub decoder_sparse_step: Option<usize>,
 }
 
-// Dense FusedMoe (FFI moe_gemm) is removed: libmoe.a is not built under
-// dynamic-loading, and there is no alternative PTX path for dense MoE.
-// Dense MoE models (qwen3-moe) use the naive expert-loop via standard matmul
-// (see Qwen3SparseMoeBlock). Quantized GGUF MoE -- FusedMoeGGUF below
-// (PTX path via QTensor::indexed_moe_forward).
+#[derive(Debug, Clone)]
+pub struct FusedMoe {
+    gate: Linear,
+    gate_up_w: Tensor,
+    down_w: Tensor,
+    w_size_n: usize,
+    act: Activation,
+    norm_topk_prob: bool,
+    num_experts_per_tok: usize,
+    dtype: DType,
+}
+
+impl FusedMoe {
+    pub fn new(cfg: &MoeCfg, vb: VarBuilder, dtype: DType) -> Result<Self> {
+        let num_experts = cfg.num_experts;
+
+        let gate = linear_no_bias(cfg.hidden_size, num_experts, vb.pp("gate"))?;
+
+        let experts_vb = vb.pp("experts");
+        let mut gate_up_experts = Vec::with_capacity(num_experts);
+        let mut down_experts = Vec::with_capacity(num_experts);
+
+        // Pack experts
+        for i in 0..num_experts {
+            let experts_vb = experts_vb.pp(format!("{i}").as_str());
+
+            let (gate_up_expert, down_expert) = {
+                let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
+                let gate_expert = experts_vb.pp("gate_proj").get_with_hints(
+                    (cfg.moe_intermediate_size, cfg.hidden_size),
+                    "weight",
+                    init_ws,
+                )?;
+                let up_expert = experts_vb.pp("up_proj").get_with_hints(
+                    (cfg.moe_intermediate_size, cfg.hidden_size),
+                    "weight",
+                    init_ws,
+                )?;
+                let down_expert = experts_vb.pp("down_proj").get_with_hints(
+                    (cfg.hidden_size, cfg.moe_intermediate_size),
+                    "weight",
+                    init_ws,
+                )?;
+                let gate_up_expert = Tensor::cat(&[&gate_expert, &up_expert], 0)?;
+
+                (gate_up_expert, down_expert)
+            };
+
+            gate_up_experts.push(gate_up_expert);
+            down_experts.push(down_expert);
+        }
+
+        let gate_up_w = Tensor::stack(&gate_up_experts, 0)?;
+        let down_w = Tensor::stack(&down_experts, 0)?;
+        let w_size_n = gate_up_w.dim(1)? / 2;
+
+        Ok(Self {
+            gate,
+            gate_up_w,
+            down_w,
+            w_size_n,
+            act: cfg.act,
+            norm_topk_prob: cfg.norm_topk_prob,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            dtype,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+        let (batch, seq_len, hidden_dim) = xs.dims3()?;
+        let xs = xs.reshape(((), hidden_dim))?;
+        let (num_tokens, hidden_dim) = xs.dims2()?;
+
+        let router_logits = self.gate.forward(&xs)?;
+
+        let routing_weights =
+            candle_nn::ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
+
+        let topk_ids = routing_weights
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+            .contiguous()?;
+
+        let mut topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
+
+        if self.norm_topk_prob {
+            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
+        }
+
+        let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
+
+        let gate_up = moe::moe_gemm(
+            &xs,
+            &self.gate_up_w,
+            &None,
+            &sorted_token_ids,
+            &expert_ids,
+            self.num_experts_per_tok,
+            is_prefill,
+        )?;
+
+        let gate = gate_up
+            .narrow(candle::D::Minus1, 0, self.w_size_n)?
+            .contiguous()?;
+        let up = gate_up
+            .narrow(candle::D::Minus1, self.w_size_n, self.w_size_n)?
+            .contiguous()?;
+
+        let down_inputs = (up * gate.apply(&self.act)?)?.reshape(((), self.w_size_n))?;
+
+        let ys = moe::moe_gemm(
+            &down_inputs,
+            &self.down_w,
+            &Some(topk_weights),
+            &sorted_token_ids,
+            &expert_ids,
+            self.num_experts_per_tok,
+            is_prefill,
+        )?
+        .reshape((num_tokens, (), hidden_dim))?
+        .sum(D::Minus2)?;
+
+        ys.reshape((batch, seq_len, hidden_dim))
+    }
+}
 
 pub struct FusedMoeGGUF {
     pub gate: Linear,
@@ -28,8 +148,6 @@ pub struct FusedMoeGGUF {
     pub act: Activation,
     pub norm_topk_prob: bool,
     pub num_experts_per_tok: usize,
-    // all_reduce: AllReduce,
-    // world_size: usize,
     pub dtype: DType,
 }
 
@@ -73,13 +191,11 @@ impl FusedMoeGGUF {
             act: cfg.act,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
-            // all_reduce: AllReduce::new(comm),
-            // world_size: 1,
             dtype,
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, _is_prefill: bool) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
         let (batch, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
         let (num_tokens, hidden_dim) = xs.dims2()?;
@@ -106,26 +222,57 @@ impl FusedMoeGGUF {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
         }
 
-        let ys = {
-            // PTX path: QTensor::indexed_moe_forward (dynamic-loading-compatible).
-            // ids = topk_ids [num_tokens, topk] -- expert id for each (token, topk-slot).
-            // sorted_token_ids sorting is not needed -- the kernel indexes weights via ids directly.
-            // input [num_tokens, 1, hidden] (input_dim1=1 -> broadcast: all topk use the same input).
+        let ys = if is_prefill && xs.device().is_cuda() {
+            // High-throughput WMMA grouped prefill path on CUDA
+            let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
+
+            let gate = moe::moe_gemm_gguf(
+                &xs,
+                &self.gate_experts,
+                &None,
+                &sorted_token_ids,
+                &expert_ids,
+                self.num_experts_per_tok,
+                true,
+                self.dtype,
+            )?;
+            let up = moe::moe_gemm_gguf(
+                &xs,
+                &self.up_experts,
+                &None,
+                &sorted_token_ids,
+                &expert_ids,
+                self.num_experts_per_tok,
+                true,
+                self.dtype,
+            )?;
+
+            let down_inputs = (up * gate.apply(&self.act)?)?;
+            let down = moe::moe_gemm_gguf(
+                &down_inputs,
+                &self.down_experts,
+                &Some(topk_weights),
+                &sorted_token_ids,
+                &expert_ids,
+                self.num_experts_per_tok,
+                true,
+                self.dtype,
+            )?;
+            down.reshape((num_tokens, (), hidden_dim))?.sum(D::Minus2)?
+        } else {
+            // Direct indexed_moe_forward path (single-pass, zero sort overhead)
             let xs_3d = xs.reshape((num_tokens, 1, hidden_dim))?;
             let gate = self.gate_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
             let up = self.up_experts.indexed_moe_forward(&xs_3d, &topk_ids)?;
 
-            // down_inputs [num_tokens, topk, intermediate] (input_dim1=topk -> each
-            // (token, topk) position uses its own input).
             let down_inputs = (up * gate.apply(&self.act)?)?;
             let down = self.down_experts.indexed_moe_forward(&down_inputs, &topk_ids)?;
 
-            // Apply topk_weights [num_tokens, topk] over [num_tokens, topk, hidden]
-            // (the FFI path did this inside the kernel). sum over topk dim -> [num_tokens, hidden].
             let topk_w = topk_weights.unsqueeze(D::Minus1)?;
-            (down * topk_w)?
+            (down * topk_w)?.sum(D::Minus2)?
         };
-        let mut ys = ys.sum(D::Minus2)?;
+
+        let mut ys = ys;
         if ys.dtype() != original_dtype {
             ys = ys.to_dtype(original_dtype)?;
         }
