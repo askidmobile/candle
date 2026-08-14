@@ -11,6 +11,8 @@ use anyhow::{anyhow, Result};
 use candle_core::quantized::gguf_file;
 use tokenizers::Tokenizer;
 
+use super::multimodal::{self, IMAGE_PAD_TOKEN_ID, VIDEO_PAD_TOKEN_ID};
+
 /// Загрузить tokenizer напрямую из GGUF-файла (читается только header + metadata
 /// через mmap; веса не трогаются). Удобно для тестов, не зависящих от адаптера.
 pub fn load_from_gguf_path(path: &std::path::Path) -> Result<Tokenizer> {
@@ -169,6 +171,31 @@ pub struct ChatMsg<'a> {
     pub content: &'a str,
 }
 
+/// Ordered mixed-content block. Media bytes are already processed; this type
+/// only renders official placeholder spans without regrouping client content.
+pub enum ChatContent<'a> {
+    Text(&'a str),
+    Image {
+        visual_tokens: usize,
+    },
+    Video {
+        frame_tokens: usize,
+        timestamps: &'a [f64],
+    },
+}
+
+pub struct MultimodalChatMsg<'a> {
+    pub role: &'a str,
+    pub content: &'a [ChatContent<'a>],
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct EncodedMultimodalPrompt {
+    pub ids: Vec<u32>,
+    /// 0=text, 1=image, 2=video, matching pinned Transformers.
+    pub mm_token_types: Vec<u8>,
+}
+
 /// Построить ChatML-текст до открывающего assistant-turn (без no-think блока).
 pub fn build_chatml_text(messages: &[ChatMsg<'_>]) -> String {
     let mut prompt = String::with_capacity(2048);
@@ -183,6 +210,51 @@ pub fn build_chatml_text(messages: &[ChatMsg<'_>]) -> String {
     prompt
 }
 
+/// Official ordered mixed-content ChatML. Text-only callers retain
+/// `build_chatml_text`, so existing scalar prompt bytes stay unchanged.
+pub fn build_chatml_multimodal(messages: &[MultimodalChatMsg<'_>]) -> Result<String> {
+    if messages.is_empty() {
+        return Err(anyhow!("no messages provided"));
+    }
+    let mut prompt = String::with_capacity(4096);
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == "system" && index != 0 {
+            return Err(anyhow!("system message must be first"));
+        }
+        if !matches!(message.role, "system" | "user" | "assistant") {
+            return Err(anyhow!("unsupported chat role: {}", message.role));
+        }
+        let mut content = String::new();
+        for part in message.content {
+            match part {
+                ChatContent::Text(text) => content.push_str(text),
+                ChatContent::Image { visual_tokens } => {
+                    if message.role == "system" {
+                        return Err(anyhow!("system message cannot contain media"));
+                    }
+                    content.push_str(&multimodal::image_marker(*visual_tokens)?);
+                }
+                ChatContent::Video {
+                    frame_tokens,
+                    timestamps,
+                } => {
+                    if message.role == "system" {
+                        return Err(anyhow!("system message cannot contain media"));
+                    }
+                    content.push_str(&multimodal::video_marker(*frame_tokens, timestamps)?);
+                }
+            }
+        }
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(message.role);
+        prompt.push('\n');
+        prompt.push_str(content.trim());
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    Ok(prompt)
+}
+
 /// Закодировать prompt + добавить no-think suffix (пустой thinking-блок).
 ///
 /// Формат суффикса совпадает с production `enable_thinking=False`:
@@ -193,17 +265,43 @@ pub fn encode_no_think(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
         .encode(text, false)
         .map_err(|e| anyhow!("encode prompt: {e}"))?;
     let mut ids: Vec<u32> = enc.get_ids().to_vec();
+    append_no_think(tokenizer, &mut ids)?;
+    Ok(ids)
+}
 
+fn append_no_think(tokenizer: &Tokenizer, ids: &mut Vec<u32>) -> Result<()> {
     let nl_enc = tokenizer
         .encode("\n\n", false)
         .map_err(|e| anyhow!("encode newlines: {e}"))?;
-    let nl_ids: Vec<u32> = nl_enc.get_ids().to_vec();
-
+    let nl_ids = nl_enc.get_ids();
     ids.push(THINK_OPEN_TOKEN_ID);
-    ids.extend_from_slice(&nl_ids);
+    ids.extend_from_slice(nl_ids);
     ids.push(THINK_CLOSE_TOKEN_ID);
-    ids.extend_from_slice(&nl_ids);
-    Ok(ids)
+    ids.extend_from_slice(nl_ids);
+    Ok(())
+}
+
+pub fn encode_multimodal_no_think(
+    tokenizer: &Tokenizer,
+    text: &str,
+) -> Result<EncodedMultimodalPrompt> {
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| anyhow!("encode multimodal prompt: {e}"))?;
+    let mut ids = encoding.get_ids().to_vec();
+    append_no_think(tokenizer, &mut ids)?;
+    let mm_token_types = ids
+        .iter()
+        .map(|id| match *id {
+            IMAGE_PAD_TOKEN_ID => 1,
+            VIDEO_PAD_TOKEN_ID => 2,
+            _ => 0,
+        })
+        .collect();
+    Ok(EncodedMultimodalPrompt {
+        ids,
+        mm_token_types,
+    })
 }
 
 /// Декодировать сгенерированные токены в текст, пропуская специальные токены.
@@ -319,5 +417,23 @@ mod tests {
         // Спецтокен пропускается.
         let text = decode_text(&tok, &[1, 2, 3]).unwrap();
         assert_eq!(text, " 🐱");
+    }
+
+    #[test]
+    fn text_chatml_path_stays_byte_identical() {
+        let messages = [
+            ChatMsg {
+                role: "system",
+                content: "system",
+            },
+            ChatMsg {
+                role: "user",
+                content: "Привет",
+            },
+        ];
+        assert_eq!(
+            build_chatml_text(&messages),
+            "<|im_start|>system\nsystem<|im_end|>\n<|im_start|>user\nПривет<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }

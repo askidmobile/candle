@@ -10,6 +10,7 @@ candle-nn = { path = "../candle-nn" }
 anyhow = "1"
 log = "0.4"
 half = "2.5.0"
+image = { workspace = true, optional = true }
 rand = "0.9.0"
 rayon = "1.7.0"
 
@@ -33,7 +34,7 @@ candle-flash-attn = { path = "../candle-flash-attn", optional = true }
 [features]
 # Активировать адаптер реальной Qwen3.5 модели (GGUF loader + port quantized_qwen35).
 # Backend выбирается отдельно: `metal` на macOS или `cuda` на Windows/Linux.
-real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger", "dep:serde_json"]
+real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger", "dep:serde_json", "dep:image"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = [
     "candle-core/cuda",
@@ -63,6 +64,11 @@ path = "tests/model_profile.rs"
 required-features = ["real-model"]
 
 [[test]]
+name = "multimodal_processor"
+path = "tests/multimodal_processor.rs"
+required-features = ["real-model"]
+
+[[test]]
 name = "qwen35moe_reference"
 path = "tests/qwen35moe_reference.rs"
 required-features = ["real-model"]
@@ -80,6 +86,11 @@ required-features = ["real-model"]
 [[bin]]
 name = "vocab_probe"
 path = "src/bin/vocab_probe.rs"
+required-features = ["real-model"]
+
+[[bin]]
+name = "qwen35_multimodal_probe"
+path = "src/bin/qwen35_multimodal_probe.rs"
 required-features = ["real-model"]
 
 [[bin]]

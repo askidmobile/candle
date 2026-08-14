@@ -21,6 +21,7 @@ pub mod metal_utils;
 pub mod model_profile;
 pub mod model_weights;
 pub mod moe;
+pub mod multimodal;
 #[cfg(feature = "real-model")]
 pub mod tokenizer;
 
