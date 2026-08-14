@@ -10,7 +10,7 @@ use candle::{Result, Tensor};
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, LaunchConfig};
+    use candle::cuda_backend::cudarc::driver::{CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg};
     use candle::cuda_backend::WrapErr;
     use candle::quantized::GgmlDType;
     use candle::{CudaDevice, CudaStorage, DType, Storage};
@@ -69,7 +69,7 @@ mod cuda {
         topk: usize,
         is_prefill: bool,
     ) -> Result<Tensor> {
-        fn cuda_fwd<T: candle::cuda_backend::CudaDType>(
+        fn cuda_fwd<T: candle::cuda_backend::CudaDType + DeviceRepr>(
             input: &Tensor,
             weights: &Tensor,
             topk_weights: &Option<Tensor>,
