@@ -904,6 +904,7 @@ impl QTensor {
     }
 
     /// Internal accessor to QStorage (for intra-crate dispatch helpers like `q4k_opt::matmul_q4k_opt_metal`).
+    #[allow(dead_code)]
     pub(crate) fn storage(&self) -> &QStorage {
         &self.storage
     }
