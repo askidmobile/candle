@@ -26,16 +26,13 @@ fn main() -> Result<()> {
     let mut builder = KernelBuilder::new()
         .source_dir("src")
         .exclude(&["moe/*", "mmvq_gguf.cu", "mmq_*.cu"])
-        .arg("--expt-relaxed-constexpr");
-    // /Zc:preprocessor — только MSVC; на Linux gcc примет флаг за имя файла
-    // и упадёт с "-o with multiple files" (урок сборки на A100 2026-08-11).
+        .arg("--expt-relaxed-constexpr")
+        .arg("-std=c++17")
+        .arg("-O3");
     #[cfg(target_os = "windows")]
     {
         builder = builder.arg("-Xcompiler").arg("/Zc:preprocessor");
     }
-    let bindings = builder
-        .arg("-std=c++17")
-        .arg("-O3");
 
     if let Ok(target) = std::env::var("TARGET") {
         if target.contains("msvc") {
