@@ -4,9 +4,8 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        BlitCommandEncoder, BlitCommandsGuard, Buffer, BufferMap, Commands, CommandsGuard,
-        ComputeCommandEncoder, Device, MTLResourceOptions, ResidencySet, ScratchArena,
-        UnifiedScratchArena,
+        BlitCommandsGuard, Buffer, BufferMap, Commands, CommandsGuard, Device, MTLResourceOptions,
+        ResidencySet, ScratchArena, UnifiedScratchArena,
     },
     Kernels,
 };

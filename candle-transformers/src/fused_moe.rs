@@ -14,6 +14,9 @@ pub struct MoeCfg {
     pub decoder_sparse_step: Option<usize>,
 }
 
+// `dtype` is kept to match the upstream constructor signature (FusedMoe::new takes it),
+// but the non-quantized path never casts by it -- only FusedMoeGGUF reads self.dtype.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FusedMoe {
     gate: Linear,

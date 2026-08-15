@@ -4,7 +4,6 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
-use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
     metal::{Buffer, Commands, Device, ResidencySet},
     BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
@@ -2264,10 +2263,6 @@ impl MetalStorage {
             "eq" | "ne" | "le" | "lt" | "ge" | "gt" => DType::U8,
             _ => self.dtype,
         };
-        let lhs_is_scalar = lhs_l.is_scalar_like();
-        let rhs_is_scalar = rhs_l.is_scalar_like();
-        let lhs_contiguous = lhs_l.is_contiguous();
-        let rhs_contiguous = rhs_l.is_contiguous();
         let lhs_is_scalar = lhs_l.is_scalar_like();
         let rhs_is_scalar = rhs_l.is_scalar_like();
         let lhs_contiguous = lhs_l.is_contiguous();
