@@ -370,8 +370,8 @@ impl Qwen35Mtp {
             .broadcast_as((1, KV_HEADS, repeats, total, HEAD_DIM))?
             .contiguous()?
             .reshape((1, HEADS, total, HEAD_DIM))?;
-        let scores = (q
-            .to_dtype(DType::F32)?
+        let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
+        let scores = (q_f32
             .matmul(&k.transpose(2, 3)?.contiguous()?)?
             * (1.0 / (HEAD_DIM as f64).sqrt()))?;
         let mask = (0..seq)
@@ -387,7 +387,7 @@ impl Qwen35Mtp {
             .collect::<Vec<_>>();
         let mask = Tensor::from_vec(mask, (1, 1, seq, total), &self.device)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores.broadcast_add(&mask)?)?;
-        let mixed = probs.matmul(&v)?;
+        let mixed = probs.contiguous()?.matmul(&v.contiguous()?)?;
         let mixed = (mixed * candle_nn::ops::sigmoid(&gate)?)?
             .transpose(1, 2)?
             .reshape((1, seq, HEADS * HEAD_DIM))?;
