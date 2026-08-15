@@ -134,9 +134,11 @@ impl Slot {
         }
     }
 
-    /// Абсолютная позиция следующего decode-токена (для RoPE / KV-cache offset).
+    /// Абсолютная позиция текущего generated input-token для decode.
+    /// Первый token сэмплируется из prefill logits, но ещё не записан в KV.
     pub fn next_pos(&self) -> usize {
         self.index_pos
+            .saturating_sub(usize::from(!self.generated.is_empty()))
     }
 
     /// Добавить сгенерированный токен; возвращает `true` если слот завершён.
@@ -205,9 +207,10 @@ mod tests {
         // Decode шаг 1.
         assert!(!s.push_token(7));
         assert_eq!(s.current_token(), 7);
+        assert_eq!(s.next_pos(), 3);
+        s.push_token(8);
         assert_eq!(s.next_pos(), 4);
-        // Decode шаг 2 (max_new) → finished.
-        assert!(s.push_token(8));
+        // Decode шаг 2 (max_new) уже сэмплирован → finished.
         assert_eq!(s.status, SlotStatus::Finished);
         assert_eq!(s.full_sequence(), vec![1, 2, 3, 7, 8]);
     }
