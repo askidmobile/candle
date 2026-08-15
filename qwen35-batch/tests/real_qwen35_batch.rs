@@ -98,6 +98,7 @@ fn real_qwen35_load_and_single_forward() {
             reset_first: true,
             tokens: prompt,
             start_pos: 0,
+            is_final: true,
         })
         .expect("prefill");
     assert_eq!(logits.len(), vocab, "logits size != vocab");
@@ -120,6 +121,7 @@ fn real_qwen35_batched_logits_equal_single() {
                 reset_first: true,
                 tokens: prompt.clone(),
                 start_pos: 0,
+                is_final: true,
             })
             .expect("prefill");
         if let Some(first) = &first_logits {
@@ -178,6 +180,7 @@ fn real_qwen35_same_slot_replay_is_bit_exact() {
             reset_first: true,
             tokens: prompt.clone(),
             start_pos: 0,
+            is_final: true,
         })
         .expect("first prefill");
     let mut expected = Vec::with_capacity(steps);
@@ -214,6 +217,7 @@ fn real_qwen35_same_slot_replay_is_bit_exact() {
             reset_first: true,
             tokens: prompt.clone(),
             start_pos: 0,
+            is_final: true,
         })
         .expect("second prefill");
     for step in 0..steps {

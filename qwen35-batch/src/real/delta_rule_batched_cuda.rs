@@ -447,6 +447,57 @@ pub fn clear_cuda_state_batched(
 ///
 /// Layout batched-буфера: leading B → slot-регион по смещению `slot * per_slot_len`.
 /// Записываем только per-slot данные (остальные слоты не трогаем).
+pub struct DeltaNetCudaSlotCheckpoint {
+    ssm_state: CudaSlice<f32>,
+    conv_state: CudaSlice<f32>,
+}
+
+/// D2D snapshot of one physical slot region. No host transfer.
+pub fn checkpoint_slot_cuda_state(
+    dev: &CudaDevice,
+    state: &DeltaNetCudaStateBatched,
+    slot: usize,
+) -> Result<DeltaNetCudaSlotCheckpoint> {
+    let capacity = state.capacity_b as usize;
+    if slot >= capacity {
+        candle_core::bail!("checkpoint slot {slot} >= capacity {capacity}");
+    }
+    let ssm_len = state.ssm_state.len() / capacity;
+    let conv_len = state.conv_state.len() / capacity;
+    let ssm_state = state.ssm_state.slice(slot * ssm_len..(slot + 1) * ssm_len);
+    let conv_state = state.conv_state.slice(slot * conv_len..(slot + 1) * conv_len);
+    let mut ssm_copy = dev.alloc_zeros::<f32>(ssm_len)?;
+    let mut conv_copy = dev.alloc_zeros::<f32>(conv_len)?;
+    dev.memcpy_dtod(&ssm_state, &mut ssm_copy)?;
+    dev.memcpy_dtod(&conv_state, &mut conv_copy)?;
+    Ok(DeltaNetCudaSlotCheckpoint {
+        ssm_state: ssm_copy,
+        conv_state: conv_copy,
+    })
+}
+
+pub fn restore_slot_cuda_checkpoint(
+    dev: &CudaDevice,
+    state: &mut DeltaNetCudaStateBatched,
+    slot: usize,
+    checkpoint: &DeltaNetCudaSlotCheckpoint,
+) -> Result<()> {
+    let capacity = state.capacity_b as usize;
+    if slot >= capacity {
+        candle_core::bail!("restore slot {slot} >= capacity {capacity}");
+    }
+    let ssm_len = state.ssm_state.len() / capacity;
+    let conv_len = state.conv_state.len() / capacity;
+    if checkpoint.ssm_state.len() != ssm_len || checkpoint.conv_state.len() != conv_len {
+        candle_core::bail!("CUDA slot checkpoint shape mismatch");
+    }
+    let mut ssm_dst = state.ssm_state.slice_mut(slot * ssm_len..(slot + 1) * ssm_len);
+    let mut conv_dst = state.conv_state.slice_mut(slot * conv_len..(slot + 1) * conv_len);
+    dev.memcpy_dtod(&checkpoint.ssm_state, &mut ssm_dst)?;
+    dev.memcpy_dtod(&checkpoint.conv_state, &mut conv_dst)?;
+    Ok(())
+}
+
 pub fn restore_slot_cuda_state(
     dev: &CudaDevice,
     state: &mut DeltaNetCudaStateBatched,

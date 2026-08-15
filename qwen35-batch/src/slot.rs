@@ -141,18 +141,39 @@ impl Slot {
             .saturating_sub(usize::from(!self.generated.is_empty()))
     }
 
+    pub fn remaining_new_tokens(&self) -> usize {
+        self.request
+            .as_ref()
+            .map(|request| request.max_new.saturating_sub(self.generated.len()))
+            .unwrap_or(0)
+    }
+
     /// Добавить сгенерированный токен; возвращает `true` если слот завершён.
     pub fn push_token(&mut self, tok: u32) -> bool {
-        self.generated.push(tok);
-        self.index_pos += 1;
-        let done = match &self.request {
-            Some(r) => tok == r.eos || self.generated.len() >= r.max_new,
-            None => true,
-        };
-        if done {
-            self.status = SlotStatus::Finished;
+        self.push_verified(&[tok]) == 1 && self.status == SlotStatus::Finished
+    }
+
+    /// Commit verified prefix token-by-token. EOS/max_new are checked after
+    /// every token; uncommitted suffix never changes cursor.
+    pub fn push_verified(&mut self, tokens: &[u32]) -> usize {
+        let mut committed = 0;
+        for &tok in tokens {
+            if self.status != SlotStatus::Decoding || self.remaining_new_tokens() == 0 {
+                break;
+            }
+            self.generated.push(tok);
+            self.index_pos += 1;
+            committed += 1;
+            let done = match &self.request {
+                Some(request) => tok == request.eos || self.generated.len() >= request.max_new,
+                None => true,
+            };
+            if done {
+                self.status = SlotStatus::Finished;
+                break;
+            }
         }
-        done
+        committed
     }
 
     /// Готов к decode (prefill сделан, ещё не завершён)?
@@ -213,6 +234,30 @@ mod tests {
         // Decode шаг 2 (max_new) уже сэмплирован → finished.
         assert_eq!(s.status, SlotStatus::Finished);
         assert_eq!(s.full_sequence(), vec![1, 2, 3, 7, 8]);
+    }
+
+    #[test]
+    fn verified_prefix_stops_at_eos_and_limit() {
+        let mut eos = Slot::new(0);
+        eos.admit(SlotRequest {
+            prompt: vec![1],
+            max_new: 4,
+            eos: 9,
+        });
+        eos.advance_prefill(1);
+        assert_eq!(eos.push_verified(&[2, 9, 3]), 2);
+        assert_eq!(eos.generated_tokens(), &[2, 9]);
+        assert_eq!(eos.next_pos(), 2);
+
+        let mut limited = Slot::new(1);
+        limited.admit(SlotRequest {
+            prompt: vec![1],
+            max_new: 2,
+            eos: 99,
+        });
+        limited.advance_prefill(1);
+        assert_eq!(limited.push_verified(&[2, 3, 4]), 2);
+        assert_eq!(limited.generated_tokens(), &[2, 3]);
     }
 
     #[test]

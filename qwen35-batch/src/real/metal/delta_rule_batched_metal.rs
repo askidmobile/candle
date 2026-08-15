@@ -522,6 +522,81 @@ pub fn clear_metal_state_batched(
 /// Layout batched-буфера: leading B → slot-регион начинается по смещению
 /// `slot * per_slot_len`. Записываем только per-slot данные (остальные слоты
 /// не трогаем).
+pub struct DeltaNetMetalSlotCheckpoint {
+    ssm_state: Arc<Buffer>,
+    conv_state: Arc<Buffer>,
+}
+
+/// GPU blit snapshot of one slot region. No CPU readback.
+pub fn checkpoint_slot_metal_state(
+    metal_device: &MetalDevice,
+    layer_state: &DeltaNetMetalStateBatched,
+    slot: usize,
+) -> Result<DeltaNetMetalSlotCheckpoint> {
+    let capacity = layer_state.capacity_b as usize;
+    if slot >= capacity {
+        candle_core::bail!("checkpoint slot {slot} >= capacity {capacity}");
+    }
+    let ssm_bytes = layer_state.ssm_state.length() / capacity;
+    let conv_bytes = layer_state.conv_state.length() / capacity;
+    let ssm_state = metal_device.allocate_zeros(ssm_bytes)?;
+    let conv_state = metal_device.allocate_zeros(conv_bytes)?;
+    let blit = metal_device.blit_command_encoder()?;
+    blit.copy_from_buffer(
+        &layer_state.ssm_state,
+        slot * ssm_bytes,
+        &ssm_state,
+        0,
+        ssm_bytes,
+    );
+    blit.copy_from_buffer(
+        &layer_state.conv_state,
+        slot * conv_bytes,
+        &conv_state,
+        0,
+        conv_bytes,
+    );
+    blit.end_encoding();
+    Ok(DeltaNetMetalSlotCheckpoint {
+        ssm_state,
+        conv_state,
+    })
+}
+
+pub fn restore_slot_metal_checkpoint(
+    metal_device: &MetalDevice,
+    layer_state: &DeltaNetMetalStateBatched,
+    slot: usize,
+    checkpoint: &DeltaNetMetalSlotCheckpoint,
+) -> Result<()> {
+    let capacity = layer_state.capacity_b as usize;
+    if slot >= capacity {
+        candle_core::bail!("restore slot {slot} >= capacity {capacity}");
+    }
+    let ssm_bytes = layer_state.ssm_state.length() / capacity;
+    let conv_bytes = layer_state.conv_state.length() / capacity;
+    if checkpoint.ssm_state.length() != ssm_bytes || checkpoint.conv_state.length() != conv_bytes {
+        candle_core::bail!("Metal slot checkpoint shape mismatch");
+    }
+    let blit = metal_device.blit_command_encoder()?;
+    blit.copy_from_buffer(
+        &checkpoint.ssm_state,
+        0,
+        &layer_state.ssm_state,
+        slot * ssm_bytes,
+        ssm_bytes,
+    );
+    blit.copy_from_buffer(
+        &checkpoint.conv_state,
+        0,
+        &layer_state.conv_state,
+        slot * conv_bytes,
+        conv_bytes,
+    );
+    blit.end_encoding();
+    Ok(())
+}
+
 pub fn restore_slot_metal_state(
     metal_device: &MetalDevice,
     layer_state: &DeltaNetMetalStateBatched,

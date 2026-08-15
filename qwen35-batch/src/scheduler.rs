@@ -25,7 +25,10 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::model::{BatchModel, DecodeBatch, DecodeItem, GreedySampler, PrefillChunk, Sampler};
+use crate::model::{
+    BatchModel, DecodeBatch, DecodeItem, GreedySampler, PrefillChunk, Sampler,
+    SpeculativeFallback, SpeculativeMetrics,
+};
 use crate::slot::{Slot, SlotRequest, SlotStatus};
 
 /// Статистика одного прогона scheduler'а.
@@ -112,6 +115,7 @@ pub struct BatchScheduler<M: BatchModel> {
     slots: Vec<Slot>,
     queue: VecDeque<SlotRequest>,
     sampler: Box<dyn Sampler>,
+    speculative: Vec<SpeculativeMetrics>,
     stats: SchedulerStats,
     eos: u32,
 }
@@ -134,6 +138,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             slots: (0..num_slots).map(Slot::new).collect(),
             queue: VecDeque::new(),
             sampler: Box::new(GreedySampler),
+            speculative: vec![SpeculativeMetrics::default(); num_slots],
             stats: SchedulerStats::default(),
             eos,
         }
@@ -148,6 +153,7 @@ impl<M: BatchModel> BatchScheduler<M> {
         };
         if let Some(idx) = self.idle_slot() {
             self.slots[idx].admit(req);
+            self.speculative[idx] = SpeculativeMetrics::default();
             return Some(idx);
         }
         self.queue.push_back(req);
@@ -174,6 +180,7 @@ impl<M: BatchModel> BatchScheduler<M> {
         };
         if let Some(idx) = self.idle_slot() {
             self.slots[idx].admit(req);
+            self.speculative[idx] = SpeculativeMetrics::default();
             self.slots[idx].prefill_done = primed_prefix_len;
             self.slots[idx].index_pos = primed_prefix_len;
             return Some(idx);
@@ -216,6 +223,7 @@ impl<M: BatchModel> BatchScheduler<M> {
                 reset_first: reset,
                 tokens,
                 start_pos,
+                is_final: chunk_size == self.slots[sidx].prefill_remaining(),
             };
             let t0 = Instant::now();
             if trace_on() {
@@ -247,50 +255,181 @@ impl<M: BatchModel> BatchScheduler<M> {
             });
         }
 
-        // 2. Decode phase: батч всех Decoding-слотов (ещё Decoding, не Finished).
-        let items: Vec<DecodeItem> = self
+        // 2. Decode phase. Eligible slots run bounded correctness-first MTP
+        // transactions; unavailable/failed slots retain one ordinary batched step.
+        let decoding: Vec<usize> = self
             .slots
             .iter()
-            .filter(|s| s.is_decoding())
-            .map(|s| DecodeItem {
-                slot_idx: s.idx,
-                token: s.current_token(),
-                pos: s.next_pos(),
-            })
+            .filter(|slot| slot.is_decoding())
+            .map(|slot| slot.idx)
             .collect();
-        if items.is_empty() {
+        if decoding.is_empty() {
             return Ok(StepOutcome::Idle);
         }
-        let batch = DecodeBatch { items };
-        let b = batch.len();
-        self.stats.max_concurrent_decode = self.stats.max_concurrent_decode.max(b);
+        let active = decoding.len();
+        self.stats.max_concurrent_decode = self.stats.max_concurrent_decode.max(active);
         let t0 = Instant::now();
-        if trace_on() {
-            let poss: Vec<usize> = batch.items.iter().map(|i| i.pos).collect();
-            eprintln!("[step] decode begin B={b} pos={poss:?}");
+        let mut fallback = Vec::new();
+        for slot in decoding {
+            if should_stop(slot, self.slots[slot].generated_tokens()) {
+                self.slots[slot].status = SlotStatus::Finished;
+                self.speculative[slot].fallback = Some(SpeculativeFallback::Cancelled);
+                continue;
+            }
+            if !self.model.speculative_available(slot)
+                || self.slots[slot].remaining_new_tokens() < 2
+            {
+                fallback.push(slot);
+                continue;
+            }
+            if let Some(category) = self.speculative_slot(slot, should_stop)? {
+                self.speculative[slot].fallback = Some(category);
+                if category == SpeculativeFallback::Cancelled {
+                    self.slots[slot].status = SlotStatus::Finished;
+                } else {
+                    fallback.push(slot);
+                }
+            }
         }
-        let logits_vec = self.model.decode_batch(&batch)?;
-        if trace_on() {
-            eprintln!("[step] decode end B={b} ({:?})", t0.elapsed());
+        if !fallback.is_empty() {
+            self.baseline_decode_slots(&fallback, should_stop)?;
         }
         self.stats.decode_ns += t0.elapsed().as_nanos();
         self.stats.decode_steps += 1;
-        for (it, logits) in batch.items.iter().zip(logits_vec.iter()) {
-            if trace_on() {
-                eprintln!("[step] sample slot={}", it.slot_idx);
+        Ok(StepOutcome::DidDecode(active))
+    }
+
+    fn speculative_slot(
+        &mut self,
+        slot: usize,
+        should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
+    ) -> Result<Option<SpeculativeFallback>> {
+        self.speculative[slot].enabled = true;
+        let sampler_checkpoint = self.sampler.checkpoint(slot);
+        if self.model.speculative_begin(slot).is_err() {
+            self.model.speculative_rollback(slot)?;
+            self.sampler.restore(slot, sampler_checkpoint)?;
+            return Ok(Some(SpeculativeFallback::Begin));
+        }
+
+        let width = self.slots[slot].remaining_new_tokens().min(4);
+        let draft = match self.model.speculative_draft(
+            slot,
+            self.slots[slot].current_token(),
+            self.slots[slot].next_pos(),
+            self.slots[slot].next_pos(),
+            width,
+        ) {
+            Ok(draft) if !draft.is_empty() => draft,
+            _ => {
+                self.model.speculative_rollback(slot)?;
+                self.sampler.restore(slot, sampler_checkpoint)?;
+                return Ok(Some(SpeculativeFallback::Draft));
             }
-            let gen = self.slots[it.slot_idx].generated_tokens().to_vec();
-            let tok = self.sampler.sample_indexed(it.slot_idx, &gen, logits);
-            if trace_on() {
-                eprintln!("[step] sampled slot={} tok={tok}", it.slot_idx);
+        };
+        self.speculative[slot].drafted += draft.len();
+
+        let mut input = self.slots[slot].current_token();
+        let mut pos = self.slots[slot].next_pos();
+        let mut verified = Vec::with_capacity(draft.len());
+        let mut accepted = 0usize;
+        for draft_id in draft {
+            if should_stop(slot, self.slots[slot].generated_tokens()) {
+                self.model.speculative_rollback(slot)?;
+                self.sampler.restore(slot, sampler_checkpoint)?;
+                return Ok(Some(SpeculativeFallback::Cancelled));
+            }
+            let logits = match self.model.decode_batch(&DecodeBatch {
+                items: vec![DecodeItem {
+                    slot_idx: slot,
+                    token: input,
+                    pos,
+                }],
+            }) {
+                Ok(mut rows) if rows.len() == 1 => rows.pop().unwrap(),
+                _ => {
+                    self.model.speculative_rollback(slot)?;
+                    self.sampler.restore(slot, sampler_checkpoint)?;
+                    return Ok(Some(SpeculativeFallback::Commit));
+                }
+            };
+            let mut history = self.slots[slot].generated_tokens().to_vec();
+            history.extend_from_slice(&verified);
+            let target = self.sampler.sample_indexed(slot, &history, &logits);
+            verified.push(target);
+            if target != draft_id {
+                break;
+            }
+            accepted += 1;
+            if target == self.eos {
+                break;
+            }
+            input = target;
+            pos += 1;
+        }
+
+        if self.model.speculative_commit(slot).is_err() {
+            self.model.speculative_rollback(slot)?;
+            self.sampler.restore(slot, sampler_checkpoint)?;
+            return Ok(Some(SpeculativeFallback::Commit));
+        }
+        self.speculative[slot].used = true;
+        self.speculative[slot].accepted += accepted;
+        for token in verified {
+            if self.slots[slot].push_verified(&[token]) == 0 {
+                break;
             }
             self.stats.total_decode_tokens += 1;
-            self.slots[it.slot_idx].push_token(tok);
-            if should_stop(it.slot_idx, &self.slots[it.slot_idx].generated) {
-                self.slots[it.slot_idx].status = SlotStatus::Finished;
+            if should_stop(slot, self.slots[slot].generated_tokens()) {
+                self.slots[slot].status = SlotStatus::Finished;
+                break;
             }
         }
-        Ok(StepOutcome::DidDecode(b))
+        Ok(None)
+    }
+
+    fn baseline_decode_slots(
+        &mut self,
+        slots: &[usize],
+        should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
+    ) -> Result<()> {
+        let items = slots
+            .iter()
+            .filter(|&&slot| self.slots[slot].is_decoding())
+            .map(|&slot| DecodeItem {
+                slot_idx: slot,
+                token: self.slots[slot].current_token(),
+                pos: self.slots[slot].next_pos(),
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let batch = DecodeBatch { items };
+        if trace_on() {
+            let poss: Vec<usize> = batch.items.iter().map(|item| item.pos).collect();
+            eprintln!("[step] decode begin B={} pos={poss:?}", batch.len());
+        }
+        let logits = self.model.decode_batch(&batch)?;
+        if logits.len() != batch.len() {
+            anyhow::bail!(
+                "decode returned {} rows for batch {}",
+                logits.len(),
+                batch.len()
+            );
+        }
+        for (item, logits) in batch.items.iter().zip(&logits) {
+            let generated = self.slots[item.slot_idx].generated_tokens().to_vec();
+            let token = self
+                .sampler
+                .sample_indexed(item.slot_idx, &generated, logits);
+            self.stats.total_decode_tokens += 1;
+            self.slots[item.slot_idx].push_token(token);
+            if should_stop(item.slot_idx, self.slots[item.slot_idx].generated_tokens()) {
+                self.slots[item.slot_idx].status = SlotStatus::Finished;
+            }
+        }
+        Ok(())
     }
 
     fn admit_from_queue(&mut self) {
@@ -298,6 +437,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             let Some(idx) = self.idle_slot() else { break };
             let req = self.queue.pop_front().unwrap();
             self.slots[idx].admit(req);
+            self.speculative[idx] = SpeculativeMetrics::default();
         }
     }
 
@@ -349,6 +489,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             for (sidx, order) in &finished {
                 outputs[*order] = self.slots[*sidx].generated_tokens().to_vec();
                 self.slots[*sidx].reset();
+                self.model.reset_slot(*sidx)?;
                 slot_order[*sidx] = None; // освободить order для пере-admit'а.
             }
             match self.step()? {
@@ -394,6 +535,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             for (sidx, order) in &finished {
                 outputs[*order] = self.slots[*sidx].generated_tokens().to_vec();
                 self.slots[*sidx].reset();
+                self.model.reset_slot(*sidx)?;
                 slot_order[*sidx] = None;
             }
             match self.step()? {
@@ -424,6 +566,10 @@ impl<M: BatchModel> BatchScheduler<M> {
 
     pub fn stats(&self) -> &SchedulerStats {
         &self.stats
+    }
+
+    pub fn speculative_metrics(&self, slot: usize) -> Option<&SpeculativeMetrics> {
+        self.speculative.get(slot)
     }
     pub fn model(&self) -> &M {
         &self.model
@@ -589,6 +735,7 @@ mod tests {
             reset_first: true,
             tokens: prompt.clone(),
             start_pos: 0,
+            is_final: true,
         };
         let ref_logits = ref_model.prefill_chunk(&chunk).unwrap();
         let expected = GreedySampler.sample(&ref_logits);

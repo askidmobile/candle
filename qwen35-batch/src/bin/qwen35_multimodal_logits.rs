@@ -141,12 +141,14 @@ fn main() -> Result<()> {
 
     let started = Instant::now();
     let mut logits = Vec::new();
+    let chunk_count = token_ids.len().div_ceil(512);
     for (chunk_index, chunk) in token_ids.chunks(512).enumerate() {
         logits = adapter.prefill_chunk(&PrefillChunk {
             slot_idx: 0,
             reset_first: chunk_index == 0,
             tokens: chunk.to_vec(),
             start_pos: chunk_index * 512,
+            is_final: chunk_index + 1 == chunk_count,
         })?;
     }
     let prefill = started.elapsed();

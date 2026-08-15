@@ -160,7 +160,17 @@ fn main() -> Result<()> {
         _ => unreachable!(),
     };
     let prompt = tokenizer::build_chatml_text(&messages);
-    let prompt_tokens = tokenizer::encode_no_think(&tokenizer, &prompt)?;
+    let mut prompt_tokens = tokenizer::encode_no_think(&tokenizer, &prompt)?;
+    if let Ok(value) = std::env::var("QWEN36_LOGITS_PROMPT_TOKENS") {
+        let target = value
+            .parse::<usize>()
+            .context("QWEN36_LOGITS_PROMPT_TOKENS must be a positive integer")?;
+        if target == 0 {
+            bail!("QWEN36_LOGITS_PROMPT_TOKENS must be a positive integer")
+        }
+        let fixture = prompt_tokens.clone();
+        prompt_tokens = fixture.iter().copied().cycle().take(target).collect();
+    }
     let vocab_size = tokenizer.get_vocab_size(true);
     if let Some(token) = forced_tokens
         .as_ref()
@@ -192,6 +202,7 @@ fn main() -> Result<()> {
         reset_first: true,
         tokens: prompt_tokens.clone(),
         start_pos: 0,
+        is_final: true,
     })?;
     let prefill = prefill_started.elapsed();
 

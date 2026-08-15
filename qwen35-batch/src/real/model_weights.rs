@@ -2528,12 +2528,146 @@ pub struct KvCacheSnap {
 /// ik turbo3). Деквантизация в F16 при чтении — дальше обычный HGEMM path.
 #[derive(Debug, Clone)]
 struct Q8KvCache {
-    /// [1, n_kv_head, cap, head_dim] u8
+    /// [1, cap, n_kv_head, head_dim] u8
     k_q: Tensor,
-    /// [1, n_kv_head, cap, 1] f32
+    /// [1, cap, n_kv_head, 1] f32
     k_s: Tensor,
     v_q: Tensor,
     v_s: Tensor,
+}
+
+#[derive(Debug, Clone)]
+struct F16KvCache {
+    /// [1, cap, n_kv_head, head_dim] f16, directly consumable by FA2.
+    k: Tensor,
+    v: Tensor,
+}
+
+#[derive(Debug, Clone)]
+enum BatchedKvCache {
+    Q8(Q8KvCache),
+    F16(F16KvCache),
+}
+
+impl BatchedKvCache {
+    fn empty_like(&self, cap: usize, n_kv: usize, hd: usize, device: &Device) -> Result<Self> {
+        Ok(match self {
+            Self::Q8(_) => {
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let k_q = Tensor::zeros((1, cap, n_kv, hd), DType::U8, device)?;
+                let k_s = Tensor::zeros((1, cap, n_kv, 1), DType::F32, device)?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let v_q = Tensor::zeros((1, cap, n_kv, hd), DType::U8, device)?;
+                let v_s = Tensor::zeros((1, cap, n_kv, 1), DType::F32, device)?;
+                Self::Q8(Q8KvCache { k_q, k_s, v_q, v_s })
+            }
+            Self::F16(_) => {
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let k = Tensor::zeros((1, cap, n_kv, hd), DType::F16, device)?;
+                #[cfg(target_os = "macos")]
+                candle_core::skip_arena_next_alloc();
+                let v = Tensor::zeros((1, cap, n_kv, hd), DType::F16, device)?;
+                Self::F16(F16KvCache { k, v })
+            }
+        })
+    }
+
+    fn capacity(&self) -> Result<usize> {
+        match self {
+            Self::Q8(c) => c.k_q.dim(1),
+            Self::F16(c) => c.k.dim(1),
+        }
+    }
+
+    fn copy_prefix_to(&self, dst: &Self, len: usize) -> Result<()> {
+        match (self, dst) {
+            (Self::Q8(src), Self::Q8(dst)) => {
+                for (src, dst) in [
+                    (&src.k_q, &dst.k_q),
+                    (&src.k_s, &dst.k_s),
+                    (&src.v_q, &dst.v_q),
+                    (&src.v_s, &dst.v_s),
+                ] {
+                    dst.slice_set(&src.narrow(1, 0, len)?.contiguous()?, 1, 0)?;
+                }
+            }
+            (Self::F16(src), Self::F16(dst)) => {
+                for (src, dst) in [(&src.k, &dst.k), (&src.v, &dst.v)] {
+                    dst.slice_set(&src.narrow(1, 0, len)?.contiguous()?, 1, 0)?;
+                }
+            }
+            _ => candle_core::bail!("KV cache dtype changed while growing"),
+        }
+        Ok(())
+    }
+
+    fn set_row(&self, row: &Self, index: usize) -> Result<()> {
+        match (self, row) {
+            (Self::Q8(dst), Self::Q8(src)) => {
+                for (dst, src) in [
+                    (&dst.k_q, &src.k_q),
+                    (&dst.k_s, &src.k_s),
+                    (&dst.v_q, &src.v_q),
+                    (&dst.v_s, &src.v_s),
+                ] {
+                    dst.slice_set(src, 1, index)?;
+                }
+            }
+            (Self::F16(dst), Self::F16(src)) => {
+                for (dst, src) in [(&dst.k, &src.k), (&dst.v, &src.v)] {
+                    dst.slice_set(src, 1, index)?;
+                }
+            }
+            _ => candle_core::bail!("KV cache row dtype mismatch"),
+        }
+        Ok(())
+    }
+
+    fn shift_and_append(&self, row: &Self, keep: usize) -> Result<()> {
+        match (self, row) {
+            (Self::Q8(dst), Self::Q8(src)) => {
+                for (dst, src) in [
+                    (&dst.k_q, &src.k_q),
+                    (&dst.k_s, &src.k_s),
+                    (&dst.v_q, &src.v_q),
+                    (&dst.v_s, &src.v_s),
+                ] {
+                    dst.slice_set(&dst.narrow(1, 1, keep)?.contiguous()?, 1, 0)?;
+                    dst.slice_set(src, 1, keep)?;
+                }
+            }
+            (Self::F16(dst), Self::F16(src)) => {
+                for (dst, src) in [(&dst.k, &src.k), (&dst.v, &src.v)] {
+                    dst.slice_set(&dst.narrow(1, 1, keep)?.contiguous()?, 1, 0)?;
+                    dst.slice_set(src, 1, keep)?;
+                }
+            }
+            _ => candle_core::bail!("KV cache row dtype mismatch"),
+        }
+        Ok(())
+    }
+
+    fn f16_prefix(&self, len: usize) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Q8(c) => Ok((
+                q8_dequantize_rows(
+                    &c.k_q.narrow(1, 0, len)?.contiguous()?,
+                    &c.k_s.narrow(1, 0, len)?.contiguous()?,
+                )?,
+                q8_dequantize_rows(
+                    &c.v_q.narrow(1, 0, len)?.contiguous()?,
+                    &c.v_s.narrow(1, 0, len)?.contiguous()?,
+                )?,
+            )),
+            Self::F16(c) => Ok((
+                c.k.narrow(1, 0, len)?.contiguous()?,
+                c.v.narrow(1, 0, len)?.contiguous()?,
+            )),
+        }
+    }
 }
 
 /// Квантование per-row (последняя ось = head_dim): scale = amax/127.
@@ -2604,7 +2738,10 @@ pub(crate) struct GatedAttentionLayer {
     /// свой Q8-квантованный буфер (u8+scale) + длину. Размер = capacity B
     /// (DECODE_BATCH_CAPACITY). Используется ТОЛЬКО в forward_attn_decode_batch;
     /// single-slot `forward_attn` использует `kv_cache` выше (shared path).
-    kv_cache_batched: Vec<Option<Q8KvCache>>,
+    kv_cache_batched: Vec<Option<BatchedKvCache>>,
+    /// Q8-rounded F16 cache dequantizes each new row once, then feeds FA2 directly.
+    /// Default remains compact Q8; opt-in is `QWEN36_KV_CACHE_DTYPE=q8_f16`.
+    use_q8_f16_kv_cache: bool,
     /// Per-slot длина заполненного KV-cache (для batched path).
     kv_cache_len_batched: Vec<usize>,
     /// Pre-allocated ёмкость KV-кэша для batched path (== attn_window cap).
@@ -3146,8 +3283,33 @@ impl GatedAttentionLayer {
             Tensor::cat(&k_slots, 0)?
         };
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
-        let (kq_all, ks_all) = q8_quantize_rows(&k_hl)?;
-        let (vq_all, vs_all) = q8_quantize_rows(&v_hl)?;
+        let cache_rows: Vec<BatchedKvCache> = if self.use_q8_f16_kv_cache {
+            let (kq, ks) = q8_quantize_rows(&k_hl)?;
+            let (vq, vs) = q8_quantize_rows(&v_hl)?;
+            let k = q8_dequantize_rows(&kq, &ks)?;
+            let v = q8_dequantize_rows(&vq, &vs)?;
+            (0..b_sz)
+                .map(|bidx| {
+                    Ok(BatchedKvCache::F16(F16KvCache {
+                        k: k.narrow(0, bidx, 1)?,
+                        v: v.narrow(0, bidx, 1)?,
+                    }))
+                })
+                .collect::<Result<_>>()?
+        } else {
+            let (kq, ks) = q8_quantize_rows(&k_hl)?;
+            let (vq, vs) = q8_quantize_rows(&v_hl)?;
+            (0..b_sz)
+                .map(|bidx| {
+                    Ok(BatchedKvCache::Q8(Q8KvCache {
+                        k_q: kq.narrow(0, bidx, 1)?,
+                        k_s: ks.narrow(0, bidx, 1)?,
+                        v_q: vq.narrow(0, bidx, 1)?,
+                        v_s: vs.narrow(0, bidx, 1)?,
+                    }))
+                })
+                .collect::<Result<_>>()?
+        };
 
         let mut slot_outs: Vec<Tensor> = Vec::with_capacity(b_sz);
         // `bidx` indexes current batch tensors; `slot` indexes persistent KV.
@@ -3157,34 +3319,15 @@ impl GatedAttentionLayer {
                 candle_core::bail!("decode slot {slot} is out of range");
             }
             let q = &q_slots[bidx];
-            let kq = kq_all.narrow(0, bidx, 1)?;
-            let ks = ks_all.narrow(0, bidx, 1)?;
-            let vq = vq_all.narrow(0, bidx, 1)?;
-            let vs = vs_all.narrow(0, bidx, 1)?;
-            let need_init = self.kv_cache_batched[slot].is_none();
-            if need_init {
+            let row = &cache_rows[bidx];
+            if self.kv_cache_batched[slot].is_none() {
                 let init_cap = 512.min(self.attn_window);
-                #[cfg(target_os = "macos")]
-                candle_core::skip_arena_next_alloc();
-                let k_q = Tensor::zeros(
-                    (1, init_cap, self.n_kv_head, self.head_dim),
-                    DType::U8, &device,
-                )?;
-                let k_s = Tensor::zeros(
-                    (1, init_cap, self.n_kv_head, 1),
-                    DType::F32, &device,
-                )?;
-                #[cfg(target_os = "macos")]
-                candle_core::skip_arena_next_alloc();
-                let v_q = Tensor::zeros(
-                    (1, init_cap, self.n_kv_head, self.head_dim),
-                    DType::U8, &device,
-                )?;
-                let v_s = Tensor::zeros(
-                    (1, init_cap, self.n_kv_head, 1),
-                    DType::F32, &device,
-                )?;
-                self.kv_cache_batched[slot] = Some(Q8KvCache { k_q, k_s, v_q, v_s });
+                self.kv_cache_batched[slot] = Some(row.empty_like(
+                    init_cap,
+                    self.n_kv_head,
+                    self.head_dim,
+                    &device,
+                )?);
                 self.kv_cache_len_batched[slot] = 0;
                 self.kv_cache_cap_batched = init_cap;
             }
@@ -3199,69 +3342,46 @@ impl GatedAttentionLayer {
                 );
             }
             let new_len = cache_len + seq_len;
-            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().k_q.dim(1)?;
+            let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().capacity()?;
 
             if seq_len == 1 && new_len > self.attn_window {
                 // Sliding window eviction (decode): отбрасываем 1 старый, пишем 1 новый.
                 let keep = self.attn_window - 1;
-                let c = self.kv_cache_batched[slot].as_mut().unwrap();
-                for (buf, src) in [(&c.k_q, &kq), (&c.v_q, &vq), (&c.k_s, &ks), (&c.v_s, &vs)] {
-                    let old = buf.narrow(1, 1, keep)?.contiguous()?;
-                    buf.slice_set(&old, 1, 0)?;
-                    buf.slice_set(src, 1, keep)?;
-                }
+                self.kv_cache_batched[slot]
+                    .as_ref()
+                    .unwrap()
+                    .shift_and_append(row, keep)?;
                 self.kv_cache_len_batched[slot] = self.attn_window;
             } else if new_len > current_cap {
                 // Рост буфера. Копируем старое + пишем новое.
                 let new_cap = (new_len + 512).min(self.max_cache_len).min(self.attn_window);
-                #[cfg(target_os = "macos")]
-                candle_core::skip_arena_next_alloc();
-                let mk = |dt: DType, last: usize| -> Result<Tensor> {
-                    Ok(Tensor::zeros((1, new_cap, self.n_kv_head, last), dt, &device)?)
-                };
-                #[cfg(target_os = "macos")]
-                candle_core::skip_arena_next_alloc();
-                let (new_kq, new_ks) = (mk(DType::U8, self.head_dim)?, mk(DType::F32, 1)?);
-                let (new_vq, new_vs) = (mk(DType::U8, self.head_dim)?, mk(DType::F32, 1)?);
-                let c = self.kv_cache_batched[slot].as_ref().unwrap();
+                let old = self.kv_cache_batched[slot].as_ref().unwrap();
+                let new_cache = old.empty_like(
+                    new_cap,
+                    self.n_kv_head,
+                    self.head_dim,
+                    &device,
+                )?;
                 if cache_len > 0 {
-                    for (dst, src) in [(&new_kq, &c.k_q), (&new_vq, &c.v_q), (&new_ks, &c.k_s), (&new_vs, &c.v_s)] {
-                        let old = src.narrow(1, 0, cache_len)?.contiguous()?;
-                        dst.slice_set(&old, 1, 0)?;
-                    }
+                    old.copy_prefix_to(&new_cache, cache_len)?;
                 }
-                new_kq.slice_set(&kq, 1, cache_len)?;
-                new_ks.slice_set(&ks, 1, cache_len)?;
-                new_vq.slice_set(&vq, 1, cache_len)?;
-                new_vs.slice_set(&vs, 1, cache_len)?;
-                self.kv_cache_batched[slot] = Some(Q8KvCache {
-                    k_q: new_kq,
-                    k_s: new_ks,
-                    v_q: new_vq,
-                    v_s: new_vs,
-                });
+                new_cache.set_row(row, cache_len)?;
+                self.kv_cache_batched[slot] = Some(new_cache);
                 self.kv_cache_len_batched[slot] = new_len;
                 self.kv_cache_cap_batched = new_cap;
             } else {
-                // Обычный append.
-                let c = self.kv_cache_batched[slot].as_mut().unwrap();
-                c.k_q.slice_set(&kq, 1, cache_len)?;
-                c.k_s.slice_set(&ks, 1, cache_len)?;
-                c.v_q.slice_set(&vq, 1, cache_len)?;
-                c.v_s.slice_set(&vs, 1, cache_len)?;
+                self.kv_cache_batched[slot]
+                    .as_ref()
+                    .unwrap()
+                    .set_row(row, cache_len)?;
                 self.kv_cache_len_batched[slot] = new_len;
             }
 
             let kv_len = self.kv_cache_len_batched[slot];
-            let c = self.kv_cache_batched[slot].as_ref().unwrap();
-            let k = q8_dequantize_rows(
-                &c.k_q.narrow(1, 0, kv_len)?.contiguous()?,
-                &c.k_s.narrow(1, 0, kv_len)?.contiguous()?,
-            )?; // [1, kv_len, n_kv, hd] — head-last, flash-ready
-            let v = q8_dequantize_rows(
-                &c.v_q.narrow(1, 0, kv_len)?.contiguous()?,
-                &c.v_s.narrow(1, 0, kv_len)?.contiguous()?,
-            )?;
+            let (k, v) = self.kv_cache_batched[slot]
+                .as_ref()
+                .unwrap()
+                .f16_prefix(kv_len)?;
 
             // SDPA (seq_len=1, decode path). k/v — head-last [1, kv, n_kv, hd].
             let y = if q.device().is_metal() || q.device().is_cpu() {
@@ -3399,6 +3519,24 @@ pub struct StateSnapshot {
     pub model_nonce: u64,
     pub position: usize,
     pub blocks: Vec<BlockStateSnap>,
+}
+
+enum BatchedBlockCheckpoint {
+    #[cfg(feature = "cuda")]
+    CudaDeltaNet(delta_rule_batched_cuda::DeltaNetCudaSlotCheckpoint),
+    #[cfg(target_os = "macos")]
+    MetalDeltaNet(metal::delta_rule_batched_metal::DeltaNetMetalSlotCheckpoint),
+    CpuDeltaNet(DeltaNetStateSnap),
+    Attention {
+        cache: Option<BatchedKvCache>,
+        len: usize,
+    },
+}
+
+pub struct BatchedStateCheckpoint {
+    model_nonce: u64,
+    slot: usize,
+    blocks: Vec<BatchedBlockCheckpoint>,
 }
 
 impl StateSnapshot {
@@ -4382,6 +4520,15 @@ impl ModelWeights {
 
         // ── Загрузка слоёв ──
         let requested_moe_backend = std::env::var("QWEN36_MOE_BACKEND").ok();
+        let kv_cache_dtype = std::env::var("QWEN36_KV_CACHE_DTYPE")
+            .unwrap_or_else(|_| if is_moe { "q8".into() } else { "q8_f16".into() });
+        if !matches!(kv_cache_dtype.as_str(), "q8" | "q8_f16") {
+            candle_core::bail!(
+                "QWEN36_KV_CACHE_DTYPE must be q8 or q8_f16, got {kv_cache_dtype:?}"
+            );
+        }
+        let use_q8_f16_kv_cache = kv_cache_dtype == "q8_f16";
+        eprintln!("[{tag}] batched KV cache: {kv_cache_dtype}");
         let mut blocks = Vec::with_capacity(block_count);
         let load_start = std::time::Instant::now();
 
@@ -4825,6 +4972,7 @@ impl ModelWeights {
                     max_cache_len: context_length,
                     attn_window,
                     kv_cache_batched: (0..DECODE_BATCH_CAPACITY as usize).map(|_| None).collect(),
+                    use_q8_f16_kv_cache,
                     kv_cache_len_batched: vec![0; DECODE_BATCH_CAPACITY as usize],
                     kv_cache_cap_batched: 0,
                 })
@@ -5146,13 +5294,19 @@ impl ModelWeights {
                 (HybridLayerType::Attention(a), BlockStateSnap::Attention(kv_opt)) => {
                     match kv_opt {
                         Some(kv) => {
-                            // Deep-clone K/V из snapshot в per-slot batched буфер
-                            // (Q8-квантование, head-last layout как decode path).
+                            // Deep-clone K/V из snapshot в per-slot head-last buffer.
                             let k = tensor_deep_clone(&kv.k)?.transpose(1, 2)?.contiguous()?;
                             let v = tensor_deep_clone(&kv.v)?.transpose(1, 2)?.contiguous()?;
                             let (k_q, k_s) = q8_quantize_rows(&k)?;
                             let (v_q, v_s) = q8_quantize_rows(&v)?;
-                            a.kv_cache_batched[slot] = Some(Q8KvCache { k_q, k_s, v_q, v_s });
+                            a.kv_cache_batched[slot] = Some(if a.use_q8_f16_kv_cache {
+                                BatchedKvCache::F16(F16KvCache {
+                                    k: q8_dequantize_rows(&k_q, &k_s)?,
+                                    v: q8_dequantize_rows(&v_q, &v_s)?,
+                                })
+                            } else {
+                                BatchedKvCache::Q8(Q8KvCache { k_q, k_s, v_q, v_s })
+                            });
                             a.kv_cache_len_batched[slot] = kv.cache_len;
                         }
                         None => {
@@ -5171,6 +5325,118 @@ impl ModelWeights {
                         "seed_slot_batched: snapshot variant mismatch at slot {slot}: expected Attention"
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checkpoint one batched slot at committed boundary. DeltaNet CUDA/Metal
+    /// copies stay device-to-device; attention cache uses copy-on-write restore
+    /// because speculative append never overwrites committed prefix.
+    pub fn checkpoint_slot_batched(
+        &self,
+        device: &Device,
+        slot: usize,
+    ) -> Result<BatchedStateCheckpoint> {
+        if slot >= DECODE_BATCH_CAPACITY as usize {
+            candle_core::bail!("checkpoint slot {slot} >= capacity {DECODE_BATCH_CAPACITY}");
+        }
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            match &block.layer {
+                HybridLayerType::DeltaNet(delta) => {
+                    #[cfg(feature = "cuda")]
+                    if let Some(context) = delta.cuda_ctx_batched.as_ref() {
+                        blocks.push(BatchedBlockCheckpoint::CudaDeltaNet(
+                            delta_rule_batched_cuda::checkpoint_slot_cuda_state(
+                                &context.dev,
+                                &context.layer_state,
+                                slot,
+                            )?,
+                        ));
+                        continue;
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Some(context) = delta.metal_ctx_batched.as_ref() {
+                        blocks.push(BatchedBlockCheckpoint::MetalDeltaNet(
+                            metal::delta_rule_batched_metal::checkpoint_slot_metal_state(
+                                device.as_metal_device()?,
+                                &context.layer_state,
+                                slot,
+                            )?,
+                        ));
+                        continue;
+                    }
+                    blocks.push(BatchedBlockCheckpoint::CpuDeltaNet(
+                        delta.cpu_state_batched[slot].to_snapshot(),
+                    ));
+                }
+                HybridLayerType::Attention(attention) => {
+                    blocks.push(BatchedBlockCheckpoint::Attention {
+                        cache: attention.kv_cache_batched[slot].clone(),
+                        len: attention.kv_cache_len_batched[slot],
+                    });
+                }
+            }
+        }
+        Ok(BatchedStateCheckpoint {
+            model_nonce: self.instance_nonce,
+            slot,
+            blocks,
+        })
+    }
+
+    pub fn restore_slot_batched(
+        &mut self,
+        device: &Device,
+        checkpoint: &BatchedStateCheckpoint,
+    ) -> Result<()> {
+        if checkpoint.model_nonce != self.instance_nonce
+            || checkpoint.slot >= DECODE_BATCH_CAPACITY as usize
+            || checkpoint.blocks.len() != self.blocks.len()
+        {
+            candle_core::bail!("batched checkpoint is incompatible with model");
+        }
+        for (block, saved) in self.blocks.iter_mut().zip(&checkpoint.blocks) {
+            match (&mut block.layer, saved) {
+                #[cfg(feature = "cuda")]
+                (HybridLayerType::DeltaNet(delta), BatchedBlockCheckpoint::CudaDeltaNet(saved)) => {
+                    let context = delta
+                        .cuda_ctx_batched
+                        .as_mut()
+                        .ok_or_else(|| candle_core::Error::Msg("CUDA batched state is absent".into()))?;
+                    let dev = context.dev.clone();
+                    delta_rule_batched_cuda::restore_slot_cuda_checkpoint(
+                        &dev,
+                        &mut context.layer_state,
+                        checkpoint.slot,
+                        saved,
+                    )?;
+                }
+                #[cfg(target_os = "macos")]
+                (HybridLayerType::DeltaNet(delta), BatchedBlockCheckpoint::MetalDeltaNet(saved)) => {
+                    let context = delta
+                        .metal_ctx_batched
+                        .as_ref()
+                        .ok_or_else(|| candle_core::Error::Msg("Metal batched state is absent".into()))?;
+                    metal::delta_rule_batched_metal::restore_slot_metal_checkpoint(
+                        device.as_metal_device()?,
+                        &context.layer_state,
+                        checkpoint.slot,
+                        saved,
+                    )?;
+                }
+                (HybridLayerType::DeltaNet(delta), BatchedBlockCheckpoint::CpuDeltaNet(saved)) => {
+                    delta.cpu_state_batched[checkpoint.slot].restore_from(saved);
+                }
+                (
+                    HybridLayerType::Attention(attention),
+                    BatchedBlockCheckpoint::Attention { cache, len },
+                ) => {
+                    attention.kv_cache_batched[checkpoint.slot] = cache.clone();
+                    attention.kv_cache_len_batched[checkpoint.slot] = *len;
+                }
+                _ => candle_core::bail!("batched checkpoint block type mismatch"),
             }
         }
         Ok(())
@@ -5688,6 +5954,32 @@ impl ModelWeights {
         rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
+        let (logits, _) = self.forward_decode_batch_hidden_inner(
+            tokens,
+            cache_positions,
+            rope_positions,
+            slots,
+        )?;
+        Ok(logits)
+    }
+
+    pub fn forward_decode_batch_with_hidden(
+        &mut self,
+        tokens: &Tensor,
+        cache_positions: &[usize],
+        rope_positions: &[usize],
+        slots: &[u32],
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_decode_batch_hidden_inner(tokens, cache_positions, rope_positions, slots)
+    }
+
+    fn forward_decode_batch_hidden_inner(
+        &mut self,
+        tokens: &Tensor,
+        cache_positions: &[usize],
+        rope_positions: &[usize],
+        slots: &[u32],
+    ) -> Result<(Tensor, Tensor)> {
         let (b_sz, seq_len) = tokens.dims2()?;
         if seq_len != 1
             || cache_positions.len() != b_sz
@@ -5742,10 +6034,13 @@ impl ModelWeights {
             eprintln!("[fdb] step blocks: delta={t_delta:?} attn={t_attn:?}");
         }
 
-        // Head: norm -> take last token -> output projection -> [b_sz, vocab].
-        let x = self.norm.forward(&layer_in)?; // [b_sz, 1, n_embd]
-        let x = x.i((.., 0, ..))?; // [b_sz, n_embd]
-        self.output.forward(&x) // [b_sz, vocab]
+        // MTP consumes target hidden after output norm, matching h_nextn oracle.
+        let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
+        Ok((self.output.forward(&hidden)?, hidden))
+    }
+
+    pub(crate) fn shared_output(&self) -> QMatMul {
+        self.output.clone()
     }
     ///
     /// Для Qwen3.5-4B = 2560. Используется в multimodal pipeline'ах для
@@ -5846,6 +6141,49 @@ impl ModelWeights {
         index_pos: usize,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
+        let (logits, _) = self.forward_embeds_hidden_inner(embeds, index_pos, rope)?;
+        Ok(logits)
+    }
+
+    pub(crate) fn forward_embeds_with_hidden(
+        &mut self,
+        embeds: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_embeds_hidden_inner(embeds, index_pos, None)
+    }
+
+    pub(crate) fn forward_embeds_mrope_with_hidden(
+        &mut self,
+        embeds: &Tensor,
+        plan: &PositionPlan,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_, seq_len, _) = embeds.dims3()?;
+        if plan.rope_positions.iter().any(|axis| axis.len() != seq_len) {
+            candle_core::bail!("MRoPE position count does not match embedding sequence");
+        }
+        let (rope_dim, device) = self
+            .blocks
+            .iter()
+            .find_map(|block| match &block.layer {
+                HybridLayerType::Attention(attention) => {
+                    Some((attention.rope_dim, attention.cos.device()))
+                }
+                HybridLayerType::DeltaNet(_) => None,
+            })
+            .ok_or_else(|| candle_core::Error::Msg("model has no attention block".into()))?;
+        let (cos, sin) =
+            precompute_mrope(&plan.rope_positions, rope_dim, 10_000_000.0, &device)?;
+        self.forward_embeds_hidden_inner(embeds, index_pos, Some((&cos, &sin)))
+    }
+
+    fn forward_embeds_hidden_inner(
+        &mut self,
+        embeds: &Tensor,
+        index_pos: usize,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, seq_len, hidden) = embeds.dims3()?;
         if hidden != self.hidden_size() {
             candle_core::bail!(
@@ -5944,9 +6282,9 @@ impl ModelWeights {
             }
         }
 
-        let x = self.norm.forward(&layer_in)?;
-        let x = x.i((.., seq_len - 1, ..))?;
-        self.output.forward(&x)
+        let hidden = self.norm.forward(&layer_in)?;
+        let logits = self.output.forward(&hidden.i((.., seq_len - 1, ..))?)?;
+        Ok((logits, hidden))
     }
 
     /// Forward с image + text — multimodal entry point.

@@ -21,6 +21,7 @@ pub mod metal_utils;
 pub mod model_profile;
 pub mod model_weights;
 pub mod moe;
+pub mod mtp;
 pub mod multimodal;
 #[cfg(feature = "real-model")]
 pub mod tokenizer;
@@ -28,5 +29,5 @@ pub mod tokenizer;
 pub mod vision;
 
 pub use adapter::Qwen35BatchAdapter;
-pub use model_profile::{Architecture, ModelFingerprint, ModelProfile};
+pub use model_profile::{Architecture, ModelFingerprint, ModelProfile, MtpProfile};
 pub use model_weights::ModelWeights;

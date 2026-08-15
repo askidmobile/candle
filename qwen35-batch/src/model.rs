@@ -24,6 +24,7 @@
 //! для первого чанка каждого запроса).
 
 use anyhow::Result;
+use std::any::Any;
 
 /// Один активный decode-слот на шаге.
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +63,9 @@ pub struct PrefillChunk {
     pub tokens: Vec<u32>,
     /// Стартовая абсолютная позиция чанка (для RoPE/KV).
     pub start_pos: usize,
+    /// Last chunk of request prompt. MTP catch-up and batched seeding commit only
+    /// here; intermediate chunks remain single-slot snapshots.
+    pub is_final: bool,
 }
 
 /// Opaque multimodal prefill payload. Core scheduler keeps text behavior and
@@ -80,8 +84,21 @@ pub struct MultimodalPrefill {
 }
 
 /// Сэмплер: логиты → токен.
+pub type SamplerCheckpoint = Box<dyn Any + Send>;
+
 pub trait Sampler: Send {
     fn sample(&mut self, logits: &[f32]) -> u32;
+
+    /// Snapshot only state belonging to `slot_idx`. Stateless samplers keep the
+    /// default unit checkpoint. Speculative commit retains current state;
+    /// rollback restores this checkpoint before baseline decode.
+    fn checkpoint(&self, _slot_idx: usize) -> SamplerCheckpoint {
+        Box::new(())
+    }
+
+    fn restore(&mut self, _slot_idx: usize, _checkpoint: SamplerCheckpoint) -> Result<()> {
+        Ok(())
+    }
 
     /// Per-slot вызов (qwen36-server: per-request sampling params + penalties).
     /// `generated` — токены, сгенерированные этим слотом ДО текущего шага
@@ -111,6 +128,34 @@ impl Sampler for GreedySampler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeFallback {
+    Begin,
+    Draft,
+    Commit,
+    Cancelled,
+}
+
+impl SpeculativeFallback {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Draft => "draft",
+            Self::Commit => "commit",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeculativeMetrics {
+    pub enabled: bool,
+    pub used: bool,
+    pub drafted: usize,
+    pub accepted: usize,
+    pub fallback: Option<SpeculativeFallback>,
+}
+
 /// Абстракция модели над batched prefill + batched decode.
 pub trait BatchModel {
     /// Размер словаря.
@@ -129,6 +174,40 @@ pub trait BatchModel {
     /// Batched decode step: один токен на каждый активный слот, одним батчем.
     /// Возвращает логиты per-item (в порядке `batch.items`).
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>>;
+
+    /// Whether validated speculative state exists for this slot. Default keeps
+    /// all existing model implementations on ordinary decode.
+    fn speculative_available(&self, _slot: usize) -> bool {
+        false
+    }
+
+    /// Checkpoint target and draft state at committed boundary.
+    fn speculative_begin(&mut self, _slot: usize) -> Result<()> {
+        anyhow::bail!("model does not support speculative transactions")
+    }
+
+    /// Advance draft model only. Returned IDs are deterministic draft argmax;
+    /// target sampler remains sole authority for committed IDs.
+    fn speculative_draft(
+        &mut self,
+        _slot: usize,
+        _token: u32,
+        _cache_pos: usize,
+        _rope_pos: usize,
+        _max_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        anyhow::bail!("model does not support speculative transactions")
+    }
+
+    /// Align draft state to target-verified rows and release checkpoint.
+    fn speculative_commit(&mut self, _slot: usize) -> Result<()> {
+        anyhow::bail!("model does not support speculative transactions")
+    }
+
+    /// Restore target and draft state. Must be idempotent after begin failure.
+    fn speculative_rollback(&mut self, _slot: usize) -> Result<()> {
+        Ok(())
+    }
 
     /// Сбросить per-slot state слота `idx` (новый запрос).
     fn reset_slot(&mut self, idx: usize) -> Result<()>;
@@ -262,6 +341,7 @@ mod tests {
                 reset_first: true,
                 tokens: prompt.clone(),
                 start_pos: 0,
+                is_final: true,
             };
             let l0 = m.prefill_chunk(&chunk).unwrap();
             let mut seq = vec![GreedySampler.sample(&l0)];
@@ -296,12 +376,14 @@ mod tests {
             reset_first: true,
             tokens: vec![5, 6, 7],
             start_pos: 0,
+            is_final: true,
         };
         let c1 = PrefillChunk {
             slot_idx: 1,
             reset_first: true,
             tokens: vec![50, 60],
             start_pos: 0,
+            is_final: true,
         };
         let l0 = m.prefill_chunk(&c0).unwrap();
         let l1 = m.prefill_chunk(&c1).unwrap();

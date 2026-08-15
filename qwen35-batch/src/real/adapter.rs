@@ -17,12 +17,15 @@
 //! на time-multiplexed path (restore→forward→snapshot per slot).
 
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use std::path::Path;
 
 use crate::model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
 use crate::real::model_profile::ModelProfile;
-use crate::real::model_weights::{ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY};
+use crate::real::model_weights::{
+    BatchedStateCheckpoint, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
+};
+use crate::real::mtp::Qwen35Mtp;
 use crate::real::multimodal::{GridThw, PositionPlan};
 use crate::real::vision::Qwen35Vision;
 
@@ -72,6 +75,10 @@ pub struct Qwen35BatchAdapter {
     /// On-demand Vision component. Phase 8 owns TTL/load barrier; adapter only
     /// consumes explicitly loaded component and per-request payloads.
     vision: Option<Qwen35Vision>,
+    mtp: Option<Qwen35Mtp>,
+    target_transactions: Vec<Option<BatchedStateCheckpoint>>,
+    verified_target_hidden: Vec<Vec<Tensor>>,
+    transaction_snapshot_positions: Vec<Option<usize>>,
     multimodal: Vec<Option<InstalledMultimodal>>,
     rope_deltas: Vec<i64>,
     eos: u32,
@@ -149,6 +156,10 @@ impl Qwen35BatchAdapter {
             slot_snaps: (0..num_slots).map(|_| None).collect(),
             slot_seeded: vec![false; num_slots],
             vision: None,
+            mtp: None,
+            target_transactions: (0..num_slots).map(|_| None).collect(),
+            verified_target_hidden: (0..num_slots).map(|_| Vec::new()).collect(),
+            transaction_snapshot_positions: vec![None; num_slots],
             multimodal: (0..num_slots).map(|_| None).collect(),
             rope_deltas: vec![0; num_slots],
             eos,
@@ -215,6 +226,31 @@ impl Qwen35BatchAdapter {
         }
     }
 
+    pub fn load_mtp(&mut self, gguf_path: &Path) -> Result<()> {
+        if self.target_transactions.iter().any(Option::is_some) {
+            return Err(anyhow!("cannot load MTP during active transaction"));
+        }
+        self.mtp = Some(
+            Qwen35Mtp::load(
+                gguf_path,
+                self.device.clone(),
+                self.slot_snaps.len(),
+                &self.profile,
+                self.model.shared_output(),
+            )
+            .map_err(|error| anyhow!("load MTP component: {error}"))?,
+        );
+        Ok(())
+    }
+
+    pub fn unload_mtp(&mut self) -> Result<()> {
+        if self.target_transactions.iter().any(Option::is_some) {
+            return Err(anyhow!("cannot unload MTP during active transaction"));
+        }
+        self.mtp = None;
+        Ok(())
+    }
+
     /// Полный сброс (все слоты) — только для тестов / teardown.
     #[allow(dead_code)]
     fn clear_all_state(&mut self) {
@@ -231,6 +267,16 @@ impl Qwen35BatchAdapter {
         }
         for payload in &mut self.multimodal {
             *payload = None;
+        }
+        self.mtp = None;
+        for transaction in &mut self.target_transactions {
+            *transaction = None;
+        }
+        for hidden in &mut self.verified_target_hidden {
+            hidden.clear();
+        }
+        for position in &mut self.transaction_snapshot_positions {
+            *position = None;
         }
     }
 }
@@ -350,7 +396,7 @@ impl BatchModel for Qwen35BatchAdapter {
             (1usize, chunk.tokens.len()),
             &self.device,
         )?;
-        let logits = if let Some(media) = self.multimodal[sidx].as_mut() {
+        let (logits, mtp_inputs) = if let Some(media) = self.multimodal[sidx].as_mut() {
             let end = chunk
                 .start_pos
                 .checked_add(chunk.tokens.len())
@@ -399,14 +445,41 @@ impl BatchModel for Qwen35BatchAdapter {
                 feature_offset += len;
             }
             let plan = slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len())?;
-            self.model
-                .forward_embeds_mrope(&embeds, &plan, chunk.start_pos)
-                .map_err(|error| anyhow!("multimodal prefill forward: {error}"))?
+            let (logits, hidden) = self
+                .model
+                .forward_embeds_mrope_with_hidden(&embeds, &plan, chunk.start_pos)
+                .map_err(|error| anyhow!("multimodal prefill forward: {error}"))?;
+            (logits, Some((embeds, hidden)))
+        } else if self.mtp.is_some() {
+            let embeds = self.model.embed_tokens(&ids, &self.device)?;
+            let (logits, hidden) = self
+                .model
+                .forward_embeds_with_hidden(&embeds, chunk.start_pos)
+                .map_err(|error| anyhow!("prefill forward: {error}"))?;
+            (logits, Some((embeds, hidden)))
         } else {
-            self.model
-                .forward(&ids, chunk.start_pos)
-                .map_err(|e| anyhow!("prefill forward: {e}"))?
+            (
+                self.model
+                    .forward(&ids, chunk.start_pos)
+                    .map_err(|error| anyhow!("prefill forward: {error}"))?,
+                None,
+            )
         };
+        if let (Some(mtp), Some((embeds, hidden))) = (self.mtp.as_mut(), mtp_inputs) {
+            let rope_positions = self.multimodal[sidx]
+                .as_ref()
+                .map(|media| slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len()))
+                .transpose()?
+                .map(|plan| plan.rope_positions);
+            mtp.catch_up(
+                sidx,
+                &embeds,
+                &hidden,
+                chunk.start_pos,
+                rope_positions.as_ref(),
+            )
+            .map_err(|error| anyhow!("MTP prefill catch-up: {error}"))?;
+        }
         let logits_f32 = logits
             .squeeze(0)?
             .to_dtype(DType::F32)?
@@ -420,8 +493,22 @@ impl BatchModel for Qwen35BatchAdapter {
             .snapshot_state(&self.device, new_pos)
             .map_err(|e| anyhow!("prefill snapshot: {e}"))?;
         self.slot_snaps[sidx] = Some(snap);
-        // Prefill изменил single-slot state; batched slot нужно пере-seed.
-        self.slot_seeded[sidx] = false;
+        // Seed only final prompt boundary; intermediate chunks restore through
+        // single-slot snapshot on next prefill call.
+        if chunk.is_final {
+            self.model
+                .seed_slot_batched(
+                    &self.device,
+                    sidx,
+                    self.slot_snaps[sidx]
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("prefill snapshot disappeared"))?,
+                )
+                .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
+            self.slot_seeded[sidx] = true;
+        } else {
+            self.slot_seeded[sidx] = false;
+        }
 
         Ok(logits_f32)
     }
@@ -472,10 +559,15 @@ impl BatchModel for Qwen35BatchAdapter {
             slots.push(it.slot_idx as u32);
         }
         let ids = Tensor::from_vec(tokens, (b, 1usize), &self.device)?;
-        let logits = self
+        let (logits, hidden) = self
             .model
-            .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
+            .forward_decode_batch_with_hidden(&ids, &positions, &rope_positions, &slots)
             .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
+        for (batch_index, &slot) in slot_order.iter().enumerate() {
+            if self.target_transactions[slot].is_some() {
+                self.verified_target_hidden[slot].push(hidden.i(batch_index)?.unsqueeze(0)?);
+            }
+        }
         // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
         // serialized four CUDA synchronizations/copies for B=4.
         let flat = logits
@@ -513,6 +605,94 @@ impl BatchModel for Qwen35BatchAdapter {
         Ok(out)
     }
 
+    fn speculative_available(&self, slot: usize) -> bool {
+        slot < self.slot_seeded.len()
+            && self.mtp.is_some()
+            && self.slot_seeded[slot]
+            && self.target_transactions[slot].is_none()
+    }
+
+    fn speculative_begin(&mut self, slot: usize) -> Result<()> {
+        if !self.speculative_available(slot) {
+            return Err(anyhow!("MTP is unavailable for slot {slot}"));
+        }
+        let checkpoint = self
+            .model
+            .checkpoint_slot_batched(&self.device, slot)
+            .map_err(|error| anyhow!("target checkpoint: {error}"))?;
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| anyhow!("MTP component is not loaded"))?;
+        if let Err(error) = mtp.begin(slot) {
+            self.model
+                .restore_slot_batched(&self.device, &checkpoint)
+                .map_err(|restore| anyhow!("MTP begin failed: {error}; target restore: {restore}"))?;
+            return Err(anyhow!("MTP begin: {error}"));
+        }
+        self.transaction_snapshot_positions[slot] =
+            self.slot_snaps[slot].as_ref().map(|snapshot| snapshot.position);
+        self.target_transactions[slot] = Some(checkpoint);
+        self.verified_target_hidden[slot].clear();
+        Ok(())
+    }
+
+    fn speculative_draft(
+        &mut self,
+        slot: usize,
+        token: u32,
+        cache_pos: usize,
+        rope_pos: usize,
+        max_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        if cache_pos != rope_pos && self.rope_deltas[slot] == 0 {
+            return Err(anyhow!("MTP cache/RoPE position mismatch"));
+        }
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| anyhow!("MTP component is not loaded"))?
+            .draft(slot, token, rope_pos, max_tokens, &self.model)
+            .map_err(|error| anyhow!("MTP draft: {error}"))
+    }
+
+    fn speculative_commit(&mut self, slot: usize) -> Result<()> {
+        if self.target_transactions[slot].is_none() {
+            return Err(anyhow!("MTP transaction is not active for slot {slot}"));
+        }
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| anyhow!("MTP component is not loaded"))?
+            .commit(slot, &self.verified_target_hidden[slot])
+            .map_err(|error| anyhow!("MTP commit: {error}"))?;
+        self.target_transactions[slot] = None;
+        self.verified_target_hidden[slot].clear();
+        self.transaction_snapshot_positions[slot] = None;
+        Ok(())
+    }
+
+    fn speculative_rollback(&mut self, slot: usize) -> Result<()> {
+        if slot >= self.target_transactions.len() {
+            return Err(anyhow!("MTP rollback slot {slot} is out of range"));
+        }
+        if let Some(checkpoint) = self.target_transactions[slot].take() {
+            self.model
+                .restore_slot_batched(&self.device, &checkpoint)
+                .map_err(|error| anyhow!("target rollback: {error}"))?;
+            if let Some(position) = self.transaction_snapshot_positions[slot] {
+                if let Some(snapshot) = self.slot_snaps[slot].as_mut() {
+                    snapshot.position = position;
+                }
+            }
+        }
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.rollback(slot)
+                .map_err(|error| anyhow!("MTP rollback: {error}"))?;
+        }
+        self.verified_target_hidden[slot].clear();
+        self.transaction_snapshot_positions[slot] = None;
+        Ok(())
+    }
+
     fn reset_slot(&mut self, idx: usize) -> Result<()> {
         if idx >= self.slot_snaps.len() {
             return Err(anyhow!("reset slot {idx} is out of range"));
@@ -521,6 +701,13 @@ impl BatchModel for Qwen35BatchAdapter {
         self.slot_seeded[idx] = false;
         self.multimodal[idx] = None;
         self.rope_deltas[idx] = 0;
+        self.target_transactions[idx] = None;
+        self.verified_target_hidden[idx].clear();
+        self.transaction_snapshot_positions[idx] = None;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.reset_slot(idx)
+                .map_err(|error| anyhow!("reset MTP slot {idx}: {error}"))?;
+        }
         Ok(())
     }
 }

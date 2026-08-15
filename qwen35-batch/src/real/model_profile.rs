@@ -460,6 +460,146 @@ impl VisionProfile {
     }
 }
 
+/// Thin Qwen3.5 MTP component contract. Shared embedding/output remain in Text.
+#[derive(Debug, Clone)]
+pub struct MtpProfile {
+    pub hidden_size: usize,
+    pub context_length: usize,
+    pub intermediate_size: usize,
+    pub head_count: usize,
+    pub kv_head_count: usize,
+    pub head_dim: usize,
+    pub rms_norm_eps: f64,
+    pub quant_set: HashSet<GgmlDType>,
+}
+
+impl MtpProfile {
+    pub fn read_and_validate(ct: &Content, text: &ModelProfile) -> Result<Self> {
+        let mut errs = ValidationErrors::default();
+        let metadata: BTreeMap<String, Value> = ct.metadata.clone().into_iter().collect();
+        let tensors: BTreeMap<String, TensorInfo> = ct
+            .tensor_infos
+            .iter()
+            .map(|(name, info)| (name.clone(), clone_tensor_info(info)))
+            .collect();
+        match Architecture::from_metadata(&metadata) {
+            Ok(Architecture::DenseQwen35) => {}
+            Ok(other) => errs.push(format!("MTP architecture {other:?}, expected dense qwen35")),
+            Err(error) => errs.push(format!("{error}")),
+        }
+        let blocks = md_u32(&metadata, "qwen35.block_count", &mut errs).unwrap_or(0);
+        let nextn = md_u32(&metadata, "qwen35.nextn_predict_layers", &mut errs).unwrap_or(0);
+        let hidden = md_u32(&metadata, "qwen35.embedding_length", &mut errs).unwrap_or(0);
+        let context = md_u32(&metadata, "qwen35.context_length", &mut errs).unwrap_or(0);
+        let intermediate =
+            md_u32(&metadata, "qwen35.feed_forward_length", &mut errs).unwrap_or(0);
+        let heads = md_u32(&metadata, "qwen35.attention.head_count", &mut errs).unwrap_or(0);
+        let kv_heads =
+            md_u32(&metadata, "qwen35.attention.head_count_kv", &mut errs).unwrap_or(0);
+        let key_length =
+            md_u32(&metadata, "qwen35.attention.key_length", &mut errs).unwrap_or(0);
+        let value_length =
+            md_u32(&metadata, "qwen35.attention.value_length", &mut errs).unwrap_or(0);
+        let rms = md_f32_req(
+            &metadata,
+            "qwen35.attention.layer_norm_rms_epsilon",
+            &mut errs,
+        )
+        .unwrap_or(0.0) as f64;
+        for (name, actual, expected) in [
+            ("block_count", blocks, 33),
+            ("nextn_predict_layers", nextn, 1),
+            ("hidden_size", hidden, 2560),
+            ("context_length", context, 262144),
+            ("intermediate_size", intermediate, 9216),
+            ("head_count", heads, 16),
+            ("kv_head_count", kv_heads, 4),
+            ("key_length", key_length, 256),
+            ("value_length", value_length, 256),
+        ] {
+            if actual != expected {
+                errs.push(format!("MTP {name}={actual}, expected {expected}"));
+            }
+        }
+        if text.architecture != Architecture::DenseQwen35
+            || text.block_count != 32
+            || text.hidden_size != hidden
+            || text.context_length != context
+            || text.feed_forward_length != intermediate
+            || text.attention_head_count != heads
+            || text.attention_head_count_kv != kv_heads
+            || text.attention_key_length != key_length
+            || text.attention_value_length != value_length
+        {
+            errs.push("MTP component is incompatible with shared Text profile".into());
+        }
+        if tensors.len() != 15 {
+            errs.push(format!("MTP tensor count={}, expected 15", tensors.len()));
+        }
+        let matrix = [GgmlDType::Q8_0];
+        let norm = [GgmlDType::F32];
+        for (name, shape) in [
+            ("blk.32.attn_k.weight", vec![1024, 2560]),
+            ("blk.32.attn_output.weight", vec![2560, 4096]),
+            ("blk.32.attn_q.weight", vec![8192, 2560]),
+            ("blk.32.attn_v.weight", vec![1024, 2560]),
+            ("blk.32.ffn_down.weight", vec![2560, 9216]),
+            ("blk.32.ffn_gate.weight", vec![9216, 2560]),
+            ("blk.32.ffn_up.weight", vec![9216, 2560]),
+            ("blk.32.nextn.eh_proj.weight", vec![2560, 5120]),
+        ] {
+            require_tensor_contract(&tensors, name, &shape, &matrix, &mut errs);
+        }
+        for (name, shape) in [
+            ("blk.32.attn_k_norm.weight", vec![256]),
+            ("blk.32.attn_norm.weight", vec![2560]),
+            ("blk.32.attn_q_norm.weight", vec![256]),
+            ("blk.32.nextn.enorm.weight", vec![2560]),
+            ("blk.32.nextn.hnorm.weight", vec![2560]),
+            ("blk.32.nextn.shared_head_norm.weight", vec![2560]),
+            ("blk.32.post_attention_norm.weight", vec![2560]),
+        ] {
+            require_tensor_contract(&tensors, name, &shape, &norm, &mut errs);
+        }
+        let allowed: HashSet<&str> = [
+            "blk.32.attn_k.weight",
+            "blk.32.attn_output.weight",
+            "blk.32.attn_q.weight",
+            "blk.32.attn_v.weight",
+            "blk.32.ffn_down.weight",
+            "blk.32.ffn_gate.weight",
+            "blk.32.ffn_up.weight",
+            "blk.32.nextn.eh_proj.weight",
+            "blk.32.attn_k_norm.weight",
+            "blk.32.attn_norm.weight",
+            "blk.32.attn_q_norm.weight",
+            "blk.32.nextn.enorm.weight",
+            "blk.32.nextn.hnorm.weight",
+            "blk.32.nextn.shared_head_norm.weight",
+            "blk.32.post_attention_norm.weight",
+        ]
+        .into_iter()
+        .collect();
+        for name in tensors.keys() {
+            if !allowed.contains(name.as_str()) {
+                errs.push(format!("unexpected MTP tensor: {name}"));
+            }
+        }
+        let quant_set = tensors.values().map(|info| info.ggml_dtype).collect();
+        errs.into_result()?;
+        Ok(Self {
+            hidden_size: hidden,
+            context_length: context,
+            intermediate_size: intermediate,
+            head_count: heads,
+            kv_head_count: kv_heads,
+            head_dim: key_length,
+            rms_norm_eps: rms,
+            quant_set,
+        })
+    }
+}
+
 /// Check tensors for a single block at the given layer index.
 /// GGUF tensor names have NO architecture prefix (`blk.N....`); the prefix is
 /// only for metadata keys. Hybrid trunk: DeltaNet blocks (linear recurrence)
