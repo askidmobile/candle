@@ -122,6 +122,7 @@ fn q4k_kernel_variant() -> Q4KKernelVariant {
 /// Backwards-compat: `true` если активна V2 или V3 (т.е. НЕ V1).
 /// Используется существующими тестами `qwen35_kernel_v2_parity`.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn q4k_kernel_is_v2() -> bool {
     !matches!(q4k_kernel_variant(), Q4KKernelVariant::V1Fast)
 }
@@ -163,6 +164,7 @@ fn q4k_kernel_variant_effective() -> Q4KKernelVariant {
 
 /// Backwards-compat: `true` если эффективный variant — V2 или V3.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn q4k_kernel_is_v2_effective() -> bool {
     !matches!(q4k_kernel_variant_effective(), Q4KKernelVariant::V1Fast)
 }
@@ -268,6 +270,7 @@ fn maybe_repack_q4k_opt(
     Ok(Some(Arc::new(gpu)))
 }
 
+#[allow(dead_code)]
 #[cfg(not(target_os = "macos"))]
 fn maybe_repack_q4k_opt(_qmatmul: &QMatMul, _device: &Device) -> Result<Option<()>> {
     Ok(None)
@@ -275,6 +278,7 @@ fn maybe_repack_q4k_opt(_qmatmul: &QMatMul, _device: &Device) -> Result<Option<(
 
 /// Интервал GPU sync между слоями prefill — измеренный оптимум (см. T-33).
 
+#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 const SYNC_EVERY: usize = 4;
 
@@ -1093,6 +1097,7 @@ impl FeedForward {
 /// Хранится на CPU как Vec<f32> для эффективной мутации в рекуррентном цикле.
 /// Инициализируется нулями при первом forward или после clear_state.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DeltaNetState {
     /// Conv1D буфер: [conv_kernel-1, channels] row-major.
     /// channels = key_dim * 2 + value_dim (joint QKV после проекции).
@@ -5163,6 +5168,7 @@ impl ModelWeights {
     }
 
     /// Получить identity nonce модели (T-274).
+    #[allow(dead_code)]
     pub(crate) fn instance_nonce(&self) -> u64 {
         self.instance_nonce
     }

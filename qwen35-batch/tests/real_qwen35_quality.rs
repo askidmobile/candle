@@ -25,7 +25,6 @@ use std::path::PathBuf;
 use qwen35_batch::real::tokenizer::{self, ChatMsg};
 use qwen35_batch::real::Qwen35BatchAdapter;
 use qwen35_batch::scheduler::BatchScheduler;
-use qwen35_batch::BatchModel;
 use tokenizers::Tokenizer;
 
 fn model_dir() -> PathBuf {
