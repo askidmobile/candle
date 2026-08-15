@@ -1,5 +1,7 @@
 use anyhow::Result;
+use candle_core::backend::BackendDevice;
 use candle_core::Device;
+use qwen35_batch::model::BatchModel;
 use qwen35_batch::real::Qwen35BatchAdapter;
 use qwen35_batch::scheduler::BatchScheduler;
 use qwen35_batch::slot::SlotStatus;
