@@ -16,6 +16,7 @@ pub enum Id {
     FlashDecode,
     Fill,
     Indexing,
+    Moe,
     /// Phase 3: device-only MoE routing + quantized expert kernels (PTX).
     MoeRouter,
     MoeQuantized,
@@ -26,7 +27,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 16] = [
+pub const ALL_IDS: [Id; 17] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -36,6 +37,7 @@ pub const ALL_IDS: [Id; 16] = [
     Id::FlashDecode,
     Id::Fill,
     Id::Indexing,
+    Id::Moe,
     Id::MoeRouter,
     Id::MoeQuantized,
     Id::Quantized,
@@ -89,6 +91,7 @@ mdl!(FLASH_DECODE, FlashDecode);
 mdl!(DELTA_RULE_BATCHED, DeltaRuleBatched);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
+mdl!(MOE, Moe);
 mdl!(MOE_ROUTER, MoeRouter);
 mdl!(MOE_QUANTIZED, MoeQuantized);
 mdl!(QUANTIZED, Quantized);
