@@ -1,0 +1,93 @@
+use anyhow::Result;
+use candle_core::Device;
+use qwen35_batch::real::Qwen35BatchAdapter;
+use qwen35_batch::scheduler::BatchScheduler;
+use qwen35_batch::slot::SlotStatus;
+use std::path::Path;
+use std::time::Instant;
+
+fn main() -> Result<()> {
+    let text = "D:\\Models\\yttri\\qwen3.5-4b\\Qwen3.5-4B-Q4_K_M.gguf";
+    let device = Device::new_cuda(0)?;
+    
+    // Warmup
+    {
+        let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
+        let mut scheduler = BatchScheduler::new(adapter, 1, 248046, 248320);
+        scheduler.submit(vec![9707; 16], 8);
+        while scheduler.step()? != qwen35_batch::scheduler::StepOutcome::Idle {}
+    }
+
+    // Prefill 512 & 2048 (B=1)
+    for p_len in [512, 2048] {
+        let mut adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
+        let prompt = vec![9707u32; p_len];
+        let t0 = Instant::now();
+        let _ = adapter.prefill_chunk(&qwen35_batch::model::PrefillChunk {
+            slot_idx: 0,
+            reset_first: true,
+            tokens: prompt,
+            start_pos: 0,
+            is_final: true,
+        })?;
+        device.as_cuda_device()?.synchronize()?;
+        let el = t0.elapsed().as_secs_f64();
+        let tps = p_len as f64 / el;
+        println!("CANDLE pp{} B=1: {:.2} tok/s ({:.3}s)", p_len, tps, el);
+    }
+
+    // Decode B=1 (tg128)
+    {
+        let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
+        let mut scheduler = BatchScheduler::new(adapter, 1, 248046, 248320);
+        scheduler.submit(vec![9707; 32], 128);
+        scheduler.step()?; // prefill
+        let t0 = Instant::now();
+        let mut gen = 0;
+        loop {
+            match scheduler.step()? {
+                qwen35_batch::scheduler::StepOutcome::DidDecode(b) => gen += b,
+                qwen35_batch::scheduler::StepOutcome::Idle => break,
+                _ => {}
+            }
+            if scheduler.slots_mut()[0].status == SlotStatus::Finished {
+                break;
+            }
+        }
+        device.as_cuda_device()?.synchronize()?;
+        let el = t0.elapsed().as_secs_f64();
+        let tps = gen as f64 / el;
+        println!("CANDLE tg128 B=1: {:.2} tok/s ({:.3}s, {} tok)", tps, el, gen);
+    }
+
+    // Decode B=4 (tg128 x 4)
+    {
+        let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 4)?;
+        let mut scheduler = BatchScheduler::new(adapter, 4, 248046, 248320);
+        for _ in 0..4 {
+            scheduler.submit(vec![9707; 32], 128);
+        }
+        // prefill all 4 slots
+        for _ in 0..4 {
+            scheduler.step()?;
+        }
+        let t0 = Instant::now();
+        let mut gen = 0;
+        loop {
+            match scheduler.step()? {
+                qwen35_batch::scheduler::StepOutcome::DidDecode(b) => gen += b,
+                qwen35_batch::scheduler::StepOutcome::Idle => break,
+                _ => {}
+            }
+            if scheduler.slots_mut().iter().all(|s| s.status == SlotStatus::Finished) {
+                break;
+            }
+        }
+        device.as_cuda_device()?.synchronize()?;
+        let el = t0.elapsed().as_secs_f64();
+        let tps = gen as f64 / el;
+        println!("CANDLE tg128 B=4: {:.2} aggregate tok/s ({:.2} tok/s per-slot, {:.3}s, {} total tok)", tps, tps / 4.0, el, gen);
+    }
+
+    Ok(())
+}
