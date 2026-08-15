@@ -1404,7 +1404,7 @@ impl candle::CustomOp3 for Sdpa {
             || q_head == 512;
         // Vector kernel requires head_dim to be a multiple of 32
         let supported_vector_head_dim =
-            q_head == 32 || q_head == 64 || q_head == 96 || q_head == 128 || q_head == 256;
+            q_head == 32 || q_head == 64 || q_head == 96 || q_head == 128 || q_head == 256 || q_head == 512;
         let supported_head_dim = supported_full_head_dim || supported_vector_head_dim;
 
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
