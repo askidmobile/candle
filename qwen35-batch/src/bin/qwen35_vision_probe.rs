@@ -14,6 +14,12 @@ fn main() -> anyhow::Result<()> {
     let gguf = args.next().ok_or_else(|| anyhow::anyhow!("usage: qwen35_vision_probe VISION.gguf [cpu|cuda|metal] [patches.bin T H W]"))?;
     let backend = args.next().unwrap_or_else(|| "cpu".into());
     let reference = std::env::var("QWEN35_VISION_REFERENCE").as_deref() == Ok("1");
+    let patch_dtype = match std::env::var("QWEN35_VISION_PATCH_DTYPE").as_deref() {
+        Err(_) | Ok("f32") => DType::F32,
+        Ok("f16") => DType::F16,
+        Ok("bf16") => DType::BF16,
+        Ok(value) => anyhow::bail!("unsupported patch dtype {value:?}"),
+    };
     let device = match backend.as_str() {
         "cpu" => Device::Cpu,
         #[cfg(feature = "cuda")]
@@ -49,7 +55,8 @@ fn main() -> anyhow::Result<()> {
         .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
         .collect();
     let rows = t.checked_mul(h).and_then(|v| v.checked_mul(w)).ok_or_else(|| anyhow::anyhow!("grid overflow"))?;
-    let patches = Tensor::from_vec(values, (rows, 3 * 2 * 16 * 16), &device)?;
+    let patches = Tensor::from_vec(values, (rows, 3 * 2 * 16 * 16), &device)?
+        .to_dtype(patch_dtype)?;
     let output = model.forward(&patches, &[GridThw { t, h, w }])?;
     device.synchronize()?;
     let values = output.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;

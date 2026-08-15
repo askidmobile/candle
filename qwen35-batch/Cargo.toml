@@ -94,6 +94,11 @@ path = "src/bin/qwen35_multimodal_probe.rs"
 required-features = ["real-model"]
 
 [[bin]]
+name = "qwen35_multimodal_logits"
+path = "src/bin/qwen35_multimodal_logits.rs"
+required-features = ["real-model", "cuda"]
+
+[[bin]]
 name = "qwen35moe_logits"
 path = "src/bin/qwen35moe_logits.rs"
 required-features = ["real-model", "cuda"]
