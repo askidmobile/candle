@@ -26,7 +26,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 15] = [
+pub const ALL_IDS: [Id; 16] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
