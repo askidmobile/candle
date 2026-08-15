@@ -374,7 +374,10 @@ impl BatchModel for Qwen35BatchAdapter {
                 .iter()
                 .filter(|kind| **kind != 0)
                 .count();
-            let features = media.features.as_ref().unwrap();
+            let features = media
+                .features
+                .as_ref()
+                .ok_or_else(|| anyhow!("Vision features were not produced"))?;
             let mut cursor = 0usize;
             while cursor < chunk.tokens.len() {
                 if media.mm_token_types[chunk.start_pos + cursor] == 0 {
