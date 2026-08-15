@@ -120,7 +120,11 @@ fn main() -> Result<()> {
 
     let device = Device::new_cuda(0).context("open CUDA device 0")?;
     let mut adapter = Qwen35BatchAdapter::load(&text, device, 1)?;
-    adapter.load_vision(&vision)?;
+    if std::env::var("QWEN35_VISION_REFERENCE").as_deref() == Ok("1") {
+        adapter.load_vision_reference(&vision)?;
+    } else {
+        adapter.load_vision(&vision)?;
+    }
     adapter.install_multimodal(
         0,
         MultimodalPrefill {

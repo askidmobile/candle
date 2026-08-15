@@ -199,6 +199,15 @@ impl Qwen35BatchAdapter {
         Ok(())
     }
 
+    /// BF16 correctness oracle only; production component loading stays Q8-strict.
+    pub fn load_vision_reference(&mut self, gguf_path: &Path) -> Result<()> {
+        self.vision = Some(
+            Qwen35Vision::load_reference(gguf_path, self.device.clone())
+                .map_err(|error| anyhow!("load reference Vision component: {error}"))?,
+        );
+        Ok(())
+    }
+
     pub fn unload_vision(&mut self) {
         self.vision = None;
         for payload in &mut self.multimodal {
