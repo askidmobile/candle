@@ -5238,7 +5238,7 @@ impl ModelWeights {
     /// `slot` — индекс [0, DECODE_BATCH_CAPACITY). Вне диапазона → Err.
     pub fn seed_slot_batched(
         &mut self,
-        device: &Device,
+        _device: &Device,
         slot: usize,
         snap: &StateSnapshot,
     ) -> Result<()> {
@@ -5342,7 +5342,7 @@ impl ModelWeights {
     /// because speculative append never overwrites committed prefix.
     pub fn checkpoint_slot_batched(
         &self,
-        device: &Device,
+        _device: &Device,
         slot: usize,
     ) -> Result<BatchedStateCheckpoint> {
         if slot >= DECODE_BATCH_CAPACITY as usize {
@@ -5395,7 +5395,7 @@ impl ModelWeights {
 
     pub fn restore_slot_batched(
         &mut self,
-        device: &Device,
+        _device: &Device,
         checkpoint: &BatchedStateCheckpoint,
     ) -> Result<()> {
         if checkpoint.model_nonce != self.instance_nonce
