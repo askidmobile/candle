@@ -356,13 +356,8 @@ impl VisionProfile {
             GgmlDType::F16,
             GgmlDType::BF16,
         ];
-        let block_matrix = if production_q8 {
-            &[GgmlDType::Q8_0][..]
-        } else {
-            &matrix[..]
-        };
-        let merger_matrix = if production_q8 {
-            &[GgmlDType::Q8_0, GgmlDType::BF16][..]
+        let sensitive_matrix = if production_q8 {
+            &[GgmlDType::BF16, GgmlDType::F32][..]
         } else {
             &matrix[..]
         };
@@ -394,7 +389,7 @@ impl VisionProfile {
             &tensors,
             "mm.0.weight",
             &[4096, 4096],
-            merger_matrix,
+            sensitive_matrix,
             &mut errs,
         );
         require_tensor_contract(&tensors, "mm.0.bias", &[4096], &f32_only, &mut errs);
@@ -402,7 +397,7 @@ impl VisionProfile {
             &tensors,
             "mm.2.weight",
             &[2560, 4096],
-            merger_matrix,
+            sensitive_matrix,
             &mut errs,
         );
         require_tensor_contract(&tensors, "mm.2.bias", &[2560], &f32_only, &mut errs);
@@ -414,11 +409,19 @@ impl VisionProfile {
                 ("ffn_up.weight", vec![4096, 1024]),
                 ("ffn_down.weight", vec![1024, 4096]),
             ] {
+                let dtypes = if production_q8
+                    && suffix == "ffn_down.weight"
+                    && (1..20).contains(&layer)
+                {
+                    &[GgmlDType::Q8_0][..]
+                } else {
+                    sensitive_matrix
+                };
                 require_tensor_contract(
                     &tensors,
                     &format!("{prefix}.{suffix}"),
                     &shape,
-                    block_matrix,
+                    dtypes,
                     &mut errs,
                 );
             }

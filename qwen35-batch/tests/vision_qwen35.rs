@@ -21,6 +21,18 @@ fn official_vision_profile_is_strict() -> Result<()> {
     assert_eq!(profile.hidden_size, 1024);
     assert_eq!(profile.projection_dim, 2560);
     assert_eq!(content.tensor_infos.len(), 298);
+    for layer in 0..24 {
+        let dtype = content.tensor_infos[&format!("v.blk.{layer}.ffn_down.weight")].ggml_dtype;
+        if (1..20).contains(&layer) {
+            assert_eq!(dtype, candle_core::quantized::GgmlDType::Q8_0);
+        } else {
+            assert!(matches!(
+                dtype,
+                candle_core::quantized::GgmlDType::BF16
+                    | candle_core::quantized::GgmlDType::F32
+            ));
+        }
+    }
     Ok(())
 }
 
