@@ -229,6 +229,7 @@ fn dispatch_q4k_matmul(
     qmatmul.forward(xs)
 }
 
+#[allow(dead_code)]
 #[cfg(not(target_os = "macos"))]
 fn dispatch_q4k_matmul(
     qmatmul: &QMatMul,
@@ -5453,7 +5454,7 @@ impl ModelWeights {
     /// Зануляет batched DeltaNet state (Metal/CUDA) и сбрасывает per-slot
     /// KV-cache для всех attention слоёв. Вызывается адаптером при reset_first
     /// перед prefill, чтобы batched decode начинал со свежего state.
-    pub fn clear_state_batched(&mut self, device: &Device) {
+    pub fn clear_state_batched(&mut self, _device: &Device) {
         for block in self.blocks.iter_mut() {
             match &mut block.layer {
                 HybridLayerType::DeltaNet(d) => {

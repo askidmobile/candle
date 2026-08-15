@@ -667,7 +667,7 @@ fn gpu_softmax_topk(
         _ => candle_core::bail!("gpu_softmax_topk: logits not CUDA"),
     };
 
-    let mut ids = unsafe { dev.alloc::<u32>(n_tokens * topk)? };
+    let ids = unsafe { dev.alloc::<u32>(n_tokens * topk)? };
     let mut weights = unsafe { dev.alloc::<f32>(n_tokens * topk)? };
 
     let func = dev.get_or_load_func("moe_softmax_topk_kernel", &candle_kernels::MOE_ROUTER)?;
