@@ -353,7 +353,7 @@ pub fn dispatch_delta_rule_prefill(
     let alpha_v = cuda_slice_view(&alpha_st, alpha_lay.start_offset())?;
 
     // Scratch под последовательность (driver pool переиспользует).
-    let mut qkv_conv = unsafe { dev.alloc::<f32>(t_len * channels)? };
+    let qkv_conv = unsafe { dev.alloc::<f32>(t_len * channels)? };
     let beta_a = unsafe { dev.alloc::<f32>(t_len * n_v)? };
     let gate_a = unsafe { dev.alloc::<f32>(t_len * n_v)? };
     let q_a = unsafe { dev.alloc::<f32>(t_len * n_v * hkd)? };

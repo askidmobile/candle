@@ -5104,7 +5104,7 @@ impl ModelWeights {
     /// слои работают на GPU (0 CPU↔GPU sync). Если n_metal == 0 — полный
     /// CPU fallback (медленно).
     pub fn metal_path_status(&self) -> (usize, usize) {
-        let mut n_metal = 0usize;
+        let n_metal = 0usize;
         let mut n_deltanet = 0usize;
         for block in &self.blocks {
             if let HybridLayerType::DeltaNet(d) = &block.layer {
