@@ -3053,8 +3053,8 @@ impl GatedAttentionLayer {
 
     /// True batched decode forward для Gated Attention (Phase 5).
     ///
-    /// Вход: x shape [B, 1, n_embd], `positions` — per-slot позиция (RoPE + KV
-    /// cache append), длина B. Выход: [B, 1, n_embd].
+    /// Вход: x shape [B, 1, n_embd], `cache_positions` — per-slot token/cache
+    /// offsets, `rope_positions` — per-slot RoPE positions. Выход: [B, 1, n_embd].
     ///
     /// Архитектура (incremental true batching):
     /// - Проекции Wq/Wk/Wv — batched QMatMul `[B,1,n_embd] @ W` (веса читаются
@@ -3070,13 +3070,18 @@ impl GatedAttentionLayer {
     fn forward_attn_decode_batch(
         &mut self,
         x: &Tensor,
-        positions: &[usize],
+        cache_positions: &[usize],
+        rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
-        debug_assert_eq!(seq_len, 1, "forward_attn_decode_batch: decode only (seq=1)");
-        debug_assert_eq!(positions.len(), b_sz, "positions.len must == batch");
-        debug_assert_eq!(slots.len(), b_sz, "slots.len must == batch");
+        if seq_len != 1
+            || cache_positions.len() != b_sz
+            || rope_positions.len() != b_sz
+            || slots.len() != b_sz
+        {
+            candle_core::bail!("invalid batched decode dimensions");
+        }
         let device = x.device().clone();
 
         // 1. Batched projections (веса один раз на B слотов).
@@ -3114,10 +3119,10 @@ impl GatedAttentionLayer {
         // can diverge positions; retain per-slot fallback for that case. Q8 is
         // per-row, so K/V quantize once over [B, 1, n_kv, hd].
         let mut q_slots = Vec::with_capacity(b_sz);
-        let shared_position = positions
+        let shared_position = rope_positions
             .first()
             .copied()
-            .filter(|&first| positions.iter().all(|&pos| pos == first));
+            .filter(|&first| rope_positions.iter().all(|&pos| pos == first));
         let k_hl = if let Some(position) = shared_position {
             let q_rope = self.apply_partial_rotary_emb(&q_all, position)?;
             for bidx in 0..b_sz {
@@ -3128,7 +3133,7 @@ impl GatedAttentionLayer {
                 .contiguous()?
         } else {
             let mut k_slots = Vec::with_capacity(b_sz);
-            for (bidx, &position) in positions.iter().enumerate() {
+            for (bidx, &position) in rope_positions.iter().enumerate() {
                 let q = q_all.narrow(0, bidx, 1)?.contiguous()?;
                 let k = k_all.narrow(0, bidx, 1)?.contiguous()?;
                 q_slots.push(self.apply_partial_rotary_emb(&q, position)?);
@@ -3148,6 +3153,9 @@ impl GatedAttentionLayer {
         // `bidx` indexes current batch tensors; `slot` indexes persistent KV.
         for (bidx, &slot) in slots.iter().enumerate() {
             let slot = slot as usize;
+            if slot >= self.kv_cache_batched.len() {
+                candle_core::bail!("decode slot {slot} is out of range");
+            }
             let q = &q_slots[bidx];
             let kq = kq_all.narrow(0, bidx, 1)?;
             let ks = ks_all.narrow(0, bidx, 1)?;
@@ -3182,6 +3190,14 @@ impl GatedAttentionLayer {
             }
 
             let cache_len = self.kv_cache_len_batched[slot];
+            let cache_position = cache_positions[bidx];
+            if (cache_len < self.attn_window && cache_position != cache_len)
+                || (cache_len == self.attn_window && cache_position < cache_len)
+            {
+                candle_core::bail!(
+                    "decode cache position {cache_position} is incompatible with slot {slot} cache length {cache_len}"
+                );
+            }
             let new_len = cache_len + seq_len;
             let current_cap = self.kv_cache_batched[slot].as_ref().unwrap().k_q.dim(1)?;
 
@@ -3532,13 +3548,14 @@ impl HybridBlock {
 
     /// True batched decode forward: B одновременных слотов за один passage.
     ///
-    /// Вход: x [B, 1, n_embd], `positions` (len B) — per-slot позиция для attention
-    /// (DeltaNet decode position-независим — нет RoPE).
+    /// Вход: x [B, 1, n_embd], separate per-slot cache and RoPE positions.
+    /// DeltaNet decode position-независим.
     /// Выход: [B, 1, n_embd]. Norms/MLP batched (RmsNorm/Mlp handle [B,1,...]).
     fn forward_decode_batch(
         &mut self,
         x: &Tensor,
-        positions: &[usize],
+        cache_positions: &[usize],
+        rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
         // Pre-norm → layer → residual (batched norm).
@@ -3547,9 +3564,12 @@ impl HybridBlock {
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed, slots)?,
-            HybridLayerType::Attention(attn) => {
-                attn.forward_attn_decode_batch(&normed, positions, slots)?
-            }
+            HybridLayerType::Attention(attn) => attn.forward_attn_decode_batch(
+                &normed,
+                cache_positions,
+                rope_positions,
+                slots,
+            )?,
         };
         let x = (layer_out + residual)?;
 
@@ -5623,8 +5643,8 @@ impl ModelWeights {
     /// True batched decode forward: B одновременных слотов за один passage.
     ///
     /// Вход: `tokens` shape [B, 1] — B независимых токенов (continuous batching);
-    /// `positions` (len B) — per-slot позиция в последовательности (RoPE + KV
-    /// cache append для attention). Выход: logits [B, vocab].
+    /// `cache_positions` (len B) — token-index KV offsets; `rope_positions`
+    /// (len B) — possibly MRoPE-adjusted positions. Выход: logits [B, vocab].
     ///
     /// Архитектура (Phases 3+5 true batching):
     /// - Embedding: [B,1] lookup -> QuantizedEmbedding возвращает [1,B,n_embd]
@@ -5641,11 +5661,12 @@ impl ModelWeights {
     pub fn forward_decode_batch(
         &mut self,
         tokens: &Tensor,
-        positions: &[usize],
+        cache_positions: &[usize],
+        rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
         crate::real::metal_utils::with_autoreleasepool(|| {
-            self.forward_decode_batch_inner(tokens, positions, slots)
+            self.forward_decode_batch_inner(tokens, cache_positions, rope_positions, slots)
         })
     }
 
@@ -5653,22 +5674,28 @@ impl ModelWeights {
     pub fn forward_decode_batch(
         &mut self,
         tokens: &Tensor,
-        positions: &[usize],
+        cache_positions: &[usize],
+        rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
-        self.forward_decode_batch_inner(tokens, positions, slots)
+        self.forward_decode_batch_inner(tokens, cache_positions, rope_positions, slots)
     }
 
     fn forward_decode_batch_inner(
         &mut self,
         tokens: &Tensor,
-        positions: &[usize],
+        cache_positions: &[usize],
+        rope_positions: &[usize],
         slots: &[u32],
     ) -> Result<Tensor> {
         let (b_sz, seq_len) = tokens.dims2()?;
-        debug_assert_eq!(seq_len, 1, "forward_decode_batch: decode only (seq=1)");
-        debug_assert_eq!(positions.len(), b_sz, "positions.len must == batch");
-        debug_assert_eq!(slots.len(), b_sz, "slots.len must == batch");
+        if seq_len != 1
+            || cache_positions.len() != b_sz
+            || rope_positions.len() != b_sz
+            || slots.len() != b_sz
+        {
+            candle_core::bail!("invalid batched decode dimensions");
+        }
 
         // Embedding: QuantizedEmbedding.forward возвращает [1, b_sz, n_embd] (hardcoded
         // leading 1). Reshape в [b_sz, 1, n_embd] для batched layers.
@@ -5684,7 +5711,12 @@ impl ModelWeights {
             if trace {
                 let is_delta = matches!(block.layer, HybridLayerType::DeltaNet(_));
                 let t0 = std::time::Instant::now();
-                layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
+                layer_in = block.forward_decode_batch(
+                    &layer_in,
+                    cache_positions,
+                    rope_positions,
+                    slots,
+                )?;
                 let el = t0.elapsed();
                 if is_delta {
                     t_delta += el;
@@ -5698,7 +5730,12 @@ impl ModelWeights {
                     );
                 }
             } else {
-                layer_in = block.forward_decode_batch(&layer_in, positions, slots)?;
+                layer_in = block.forward_decode_batch(
+                    &layer_in,
+                    cache_positions,
+                    rope_positions,
+                    slots,
+                )?;
             }
         }
         if trace {

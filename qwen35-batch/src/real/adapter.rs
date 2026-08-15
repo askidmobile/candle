@@ -462,7 +462,7 @@ impl BatchModel for Qwen35BatchAdapter {
         let ids = Tensor::from_vec(tokens, (b, 1usize), &self.device)?;
         let logits = self
             .model
-            .forward_decode_batch(&ids, &rope_positions, &slots)
+            .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
             .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
         // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
         // serialized four CUDA synchronizations/copies for B=4.
