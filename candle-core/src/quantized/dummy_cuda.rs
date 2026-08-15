@@ -58,6 +58,15 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn dequantize_rowslice(
+        &self,
+        _row_start: usize,
+        _row_end: usize,
+        _k: usize,
+    ) -> Result<CudaStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn storage_size_in_bytes(&self) -> usize {
         0
     }
@@ -100,6 +109,14 @@ impl QCudaStorage {
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     _device: &CudaDevice,
     _data: &[T],
+) -> Result<super::QStorage> {
+    Err(Error::NotCompiledWithCudaSupport)
+}
+
+pub fn load_quantized_bytes(
+    _device: &CudaDevice,
+    _data: &[u8],
+    _dtype: GgmlDType,
 ) -> Result<super::QStorage> {
     Err(Error::NotCompiledWithCudaSupport)
 }

@@ -116,6 +116,10 @@ impl ComputeCommandEncoder {
         }
     }
 
+    pub fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        self.set_input_buffer(index, buffer, offset)
+    }
+
     pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
@@ -162,6 +166,8 @@ impl ComputeCommandEncoder {
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
+
+    pub fn use_resource(&self, _resource: &Buffer, _usage: objc2_metal::MTLResourceUsage) {}
 
     /// Insert a memory barrier at buffers scope.
     pub fn insert_memory_barrier(&self) {

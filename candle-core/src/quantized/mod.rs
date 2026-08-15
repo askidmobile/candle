@@ -140,14 +140,26 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
-                GgmlDType::IQ2XXS
-                | GgmlDType::IQ2XS
-                | GgmlDType::IQ3XXS
-                | GgmlDType::IQ1S
+                GgmlDType::IQ3XXS => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3XXS)
+                }
+                GgmlDType::IQ2S => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2S)
+                }
+                GgmlDType::IQ3S => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ3S)
+                }
+                GgmlDType::IQ2XS => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2XS)
+                }
+                GgmlDType::IQ4XS => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ4XS)
+                }
+                GgmlDType::IQ2XXS => {
+                    cuda::load_quantized_bytes(d, data.as_ref(), GgmlDType::IQ2XXS)
+                }
+                GgmlDType::IQ1S
                 | GgmlDType::IQ4NL
-                | GgmlDType::IQ3S
-                | GgmlDType::IQ2S
-                | GgmlDType::IQ4XS
                 | GgmlDType::IQ1M => crate::bail!("CUDA is not implemented for {:?}", dtype),
             },
         }
@@ -256,6 +268,33 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
+        }
+    }
+
+    /// Dequantize a row-slice [row_start, row_end) of a 2D weight [n, k] into
+    /// a contiguous f32 buffer [(row_end - row_start) * k] on the compute
+    /// device.
+    ///
+    /// CUDA-only: uses the per-block dequantize kernel slicing the device
+    /// buffer at a byte offset — no full-weight f32 allocation. Non-CUDA
+    /// backends are intentionally not supported here (they use the
+    /// `QTensor::dequantize_rowslice` fallback which does full dequant +
+    /// reshape + narrow).
+    pub fn dequantize_rowslice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        k: usize,
+    ) -> Result<Storage> {
+        match self {
+            QStorage::Cuda(storage) => {
+                let cuda = storage.dequantize_rowslice(row_start, row_end, k)?;
+                Ok(Storage::Cuda(cuda))
+            }
+            _ => crate::bail!(
+                "dequantize_rowslice (storage-level) only supports CUDA storage; \
+                 use QTensor::dequantize_rowslice for CPU/Metal fallback"
+            ),
         }
     }
 
@@ -505,7 +544,7 @@ impl GgmlDType {
     }
 }
 
-struct RawQuantizedType {
+pub(crate) struct RawQuantizedType {
     dtype: GgmlDType,
     data: Vec<u8>,
 }
@@ -519,7 +558,7 @@ impl RawQuantizedType {
         }
     }
 
-    fn from_data(dtype: GgmlDType, data: Cow<'_, [u8]>) -> Self {
+    pub(crate) fn from_data(dtype: GgmlDType, data: Cow<'_, [u8]>) -> Self {
         Self {
             dtype,
             data: data.into_owned(),
@@ -846,6 +885,24 @@ impl QTensor {
         &self.shape
     }
 
+    /// Changes only tensor metadata while preserving quantized storage.
+    ///
+    /// New shape must keep element count and a block-aligned last dimension so
+    /// existing quantized matmul kernels can consume storage without dequantizing.
+    pub fn reshape<S: Into<Shape>>(mut self, shape: S) -> Result<Self> {
+        let shape = shape.into();
+        if shape.elem_count() != self.shape.elem_count() {
+            crate::bail!(
+                "cannot reshape quantized tensor {:?} to {:?}: element count differs",
+                self.shape,
+                shape
+            )
+        }
+        check_shape(&shape, self.storage.block_size())?;
+        self.shape = shape;
+        Ok(self)
+    }
+
     /// Internal accessor to QStorage (for intra-crate dispatch helpers like `q4k_opt::matmul_q4k_opt_metal`).
     pub(crate) fn storage(&self) -> &QStorage {
         &self.storage
@@ -855,6 +912,140 @@ impl QTensor {
         let storage = self.storage.dequantize(self.shape.elem_count())?;
         let none = crate::op::BackpropOp::none();
         crate::tensor::from_storage(storage, self.shape.clone(), none, false).to_device(device)
+    }
+
+    /// Fused indexed MoE matmul на CUDA (q8_1 quantization входа + per-expert
+    /// kernel). `self` — packed веса [n_experts, n, k]; input [batch, topk, k]
+    /// F32 CUDA; ids [batch, topk] U32. Возвращает [batch, topk, n].
+    /// Поддержанные dtype: IQ2S/IQ2XS/IQ2XXS, IQ3S/IQ3XXS, IQ4XS, Q8_0, Q2K-Q6K.
+    #[cfg(feature = "cuda")]
+    pub fn indexed_moe_forward_cuda(&self, input: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let qs = match &self.storage {
+            QStorage::Cuda(c) => c,
+            _ => crate::bail!("indexed_moe_forward_cuda: weights not on CUDA"),
+        };
+        let (in_st, in_l) = input.storage_and_layout();
+        let in_cuda = match &*in_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("indexed_moe_forward_cuda: input not on CUDA"),
+        };
+        let (ids_st, ids_l) = ids.storage_and_layout();
+        let ids_cuda = match &*ids_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("indexed_moe_forward_cuda: ids not on CUDA"),
+        };
+        let (out, out_shape) = qs.indexed_moe_forward(
+            &self.shape,
+            in_cuda,
+            &in_l,
+            ids_cuda,
+            &ids_l,
+        )?;
+        Ok(Tensor::from((crate::Storage::Cuda(out), out_shape)))
+    }
+
+    /// Dual indexed MoE (gate+up одним запуском, общий вход).
+    /// Возвращает (gate_out, up_out) оба [batch, topk, n].
+    #[cfg(feature = "cuda")]
+    pub fn indexed_moe_forward_dual_cuda(
+        &self,
+        other: &QTensor,
+        input: &Tensor,
+        ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let (qs, qs_other) = match (&self.storage, &other.storage) {
+            (QStorage::Cuda(a), QStorage::Cuda(b)) => (a, b),
+            _ => crate::bail!("indexed_moe_forward_dual_cuda: weights not on CUDA"),
+        };
+        if self.shape != other.shape {
+            crate::bail!("dual moe: shape mismatch {:?} vs {:?}", self.shape, other.shape);
+        }
+        let (in_st, in_l) = input.storage_and_layout();
+        let in_cuda = match &*in_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("dual moe: input not CUDA"),
+        };
+        let (ids_st, ids_l) = ids.storage_and_layout();
+        let ids_cuda = match &*ids_st {
+            crate::Storage::Cuda(c) => c,
+            _ => crate::bail!("dual moe: ids not CUDA"),
+        };
+        let (out1, out2, shape) = qs.indexed_moe_forward_dual(
+            qs_other,
+            &self.shape,
+            in_cuda,
+            &in_l,
+            ids_cuda,
+            &ids_l,
+        )?;
+        Ok((
+            Tensor::from((crate::Storage::Cuda(out1), shape.clone())),
+            Tensor::from((crate::Storage::Cuda(out2), shape)),
+        ))
+    }
+
+    /// Dequantize a row-slice `[row_start, row_end)` of a 2D view `[n, k]` into
+    /// a contiguous f32 tensor `[(row_end - row_start), k]` on `device`.
+    ///
+    /// `k` is the number of columns (last dim of the shape). The tensor is
+    /// treated as 2D `[n, k]` where `n = elem_count / k`.
+    ///
+    /// CUDA IQ-types: per-block dequantize kernel slices the device buffer at
+    /// a byte offset — no full-weight f32 allocation (the OOM-avoiding path).
+    /// CPU/Metal: falls back to full `dequantize` + reshape + narrow.
+    pub fn dequantize_rowslice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        k: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let rows = row_end
+            .checked_sub(row_start)
+            .ok_or_else(|| crate::Error::Msg(format!("row_end < row_start ({row_end} < {row_start})")).bt())?;
+        if k == 0 {
+            crate::bail!("dequantize_rowslice: k must be non-zero");
+        }
+        let elem_count = self.shape.elem_count();
+        let n = elem_count / k;
+        if row_end > n {
+            crate::bail!(
+                "dequantize_rowslice: row_end {} > n_rows {} (elem_count={}, k={})",
+                row_end,
+                n,
+                elem_count,
+                k
+            );
+        }
+        // Fast path: CUDA storage uses the per-block rowslice kernel directly.
+        let out_shape = Shape::from((rows, k));
+        if rows == 0 {
+            // Empty slice: return a zero-element tensor with the right shape.
+            let none = crate::op::BackpropOp::none();
+            return crate::tensor::from_storage(
+                Storage::Cpu(crate::CpuStorage::F32(Vec::new())),
+                out_shape,
+                none,
+                false,
+            )
+            .to_device(device);
+        }
+        match &self.storage {
+            QStorage::Cuda(storage) => {
+                let cuda = storage.dequantize_rowslice(row_start, row_end, k)?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Cuda(cuda), out_shape, none, false)
+                    .to_device(device)
+            }
+            // Fallback: full dequant + reshape to [n, k] + narrow(0, row_start, rows).
+            // CPU/Metal reference tests use small experts so the full dequant
+            // is fine and matches the reference numerically.
+            _ => {
+                let full = self.dequantize(device)?;
+                let full = full.to_dtype(crate::DType::F32)?.reshape((n, k))?;
+                full.narrow(0, row_start, rows)
+            }
+        }
     }
 
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
@@ -1026,18 +1217,21 @@ thread_local! {
 
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
-        let dequantize = match qtensor.dtype() {
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            _ => DEQUANTIZE_ALL.with(|b| *b),
-        };
-        let t = if dequantize {
-            let tensor = qtensor.dequantize(&qtensor.device())?;
-            Self::Tensor(tensor)
-        } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
-            let tensor = qtensor.dequantize_f16(&qtensor.device())?;
-            Self::TensorF16(tensor)
-        } else {
-            Self::QTensor(qtensor)
+        // F16/BF16 веса → TensorF16 (не F32!): иначе BF16-модель раздувается
+        // в 2x VRAM (27B BF16: 53.8GB → 107GB F32 → OOM на A100 80GB,
+        // поймано 2026-08-11). F32 остаётся F32.
+        let t = match qtensor.dtype() {
+            GgmlDType::F32 => Self::Tensor(qtensor.dequantize(&qtensor.device())?),
+            GgmlDType::F16 | GgmlDType::BF16 => {
+                Self::TensorF16(qtensor.dequantize_f16(&qtensor.device())?)
+            }
+            _ if DEQUANTIZE_ALL.with(|b| *b) => {
+                Self::Tensor(qtensor.dequantize(&qtensor.device())?)
+            }
+            _ if DEQUANTIZE_ALL_F16.with(|b| *b) => {
+                Self::TensorF16(qtensor.dequantize_f16(&qtensor.device())?)
+            }
+            _ => Self::QTensor(qtensor),
         };
         Ok(t)
     }

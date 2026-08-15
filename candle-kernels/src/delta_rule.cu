@@ -388,7 +388,6 @@ extern "C" __global__ void delta_l2_norm_prefill(
     const float k_val = qkv_conv[base + key_dim + head_k * hkd + dim];
     sq_q[dim] = q_val * q_val;
     sq_k[dim] = k_val * k_val;
-
     __syncthreads();
     for (unsigned int stride = hkd / 2; stride > 0; stride >>= 1) {
         if (dim < stride) {

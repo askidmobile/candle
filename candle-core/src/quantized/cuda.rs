@@ -17,10 +17,26 @@ pub struct QCudaStorage {
     data: PaddedCudaSlice,
     dtype: GgmlDType,
     device: CudaDevice,
+    /// Кэш полной F16-деквантизации весов (IQ-типы). Один раз при первом
+    /// matmul; дальше чистый HGEMM вместо dequant-всей-матрицы-на-шаг.
+    /// Включается env QWEN36_DEQUANT_CACHE=1 (смысл: карты с большим VRAM,
+    /// A100 80GB; на 12GB не влезает — там tiled fallback как было).
+    dequant_cache: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<CudaStorage>>>>,
+}
+
+fn dequant_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN36_DEQUANT_CACHE").is_some())
 }
 
 pub(crate) static FORCE_DMMV: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// QWEN36_FORCE_MMQ=1: MMQ kernels даже для m=1 (decode). Эксперимент.
+fn force_mmq() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN36_FORCE_MMQ").is_some())
+}
 
 pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
@@ -131,6 +147,12 @@ fn dequantize_f32(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb),
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3_xxs_f32", true, 256, nb),
+        GgmlDType::IQ2S => ("dequantize_block_iq2_s_f32", true, 256, nb),
+        GgmlDType::IQ3S => ("dequantize_block_iq3_s_f32", true, 256, nb),
+        GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", true, 256, nb),
+        GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", true, 256, nb),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", true, 256, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -159,6 +181,67 @@ fn dequantize_f32(
         barg!(builder, nb32 as i32);
         unsafe { builder.launch(cfg) }.w()?;
     }
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Dequantize a row-slice [row_start, row_end) of an IQ-type weight [n, k] into
+/// a contiguous f32 buffer [(row_end - row_start) * k].
+///
+/// IQ kernels index blocks by `blockIdx.x` and write `yy[i * QK_K + pos]`, so
+/// slicing `data.inner` by byte offset shifts the base pointer — the kernel
+/// sees the first block of the slice as block 0. This avoids dequantizing the
+/// full [n, k] weight (n*k*4 bytes f32) which can exceed VRAM headroom.
+fn dequantize_f32_rowslice(
+    data: &PaddedCudaSlice,
+    dtype: GgmlDType,
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let block_size = dtype.block_size();
+    let type_size = dtype.type_size();
+    let blocks_per_row = k / block_size;
+    let chunk_rows = row_end - row_start;
+    let nb = chunk_rows * blocks_per_row;
+    let elem_count = chunk_rows * k;
+    let byte_offset = row_start * blocks_per_row * type_size;
+    let byte_len = nb * type_size;
+
+    let (kernel_name, block_dim) = match dtype {
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3_xxs_f32", 256),
+        GgmlDType::IQ2S => ("dequantize_block_iq2_s_f32", 256),
+        GgmlDType::IQ3S => ("dequantize_block_iq3_s_f32", 256),
+        GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f32", 256),
+        GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f32", 256),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f32", 256),
+        // K-quants и Q8_0 — для MoE reference rowslice (Q8_0 эксперты).
+        GgmlDType::Q2K => ("dequantize_block_q2_K_f32", 64),
+        GgmlDType::Q3K => ("dequantize_block_q3_K_f32", 64),
+        GgmlDType::Q4K => ("dequantize_block_q4_K_f32", 32),
+        GgmlDType::Q5K => ("dequantize_block_q5_K_f32", 64),
+        GgmlDType::Q6K => ("dequantize_block_q6_K_f32", 64),
+        GgmlDType::Q8_0 => ("dequantize_block_q8_0_f32", 32),
+        _ => crate::bail!("unsupported dtype for rowslice dequant: {dtype:?}"),
+    };
+    let is_k = !matches!(dtype, GgmlDType::Q8_0);
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nb as u32, 1, 1),
+        block_dim: (block_dim as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let src_view = data.inner.slice(byte_offset..byte_offset + byte_len);
+    let mut builder = func.builder();
+    builder.arg(&src_view);
+    builder.arg(&dst);
+    let nb32 = (elem_count / 32) as i32;
+    if !is_k {
+        // non-k ядра ждут nb32 (число 32-элементных блоков).
+        builder.arg(&nb32);
+    }
+    unsafe { builder.launch(cfg) }.w()?;
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
@@ -191,6 +274,33 @@ fn dequantize_f16(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb),
+        GgmlDType::IQ3XXS => ("dequantize_block_iq3_xxs_f16", true, 256, nb),
+        GgmlDType::IQ2S => ("dequantize_block_iq2_s_f16", true, 256, nb),
+        GgmlDType::IQ3S => ("dequantize_block_iq3_s_f16", true, 256, nb),
+        GgmlDType::IQ2XS => ("dequantize_block_iq2_xs_f16", true, 256, nb),
+        GgmlDType::IQ2XXS => ("dequantize_block_iq2_xxs_f16", true, 256, nb),
+        GgmlDType::IQ4XS => ("dequantize_block_iq4_xs_f16", true, 256, nb),
+        // BF16 — не квант: простой cast bf16→f16 (dequantize_f16 вызывается
+        // из QMatMul::from_arc для F16/BF16 весов; без этого полные BF16
+        // GGUF падали "unsupported dtype", а через F32 — 2x VRAM/OOM).
+        GgmlDType::BF16 => {
+            let view = unsafe { data.inner.transmute::<half::bf16>(elem_count) }
+                .ok_or_else(|| {
+                    crate::Error::Msg("bf16 view: size mismatch".into()).bt()
+                })?;
+            let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+            let func = dev.get_or_load_func("cast_bf16_f16", &candle_kernels::CAST)?;
+            let cfg = cudarc::driver::LaunchConfig::for_num_elems(elem_count as u32);
+            let mut builder = func.builder();
+            barg!(builder, elem_count);
+            barg!(builder, 0usize); // num_dims = 0 (contiguous)
+            let null_info: usize = 0;
+            barg!(builder, null_info); // info = nullptr
+            builder.arg(&view);
+            builder.arg(&dst);
+            unsafe { builder.launch(cfg) }.w()?;
+            return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
+        }
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -315,6 +425,38 @@ fn get_rows(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+// IQ-type fallback: dequantize weights to f32 on GPU, then matvec via cuBLAS.
+// Used by dequantize_matmul_vec for IQ3XXS (no fused kernel exists).
+// `rhs` is the [b, m, ncols] f32 activation storage.
+fn dequantize_mul_mat_vec_via_cublas(
+    data: &PaddedCudaSlice,
+    rhs: &CudaStorage,
+    rhs_l: &crate::Layout,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b: usize,
+    m: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
+    let storage = QCudaStorage {
+        data: data.clone(),
+        dtype,
+        device: dev.clone(),
+        dequant_cache: Default::default(),
+    };
+    // Dequantize [nrows, ncols] weights to f32
+    let data_f32 = storage.dequantize(nrows * ncols)?;
+    // cuBLAS: result[b, m, nrows] = rhs[b, m, ncols] @ data_f32[nrows, ncols]^T
+    // Weights [nrows, ncols] row-major => transposed view [ncols, nrows] (swap strides).
+    let weight_l =
+        crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
+            .broadcast_as((b, ncols, nrows))?;
+    rhs.matmul(&data_f32, (b, m, nrows, ncols), rhs_l, &weight_l)
+}
+
+#[cfg(test)]
 fn dequantize_mul_mat_vec(
     data: &PaddedCudaSlice,
     y: &CudaView<f32>,
@@ -501,28 +643,105 @@ fn mul_mat_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+fn contiguous_view<'a, T>(
+    storage: &'a CudaSlice<T>,
+    layout: &crate::Layout,
+    name: &str,
+) -> Result<CudaView<'a, T>> {
+    let (start, end) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg(format!("indexed moe: {name} not contiguous")).bt())?;
+    if end > storage.len() {
+        crate::bail!(
+            "indexed moe: {name} layout range {start}..{end} exceeds storage length {}",
+            storage.len()
+        )
+    }
+    Ok(storage.slice(start..end))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn indexed_moe_forward_fused_q8_1_input(
+fn indexed_moe_forward_dispatch(
     weight: &CudaView<u8>,
     w_shape: &crate::Shape, //[num_experts, n, k]
     w_dtype: GgmlDType,
-    input: &CudaSlice<f32>,
+    input: &CudaView<f32>,
     in_shape: &crate::Shape, //[batch, topk or 1, k]
     ids: &CudaView<u32>,
     idx_shape: &crate::Shape, //[batch, topk]
     dev: &CudaDevice,
 ) -> Result<(CudaStorage, crate::Shape)> {
-    let (_, n, k) = w_shape.dims3()?;
-    let batch = in_shape.dims()[0];
-    let input_dim1 = in_shape.dims()[1];
-
-    let topk = idx_shape.dims()[1];
-    if batch != idx_shape.dims()[0] {
+    let (n_experts, n, k) = w_shape.dims3()?;
+    let (batch, input_dim1, input_k) = in_shape.dims3()?;
+    let (ids_batch, topk) = idx_shape.dims2()?;
+    if batch != ids_batch {
+        crate::bail!("indexed moe batch mismatch: input={batch}, ids={ids_batch}")
+    }
+    if input_dim1 != 1 && input_dim1 != topk {
+        crate::bail!("indexed moe input dim1 must be 1 or topk={topk}, got {input_dim1}")
+    }
+    if input_k != k {
+        crate::bail!("indexed moe input width mismatch: weights={k}, input={input_k}")
+    }
+    if batch == 0 || topk == 0 || n_experts == 0 {
         crate::bail!(
-            "indexed_moe_forward batch mismatch: input batch {} vs ids batch {}",
-            batch,
-            idx_shape.dims()[0]
+            "indexed moe dimensions must be nonzero: experts={n_experts}, batch={batch}, topk={topk}"
+        )
+    }
+
+    if matches!(
+        w_dtype,
+        GgmlDType::IQ2S
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ4XS
+    ) {
+        let kernel_name = match w_dtype {
+            GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_f32",
+            GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_f32",
+            GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_f32",
+            GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_f32",
+            GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_f32",
+            GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_f32",
+            _ => unreachable!(),
+        };
+        let out = unsafe { dev.alloc::<f32>(batch * topk * n)? };
+        let grouped = batch > 4;
+        let kernel_name = if grouped {
+            format!("{kernel_name}_grouped")
+        } else {
+            kernel_name.to_owned()
+        };
+        let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: if grouped {
+                (n as u32, n_experts as u32, 1)
+            } else {
+                (n as u32, batch as u32, topk as u32)
+            },
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(weight);
+        builder.arg(input);
+        builder.arg(ids);
+        builder.arg(&out);
+        barg!(
+            builder,
+            n as i32,
+            k as i32,
+            batch as i32,
+            topk as i32,
+            input_dim1 as i32
         );
+        unsafe { builder.launch(cfg) }.w()?;
+        return Ok((
+            CudaStorage::wrap_cuda_slice(out, dev.clone()),
+            (batch, topk, n).into(),
+        ));
     }
 
     // Quantize input into q8_1.
@@ -538,8 +757,7 @@ fn indexed_moe_forward_fused_q8_1_input(
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
     let mut input_quant = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
 
-    let input_view = input.slice(0..);
-    quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+    quantize_q8_1(input, &mut input_quant, k, total_rows, dev)?;
 
     // output buffer
     let outsize = batch * topk * n;
@@ -590,6 +808,116 @@ fn indexed_moe_forward_fused_q8_1_input(
 }
 
 impl QCudaStorage {
+    /// Dual indexed MoE: gate+up with shared input and two outputs.
+    /// IQ types keep F32 input and use two measured-faster launches; K-quants share Q8_1 input.
+    /// w1/w2 — packed [n_experts, n, k] одинакового dtype; input [batch, topk, k] f32;
+    /// ids [batch, topk] u32. Выход: два [batch, topk, n] f32.
+    pub fn indexed_moe_forward_dual(
+        &self,
+        other: &QCudaStorage,
+        self_shape: &crate::Shape,
+        input: &CudaStorage,
+        input_l: &crate::Layout,
+        ids: &CudaStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(CudaStorage, CudaStorage, crate::Shape)> {
+        let dtype = self.dtype();
+        if dtype != other.dtype() {
+            crate::bail!("dual moe: dtype mismatch {:?} vs {:?}", dtype, other.dtype());
+        }
+        let input_storage = input.as_cuda_slice::<f32>()?;
+        let input_view = contiguous_view(input_storage, input_l, "input")?;
+        let ids_storage = ids.as_cuda_slice::<u32>()?;
+        let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
+        if matches!(
+            dtype,
+            GgmlDType::IQ2S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
+        ) {
+            // Two launches beat dual-register pressure on RTX 3060 for current
+            // 2048x512 experts. Input stays F32; neither path allocates Q8_1.
+            let first = indexed_moe_forward_dispatch(
+                &self.data.inner.slice(0..),
+                self_shape,
+                dtype,
+                &input_view,
+                input_l.shape(),
+                &ids_view,
+                ids_l.shape(),
+                &self.device,
+            )?;
+            let second = indexed_moe_forward_dispatch(
+                &other.data.inner.slice(0..),
+                self_shape,
+                dtype,
+                &input_view,
+                input_l.shape(),
+                &ids_view,
+                ids_l.shape(),
+                &self.device,
+            )?;
+            return Ok((first.0, second.0, first.1));
+        }
+        let kernel_name = match dtype {
+            GgmlDType::Q8_0 => "indexed_moe_forward_dual_q8_0_q8_1",
+            GgmlDType::Q2K => "indexed_moe_forward_dual_q2k_q8_1",
+            GgmlDType::Q4K => "indexed_moe_forward_dual_q4k_q8_1",
+            GgmlDType::Q6K => "indexed_moe_forward_dual_q6k_q8_1",
+            _ => crate::bail!("unsupported dtype for dual indexed moe {dtype:?}"),
+        };
+        let (n, k) = (self_shape.dims3()?.1, self_shape.dims3()?.2);
+        let batch = input_l.shape().dims()[0];
+        let topk = ids_l.shape().dims()[1];
+        let input_dim1 = input_l.shape().dims()[1];
+
+        // q8_1 quantize входа (один раз на обе проекции).
+        let dev = &self.device;
+        let total_rows = batch * input_dim1;
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let y_size_in_bytes =
+            k_padded * total_rows * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+        let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+        quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+
+        let outsize = batch * topk * n;
+        let out1 = unsafe { dev.alloc::<f32>(outsize)? };
+        let out2 = unsafe { dev.alloc::<f32>(outsize)? };
+
+        let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, batch as u32, topk as u32),
+            block_dim: (WARP_SIZE as u32, 4, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&self.data.inner);
+        b.arg(&other.data.inner);
+        b.arg(&input_quant);
+        b.arg(&ids_view);
+        b.arg(&out1);
+        b.arg(&out2);
+        barg!(b, n as i32);
+        barg!(b, k as i32);
+        barg!(b, batch as i32);
+        barg!(b, topk as i32);
+        barg!(b, k_padded as i32);
+        barg!(b, input_dim1 as i32);
+        unsafe { b.launch(cfg) }.w()?;
+
+        let shape: crate::Shape = (batch, topk, n).into();
+        Ok((
+            CudaStorage::wrap_cuda_slice(out1, dev.clone()),
+            CudaStorage::wrap_cuda_slice(out2, dev.clone()),
+            shape,
+        ))
+    }
+}
+
+impl QCudaStorage {
     pub fn indexed_moe_forward(
         &self,
         self_shape: &crate::Shape, //[num_experts, n, k]
@@ -622,7 +950,13 @@ impl QCudaStorage {
         }
         if matches!(
             self.dtype(),
-            GgmlDType::Q8_0
+            GgmlDType::IQ3S
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ4XS
+                | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
                 | GgmlDType::Q4K
@@ -630,14 +964,16 @@ impl QCudaStorage {
                 | GgmlDType::Q6K
         ) {
             let input_storage = input.as_cuda_slice::<f32>()?;
+            let input_view = contiguous_view(input_storage, input_l, "input")?;
             let ids_storage = ids.as_cuda_slice::<u32>()?;
-            indexed_moe_forward_fused_q8_1_input(
+            let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
+            indexed_moe_forward_dispatch(
                 &self.data.inner.slice(0..),
                 self_shape, //[num_experts, n, k]
                 self.dtype(),
-                input_storage,
+                &input_view,
                 input_l.shape(), //[batch, topk or 1, k]
-                &ids_storage.slice(0..),
+                &ids_view,
                 ids_l.shape(), //[batch, topk]
                 &self.device,
             )
@@ -661,6 +997,7 @@ impl QCudaStorage {
             },
             device: device.clone(),
             dtype,
+            dequant_cache: Default::default(),
         })
     }
 
@@ -670,6 +1007,34 @@ impl QCudaStorage {
 
     pub fn device(&self) -> &CudaDevice {
         &self.device
+    }
+
+    /// Деквантизация всей матрицы с кэшем (IQ-типы, QWEN36_DEQUANT_CACHE=1):
+    /// один раз dequant в F32, дальше cuBLAS SGEMM по кэшу.
+    fn cached_dequant_f32(&self, elem_count: usize) -> Result<std::sync::Arc<CudaStorage>> {
+        let mut g = self.dequant_cache.lock().unwrap();
+        if g.is_none() {
+            if std::env::var("QWEN36_TRACE")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "[cuda] dequant cache fill: dtype={:?} elems={} (~{:.0}MiB f32)",
+                    self.dtype,
+                    elem_count,
+                    elem_count as f64 * 4.0 / 1048576.0
+                );
+            }
+            let w = QCudaStorage {
+                data: self.data.clone(),
+                dtype: self.dtype,
+                device: self.device.clone(),
+                dequant_cache: Default::default(),
+            }
+            .dequantize(elem_count)?;
+            *g = Some(std::sync::Arc::new(w));
+        }
+        Ok(g.as_ref().unwrap().clone())
     }
 
     pub fn dequantize(&self, elem_count: usize) -> Result<CudaStorage> {
@@ -692,6 +1057,12 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -880,6 +1251,18 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        // IQ-types have no MMQ/DMMV kernels yet — always use dequantize + cuBLAS fallback.
+        if matches!(
+            self.dtype,
+            GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
+        ) {
+            return self.dequantize_matmul(self_shape, storage, layout);
+        }
         // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
         if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
@@ -889,10 +1272,11 @@ impl QCudaStorage {
                 return Ok(result);
             }
         }
-
-        // Fallback
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             1
+        } else if force_mmq() {
+            // Эксперимент (шаг 2 perf-плана): MMQ вместо dmmv даже для m=1.
+            0
         } else {
             8
         };
@@ -926,7 +1310,21 @@ impl QCudaStorage {
         let (ptr, guard) = self.data.inner.device_ptr(stream);
         Ok((ptr as *const u8, guard))
     }
-}
+
+    /// Dequantize a row-slice [row_start, row_end) of a 2D weight [n, k] into
+    /// a contiguous f32 buffer [(row_end - row_start) * k].
+    ///
+    /// Uses the per-block IQ kernel by slicing the device buffer at a byte
+    /// offset — no full-weight f32 allocation. Only IQ-types are supported
+    /// (other dtypes fall back to `dequantize` + reshape).
+    pub fn dequantize_rowslice(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        k: usize,
+    ) -> Result<CudaStorage> {
+        dequantize_f32_rowslice(&self.data, self.dtype, row_start, row_end, k, self.device())
+    }
 
 impl QCudaStorage {
     fn dequantize_matmul_vec(
@@ -936,26 +1334,55 @@ impl QCudaStorage {
         rhs_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
         let (nrows, ncols) = self_shape.dims2()?;
-        let rhs = rhs.as_cuda_slice::<f32>()?;
-        let rhs = match rhs_l.contiguous_offsets() {
-            Some((o1, o2)) => rhs.slice(o1..o2),
+        let rhs_slice = rhs.as_cuda_slice::<f32>()?;
+        let rhs_slice = match rhs_l.contiguous_offsets() {
+            Some((o1, o2)) => rhs_slice.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "dmmv" }.bt())?,
         };
-        let (b_size, k) = match rhs_l.shape().dims() {
-            [b, m, k] => (b * m, *k),
-            [b, k] => (*b, *k),
+        let (b, m, k) = match rhs_l.shape().dims() {
+            [b, m, k] => (*b, *m, *k),
+            [b, k] => (*b, 1, *k),
             _ => crate::bail!("unexpected rhs shape in dmmv {:?}", rhs_l.shape()),
         };
         if ncols != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
         }
+        let b_size = b * m;
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            dequantize_mul_mat_vec(&self.data, &rhs, self.dtype, ncols, nrows, self.device())?
+        // IQ-types have no fused vec/matmul kernels — use dequantize + cuBLAS.
+        let iq_type = matches!(
+            self.dtype,
+            GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
+        );
+        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
+            if iq_type && dequant_cache_enabled() {
+                use crate::backend::BackendStorage;
+                let w = self.cached_dequant_f32(nrows * ncols)?;
+                let weight_l = crate::Layout::new((ncols, nrows).into(), vec![1, ncols], 0)
+                    .broadcast_as((b, ncols, nrows))?;
+                rhs.matmul(w.as_ref(), (b, m, nrows, ncols), rhs_l, &weight_l)?
+            } else {
+                dequantize_mul_mat_vec_via_cublas(
+                    &self.data,
+                    rhs,
+                    rhs_l,
+                    self.dtype,
+                    ncols,
+                    nrows,
+                    b,
+                    m,
+                    self.device(),
+                )?
+            }
         } else {
             mul_mat_vec_via_q8_1(
                 &self.data,
-                &rhs,
+                &rhs_slice,
                 self.dtype,
                 ncols,
                 nrows,
@@ -986,10 +1413,70 @@ impl QCudaStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            let data_f32 = self.dequantize(n * k)?;
-            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-            storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
+        let is_iq = matches!(
+            self.dtype,
+            GgmlDType::IQ3XXS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ4XS
+        );
+        // Кэшированная полная деквантизация (A100 80GB): один matmul по кэшу
+        // вместо tiled dequant каждый вызов.
+        if is_iq && dequant_cache_enabled() && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            let w = self.cached_dequant_f32(n * k)?;
+            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0)
+                .broadcast_as((b, k, n))?;
+            let out = storage.matmul(w.as_ref(), (b, m, n, k), layout, &rhs_l)?;
+            let mut out_shape = layout.shape().dims().to_vec();
+            out_shape.pop();
+            out_shape.push(n);
+            return Ok((out, out_shape.into()));
+        }
+
+        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+            || is_iq
+            {
+            // Tiled dequantize matmul: dequantize weight in row-chunks to avoid
+            // allocating the full f32 weight (n*k*4 bytes) which can exceed VRAM
+            // headroom during prefill and trigger CUDA unified-memory paging.
+            // Each chunk: dequant [chunk_n, k] f32, cuBLAS matmul with activations
+            // [b, m, k], scatter result into pre-allocated output [b, m, n].
+            // Chunks write disjoint row ranges — no accumulation needed.
+            let chunk_n = std::cmp::min(n, 512);
+            let mut out_storage = CudaStorage::wrap_cuda_slice(
+                unsafe { self.device.alloc::<f32>(b * m * n)? },
+                self.device.clone(),
+            );
+            let mut row_start = 0;
+            while row_start < n {
+                let row_end = std::cmp::min(row_start + chunk_n, n);
+                let chunk_rows = row_end - row_start;
+                let data_f32 = dequantize_f32_rowslice(
+                    &self.data,
+                    self.dtype,
+                    row_start,
+                    row_end,
+                    k,
+                    self.device(),
+                )?;
+                let rhs_l = crate::Layout::new((k, chunk_rows).into(), vec![1, k], 0)
+                    .broadcast_as((b, k, chunk_rows))?;
+                let chunk_out =
+                    storage.matmul(&data_f32, (b, m, chunk_rows, k), layout, &rhs_l)?;
+                chunk_out.copy2d(
+                    &mut out_storage,
+                    /* d1 */ b * m,
+                    /* d2 */ chunk_rows,
+                    /* src_s */ chunk_rows,
+                    /* dst_s */ n,
+                    /* src_o */ 0,
+                    /* dst_o */ row_start,
+                )?;
+                row_start = row_end;
+            }
+            out_storage
         } else {
             let storage = storage.as_cuda_slice::<f32>()?;
             let storage = match layout.contiguous_offsets() {
@@ -1035,6 +1522,29 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         },
         device: device.clone(),
         dtype,
+        dequant_cache: Default::default(),
+    }))
+}
+
+/// Load raw quantized bytes (IQ-types) onto CUDA device.
+/// Analog of metal::load_quantized_bytes — stores raw bytes in a PaddedCudaSlice,
+/// keeps dtype metadata for kernel dispatch.
+pub fn load_quantized_bytes(
+    device: &CudaDevice,
+    data: &[u8],
+    dtype: GgmlDType,
+) -> Result<super::QStorage> {
+    let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner,
+            len: data.len(),
+        },
+        device: device.clone(),
+        dtype,
+        dequant_cache: Default::default(),
     }))
 }
 

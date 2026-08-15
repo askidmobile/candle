@@ -58,7 +58,7 @@ pub struct ModuleStore {
 #[derive(Clone)]
 pub struct CudaDevice {
     id: DeviceId,
-    context: Arc<cudarc::driver::CudaContext>,
+    pub(crate) context: Arc<cudarc::driver::CudaContext>,
     modules: Arc<std::sync::RwLock<ModuleStore>>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,

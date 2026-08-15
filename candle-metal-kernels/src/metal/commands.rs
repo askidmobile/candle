@@ -45,6 +45,13 @@ impl AsRef<ComputeCommandEncoder> for CommandsGuard<'_> {
     }
 }
 
+impl std::ops::Deref for CommandsGuard<'_> {
+    type Target = ComputeCommandEncoder;
+    fn deref(&self) -> &Self::Target {
+        self.guard.current_encoder.as_ref().unwrap()
+    }
+}
+
 impl CommandsGuard<'_> {
     pub fn set_label(&self, label: &str) {
         self.as_ref().set_label(label);

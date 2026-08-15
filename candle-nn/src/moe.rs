@@ -440,3 +440,190 @@ pub fn moe_gemm_gguf(
     }
     candle::bail!("moe_gemm_gguf is only supported on CUDA")
 }
+
+// ─── Phase 3: PTX MoE backend (cudarc dynamic-loading, no libmoe.a) ─────────────
+//
+// Fused K-quant (Q2_K, Q4_K) expert GEMM via PTX kernels in moe_quantized.cu.
+// IQ types bail — caller falls back to reference backend.
+// CPU flattens+sorts route plan by expert (PD-010), uploads sorted arrays to
+// GPU, launches moe_gate_up_kernel then moe_down_proj_kernel (or prefill).
+// No cudaMallocAsync in hot path (PD-011).
+
+#[cfg(all(feature = "cuda", feature = "moe-cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ptx_gguf(
+    input: &Tensor,             // [n_tokens, n_embd] F32 on CUDA
+    gate: &QTensor,             // [n_experts, n_ff, n_embd] packed quantized
+    up: &QTensor,               // [n_experts, n_ff, n_embd] packed quantized
+    down: &QTensor,             // [n_experts, n_embd, n_ff] packed quantized
+    expert_ids: &[Vec<usize>],  // [n_tokens][topk] selected expert indices
+    weights: &[Vec<f32>],      // [n_tokens][topk] normalized routing weights
+    _n_experts: usize,
+    n_ff: usize,
+    is_prefill: bool,
+) -> Result<Tensor> {
+    use candle::cuda_backend::cudarc::driver::{
+        DeviceRepr, LaunchConfig, PushKernelArg,
+    };
+    use candle::cuda_backend::{kernels, WrapErr};
+    use candle::op::BackpropOp;
+    use candle::quantized::GgmlDType;
+
+    let dtype = gate.dtype();
+    // Only Q2_K and Q4_K have fused PTX dispatch. IQ types and other K-quants
+    // bail → caller (qwen35-batch) falls back to reference backend.
+    // ponytail: add IQ grid tables to moe_quantized.cu to support IQ types here.
+    // quant_type values match GgmlDType::to_u32() (Q2K=10, Q4K=12) and MOE_QTYPE_* in moe_dequant.cuh.
+    let (quant_type, block_size, type_size) = match dtype {
+        GgmlDType::Q2K => (10i32, dtype.block_size() as i32, dtype.type_size() as i32),
+        GgmlDType::Q4K => (12i32, dtype.block_size() as i32, dtype.type_size() as i32),
+        _ => {
+            candle::bail!(
+                "moe_ptx_gguf: dtype {:?} not supported by fused PTX kernels \
+                 (only Q2K/Q4K). Use reference backend for this quant.",
+                dtype
+            )
+        }
+    };
+
+    if up.dtype() != dtype || down.dtype() != dtype {
+        candle::bail!(
+            "moe_ptx_gguf: gate/up/down dtype mismatch: {:?} / {:?} / {:?}",
+            dtype,
+            up.dtype(),
+            down.dtype()
+        );
+    }
+
+    let (n_tokens, n_embd) = input.dims2()?;
+    if expert_ids.len() != n_tokens || weights.len() != n_tokens {
+        candle::bail!(
+            "moe_ptx_gguf: route plan length {} != n_tokens {}",
+            expert_ids.len(),
+            n_tokens
+        );
+    }
+
+    let dev = input.device().as_cuda_device()?;
+
+    // Flatten + sort by expert on CPU (PD-010).
+    let topk = expert_ids.first().map_or(0, |v| v.len());
+    let mut triples: Vec<(i32, i32, f32)> = Vec::with_capacity(n_tokens * topk);
+    for (t, (eks, ws)) in expert_ids.iter().zip(weights.iter()).enumerate() {
+        if eks.len() != ws.len() {
+            candle::bail!("moe_ptx_gguf: expert/weight length mismatch at token {}", t);
+        }
+        for (e, w) in eks.iter().zip(ws.iter()) {
+            triples.push((*e as i32, t as i32, *w));
+        }
+    }
+    triples.sort_by_key(|(e, _, _)| *e);
+
+    let m_total = triples.len();
+    if m_total == 0 {
+        let zeros = Tensor::zeros((n_tokens, n_embd), candle::DType::F32, input.device())?;
+        return Ok(zeros);
+    }
+
+    let sorted_expert_ids: Vec<i32> = triples.iter().map(|(e, _, _)| *e).collect();
+    let sorted_token_ids: Vec<i32> = triples.iter().map(|(_, t, _)| *t).collect();
+    let sorted_weights: Vec<f32> = triples.iter().map(|(_, _, w)| *w).collect();
+
+    // Input as CudaSlice<f32>, sliced from layout start_offset.
+    let (input_storage, input_layout) = input.storage_and_layout();
+    let input_slice = match &*input_storage {
+        candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => candle::bail!("moe_ptx_gguf: input must be a cuda tensor"),
+    };
+    let input_view = input_slice.slice(input_layout.start_offset()..);
+
+    // Raw device pointers for packed weights (PD-011: pass as &u64).
+    let gate_ptr = gate.device_ptr()? as u64;
+    let up_ptr = up.device_ptr()? as u64;
+    let down_ptr = down.device_ptr()? as u64;
+
+    // Upload sorted route arrays.
+    let d_expert_ids = dev.clone_htod(&sorted_expert_ids)?;
+    let d_token_ids = dev.clone_htod(&sorted_token_ids)?;
+    let d_weights = dev.clone_htod(&sorted_weights)?;
+
+    // Workspace: intermediate [m_total, n_ff] + output [n_tokens, n_embd].
+    let mut intermediate = unsafe { dev.alloc::<f32>(m_total * n_ff)? };
+    let mut output = dev.alloc_zeros::<f32>(n_tokens * n_embd)?;
+
+    let block_dim: u32 = 256;
+
+    // ── Launch moe_gate_up_kernel ───────────────────────────────────────────
+    // Grid: (ceil(n_ff/256), m_total), Block: 256.
+    let grid_gate = ((n_ff as u32 + block_dim - 1) / block_dim, m_total as u32, 1);
+    let cfg_gate = LaunchConfig {
+        grid_dim: grid_gate,
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let gate_up_func = dev.get_or_load_func("moe_gate_up_kernel", &kernels::MOE_QUANTIZED)?;
+    let mut b1 = gate_up_func.builder();
+    b1.arg(&input_view);
+    b1.arg(&gate_ptr);
+    b1.arg(&up_ptr);
+    b1.arg(&d_expert_ids);
+    b1.arg(&d_token_ids);
+    b1.arg(&mut intermediate);
+    candle::builder_arg!(
+        b1, n_embd as i32, n_ff as i32, m_total as i32, quant_type, block_size, type_size
+    );
+    // SAFETY: kernel args match moe_gate_up_kernel signature.
+    unsafe { b1.launch(cfg_gate) }.w()?;
+
+    // ── Launch moe_down_proj_kernel (decode or prefill variant) ─────────────
+    // Grid: (ceil(n_embd/256), m_total), Block: 256.
+    let down_name = if is_prefill {
+        "moe_prefill_down_proj_kernel"
+    } else {
+        "moe_down_proj_kernel"
+    };
+    let grid_down = ((n_embd as u32 + block_dim - 1) / block_dim, m_total as u32, 1);
+    let cfg_down = LaunchConfig {
+        grid_dim: grid_down,
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let down_func = dev.get_or_load_func(down_name, &kernels::MOE_QUANTIZED)?;
+    let mut b2 = down_func.builder();
+    b2.arg(&intermediate);
+    b2.arg(&down_ptr);
+    b2.arg(&d_expert_ids);
+    b2.arg(&d_weights);
+    b2.arg(&mut output);
+    b2.arg(&d_token_ids);
+    candle::builder_arg!(
+        b2, n_ff as i32, n_embd as i32, m_total as i32, quant_type, block_size, type_size
+    );
+    // SAFETY: kernel args match moe_down_proj_kernel signature.
+    unsafe { b2.launch(cfg_down) }.w()?;
+
+    let out_storage = candle::CudaStorage::wrap_cuda_slice(output, dev.clone());
+    let out_tensor = Tensor::from_storage(
+        candle::Storage::Cuda(out_storage),
+        (n_tokens, n_embd),
+        BackpropOp::none(),
+        false,
+    );
+    Ok(out_tensor)
+}
+
+#[cfg(not(all(feature = "cuda", feature = "moe-cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_ptx_gguf(
+    _: &Tensor,
+    _: &QTensor,
+    _: &QTensor,
+    _: &QTensor,
+    _: &[Vec<usize>],
+    _: &[Vec<f32>],
+    _: usize,
+    _: usize,
+    _: bool,
+) -> Result<Tensor> {
+    candle::bail!("moe_ptx_gguf requires cuda + moe-cuda features")
+}
