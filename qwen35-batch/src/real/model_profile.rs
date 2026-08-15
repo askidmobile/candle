@@ -356,8 +356,13 @@ impl VisionProfile {
             GgmlDType::F16,
             GgmlDType::BF16,
         ];
-        let production_matrix = if production_q8 {
+        let block_matrix = if production_q8 {
             &[GgmlDType::Q8_0][..]
+        } else {
+            &matrix[..]
+        };
+        let merger_matrix = if production_q8 {
+            &[GgmlDType::Q8_0, GgmlDType::BF16][..]
         } else {
             &matrix[..]
         };
@@ -385,9 +390,21 @@ impl VisionProfile {
         );
         require_tensor_contract(&tensors, "v.post_ln.weight", &[1024], &f32_only, &mut errs);
         require_tensor_contract(&tensors, "v.post_ln.bias", &[1024], &f32_only, &mut errs);
-        require_tensor_contract(&tensors, "mm.0.weight", &[4096, 4096], &matrix, &mut errs);
+        require_tensor_contract(
+            &tensors,
+            "mm.0.weight",
+            &[4096, 4096],
+            merger_matrix,
+            &mut errs,
+        );
         require_tensor_contract(&tensors, "mm.0.bias", &[4096], &f32_only, &mut errs);
-        require_tensor_contract(&tensors, "mm.2.weight", &[2560, 4096], &matrix, &mut errs);
+        require_tensor_contract(
+            &tensors,
+            "mm.2.weight",
+            &[2560, 4096],
+            merger_matrix,
+            &mut errs,
+        );
         require_tensor_contract(&tensors, "mm.2.bias", &[2560], &f32_only, &mut errs);
         for layer in 0..block_count {
             let prefix = format!("v.blk.{layer}");
@@ -401,7 +418,7 @@ impl VisionProfile {
                     &tensors,
                     &format!("{prefix}.{suffix}"),
                     &shape,
-                    &production_matrix,
+                    block_matrix,
                     &mut errs,
                 );
             }
