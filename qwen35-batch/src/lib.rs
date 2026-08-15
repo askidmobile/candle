@@ -27,7 +27,7 @@ pub mod slot;
 #[cfg(feature = "real-model")]
 pub mod real;
 
-pub use model::{BatchModel, DecodeBatch, PrefillChunk};
+pub use model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
 pub use scheduler::{BatchScheduler, SchedulerStats};
 pub use slot::{Slot, SlotStatus};
 

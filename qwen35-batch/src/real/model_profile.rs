@@ -249,6 +249,197 @@ fn require_tensor(
     }
 }
 
+fn require_tensor_contract(
+    tensor_infos: &BTreeMap<String, TensorInfo>,
+    name: &str,
+    shape: &[usize],
+    dtypes: &[GgmlDType],
+    errs: &mut ValidationErrors,
+) {
+    match tensor_infos.get(name) {
+        None => errs.push_tensor_missing(name),
+        Some(info) => {
+            if info.shape.dims() != shape {
+                errs.push(format!(
+                    "tensor {name} shape {:?}, expected {shape:?}",
+                    info.shape.dims()
+                ));
+            }
+            if !dtypes.contains(&info.ggml_dtype) {
+                errs.push(format!(
+                    "tensor {name} dtype {:?}, expected one of {dtypes:?}",
+                    info.ggml_dtype
+                ));
+            }
+        }
+    }
+}
+
+/// Immutable Qwen3.5 Vision component contract.
+#[derive(Debug, Clone)]
+pub struct VisionProfile {
+    pub block_count: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub head_count: usize,
+    pub projection_dim: usize,
+    pub patch_size: usize,
+    pub spatial_merge_size: usize,
+    pub position_embeddings: usize,
+    pub quant_set: HashSet<GgmlDType>,
+}
+
+impl VisionProfile {
+    pub fn read_and_validate(ct: &Content) -> Result<Self> {
+        Self::read_and_validate_with_policy(ct, true)
+    }
+
+    pub fn read_reference(ct: &Content) -> Result<Self> {
+        Self::read_and_validate_with_policy(ct, false)
+    }
+
+    fn read_and_validate_with_policy(ct: &Content, production_q8: bool) -> Result<Self> {
+        let mut errs = ValidationErrors::default();
+        let metadata: BTreeMap<String, Value> = ct.metadata.clone().into_iter().collect();
+        let tensors: BTreeMap<String, TensorInfo> = ct
+            .tensor_infos
+            .iter()
+            .map(|(name, info)| (name.clone(), clone_tensor_info(info)))
+            .collect();
+
+        match metadata.get("general.architecture") {
+            Some(Value::String(value)) if value == "clip" => {}
+            Some(value) => errs.push(format!(
+                "general.architecture={value:?}, expected clip for Qwen3.5 Vision"
+            )),
+            None => errs.push_missing("general.architecture"),
+    }
+        let block_count = md_u32(&metadata, "clip.vision.block_count", &mut errs).unwrap_or(0);
+        let hidden_size = md_u32(&metadata, "clip.vision.embedding_length", &mut errs).unwrap_or(0);
+        let intermediate_size =
+            md_u32(&metadata, "clip.vision.feed_forward_length", &mut errs).unwrap_or(0);
+        let head_count =
+            md_u32(&metadata, "clip.vision.attention.head_count", &mut errs).unwrap_or(0);
+        let projection_dim =
+            md_u32(&metadata, "clip.vision.projection_dim", &mut errs).unwrap_or(0);
+        let patch_size = md_u32(&metadata, "clip.vision.patch_size", &mut errs).unwrap_or(0);
+        let spatial_merge_size =
+            md_u32(&metadata, "clip.vision.spatial_merge_size", &mut errs).unwrap_or(0);
+        let image_size = md_u32(&metadata, "clip.vision.image_size", &mut errs).unwrap_or(0);
+        let position_embeddings = (image_size / patch_size.max(1)).pow(2);
+
+        for (name, actual, expected) in [
+            ("block_count", block_count, 24),
+            ("hidden_size", hidden_size, 1024),
+            ("intermediate_size", intermediate_size, 4096),
+            ("head_count", head_count, 16),
+            ("projection_dim", projection_dim, 2560),
+            ("patch_size", patch_size, 16),
+            ("spatial_merge_size", spatial_merge_size, 2),
+            ("position_embeddings", position_embeddings, 2304),
+        ] {
+            if actual != expected {
+                errs.push(format!("Vision {name}={actual}, expected {expected}"));
+}
+        }
+        if tensors.len() != 298 {
+            errs.push(format!(
+                "Vision tensor count={}, expected 298",
+                tensors.len()
+            ));
+        }
+
+        let f32_only = [GgmlDType::F32];
+        let matrix = [
+            GgmlDType::Q8_0,
+            GgmlDType::F32,
+            GgmlDType::F16,
+            GgmlDType::BF16,
+        ];
+        let production_matrix = if production_q8 {
+            &[GgmlDType::Q8_0][..]
+        } else {
+            &matrix[..]
+        };
+        require_tensor_contract(
+            &tensors,
+            "v.patch_embd.weight",
+            &[1024, 3, 16, 16],
+            &matrix,
+            &mut errs,
+        );
+        require_tensor_contract(
+            &tensors,
+            "v.patch_embd.weight.1",
+            &[1024, 3, 16, 16],
+            &matrix,
+            &mut errs,
+        );
+        require_tensor_contract(&tensors, "v.patch_embd.bias", &[1024], &f32_only, &mut errs);
+        require_tensor_contract(
+            &tensors,
+            "v.position_embd.weight",
+            &[2304, 1024],
+            &matrix,
+            &mut errs,
+        );
+        require_tensor_contract(&tensors, "v.post_ln.weight", &[1024], &f32_only, &mut errs);
+        require_tensor_contract(&tensors, "v.post_ln.bias", &[1024], &f32_only, &mut errs);
+        require_tensor_contract(&tensors, "mm.0.weight", &[4096, 4096], &matrix, &mut errs);
+        require_tensor_contract(&tensors, "mm.0.bias", &[4096], &f32_only, &mut errs);
+        require_tensor_contract(&tensors, "mm.2.weight", &[2560, 4096], &matrix, &mut errs);
+        require_tensor_contract(&tensors, "mm.2.bias", &[2560], &f32_only, &mut errs);
+        for layer in 0..block_count {
+            let prefix = format!("v.blk.{layer}");
+            for (suffix, shape) in [
+                ("attn_qkv.weight", vec![3072, 1024]),
+                ("attn_out.weight", vec![1024, 1024]),
+                ("ffn_up.weight", vec![4096, 1024]),
+                ("ffn_down.weight", vec![1024, 4096]),
+            ] {
+                require_tensor_contract(
+                    &tensors,
+                    &format!("{prefix}.{suffix}"),
+                    &shape,
+                    &production_matrix,
+                    &mut errs,
+                );
+            }
+            for (suffix, size) in [
+                ("attn_qkv.bias", 3072),
+                ("attn_out.bias", 1024),
+                ("ffn_up.bias", 4096),
+                ("ffn_down.bias", 1024),
+                ("ln1.weight", 1024),
+                ("ln1.bias", 1024),
+                ("ln2.weight", 1024),
+                ("ln2.bias", 1024),
+            ] {
+                require_tensor_contract(
+                    &tensors,
+                    &format!("{prefix}.{suffix}"),
+                    &[size],
+                    &f32_only,
+                    &mut errs,
+                );
+            }
+        }
+        let quant_set = tensors.values().map(|info| info.ggml_dtype).collect();
+        errs.into_result()?;
+        Ok(Self {
+            block_count,
+            hidden_size,
+            intermediate_size,
+            head_count,
+            projection_dim,
+            patch_size,
+            spatial_merge_size,
+            position_embeddings,
+            quant_set,
+        })
+    }
+}
+
 /// Check tensors for a single block at the given layer index.
 /// GGUF tensor names have NO architecture prefix (`blk.N....`); the prefix is
 /// only for metadata keys. Hybrid trunk: DeltaNet blocks (linear recurrence)

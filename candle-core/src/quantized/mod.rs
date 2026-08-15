@@ -816,6 +816,24 @@ impl QTensor {
         &self.shape
     }
 
+    /// Changes only tensor metadata while preserving quantized storage.
+    ///
+    /// New shape must keep element count and a block-aligned last dimension so
+    /// existing quantized matmul kernels can consume storage without dequantizing.
+    pub fn reshape<S: Into<Shape>>(mut self, shape: S) -> Result<Self> {
+        let shape = shape.into();
+        if shape.elem_count() != self.shape.elem_count() {
+            crate::bail!(
+                "cannot reshape quantized tensor {:?} to {:?}: element count differs",
+                self.shape,
+                shape
+            )
+        }
+        check_shape(&shape, self.storage.block_size())?;
+        self.shape = shape;
+        Ok(self)
+    }
+
     /// Внутренний accessor к QStorage для Metal Q4K dispatch helpers.
     #[cfg(target_os = "macos")]
     pub(crate) fn storage(&self) -> &QStorage {

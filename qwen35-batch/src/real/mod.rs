@@ -24,6 +24,8 @@ pub mod moe;
 pub mod multimodal;
 #[cfg(feature = "real-model")]
 pub mod tokenizer;
+#[cfg(feature = "real-model")]
+pub mod vision;
 
 pub use adapter::Qwen35BatchAdapter;
 pub use model_profile::{Architecture, ModelFingerprint, ModelProfile};

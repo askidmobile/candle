@@ -64,6 +64,21 @@ pub struct PrefillChunk {
     pub start_pos: usize,
 }
 
+/// Opaque multimodal prefill payload. Core scheduler keeps text behavior and
+/// implementations without media support reject install explicitly.
+#[derive(Debug, Clone)]
+pub struct MultimodalPrefill {
+    pub token_ids: Vec<u32>,
+    /// Vision encoder grids in packed-patch order, regardless of media kind.
+    pub media_grids: Vec<[usize; 3]>,
+    pub patch_values: Vec<f32>,
+    pub patch_rows: usize,
+    pub patch_width: usize,
+    pub mm_token_types: Vec<u8>,
+    pub rope_positions: [Vec<u32>; 3],
+    pub decode_rope_delta: i64,
+}
+
 /// Сэмплер: логиты → токен.
 pub trait Sampler: Send {
     fn sample(&mut self, logits: &[f32]) -> u32;
@@ -100,6 +115,10 @@ impl Sampler for GreedySampler {
 pub trait BatchModel {
     /// Размер словаря.
     fn vocab_size(&self) -> usize;
+
+    fn install_multimodal(&mut self, _slot: usize, _payload: MultimodalPrefill) -> Result<()> {
+        anyhow::bail!("model does not support multimodal prefill")
+    }
 
     /// Prefill одного чанка для одного слота. Обновляет per-slot state.
     /// Возвращает logits **последнего** токена чанка → scheduler сэмплирует
@@ -209,6 +228,28 @@ impl BatchModel for MockRecurrentModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_rejects_multimodal_install() {
+        let mut model = MockRecurrentModel::new(1, 32);
+        let payload = MultimodalPrefill {
+            token_ids: vec![1],
+            media_grids: vec![],
+            patch_values: vec![],
+            patch_rows: 0,
+            patch_width: 0,
+            mm_token_types: vec![0],
+            rope_positions: [vec![0], vec![0], vec![0]],
+            decode_rope_delta: 0,
+        };
+        assert_eq!(
+            model
+                .install_multimodal(0, payload)
+                .unwrap_err()
+                .to_string(),
+            "model does not support multimodal prefill"
+        );
+    }
 
     #[test]
     fn mock_output_is_pure_function_of_prompt() {

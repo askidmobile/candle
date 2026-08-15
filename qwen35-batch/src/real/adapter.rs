@@ -20,9 +20,42 @@ use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use std::path::Path;
 
-use crate::model::{BatchModel, DecodeBatch, PrefillChunk};
+use crate::model::{BatchModel, DecodeBatch, MultimodalPrefill, PrefillChunk};
 use crate::real::model_profile::ModelProfile;
 use crate::real::model_weights::{ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY};
+use crate::real::multimodal::{GridThw, PositionPlan};
+use crate::real::vision::Qwen35Vision;
+
+/// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
+struct InstalledMultimodal {
+    token_ids: Vec<u32>,
+    grids: Vec<GridThw>,
+    patches: Tensor,
+    mm_token_types: Vec<u8>,
+    plan: PositionPlan,
+    features: Option<Tensor>,
+}
+
+fn slice_position_plan(plan: &PositionPlan, start: usize, len: usize) -> Result<PositionPlan> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("position-plan range overflow"))?;
+    let slice = |axis: &[u32]| -> Result<Vec<u32>> {
+        Ok(axis
+            .get(start..end)
+            .ok_or_else(|| anyhow!("position-plan range is out of bounds"))?
+            .to_vec())
+    };
+    Ok(PositionPlan {
+        text_positions: slice(&plan.text_positions)?,
+        rope_positions: [
+            slice(&plan.rope_positions[0])?,
+            slice(&plan.rope_positions[1])?,
+            slice(&plan.rope_positions[2])?,
+        ],
+        decode_rope_delta: plan.decode_rope_delta,
+    })
+}
 
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
 pub struct Qwen35BatchAdapter {
@@ -36,6 +69,11 @@ pub struct Qwen35BatchAdapter {
     /// Признак того, что слот уже засеян в batched buffers (после prefill).
     /// True = batched decode может использовать этот slot без повторного seed.
     slot_seeded: Vec<bool>,
+    /// On-demand Vision component. Phase 8 owns TTL/load barrier; adapter only
+    /// consumes explicitly loaded component and per-request payloads.
+    vision: Option<Qwen35Vision>,
+    multimodal: Vec<Option<InstalledMultimodal>>,
+    rope_deltas: Vec<i64>,
     eos: u32,
     vocab: usize,
 }
@@ -110,6 +148,9 @@ impl Qwen35BatchAdapter {
             profile,
             slot_snaps: (0..num_slots).map(|_| None).collect(),
             slot_seeded: vec![false; num_slots],
+            vision: None,
+            multimodal: (0..num_slots).map(|_| None).collect(),
+            rope_deltas: vec![0; num_slots],
             eos,
             vocab,
         })
@@ -150,14 +191,19 @@ impl Qwen35BatchAdapter {
         &self.profile
     }
 
-    /// Сбросить single-stream state модели в нули (для свежего prefill).
-    /// Batched decode buffers других слотов НЕ трогаем (они — source of truth
-    /// для активных слотов в continuous batching). Сбрасываем только snapshot
-    /// и seeded-флаг конкретного слота.
-    fn reset_for_prefill(&mut self, sidx: usize) {
-        self.model.clear_state();
-        self.slot_snaps[sidx] = None;
-        self.slot_seeded[sidx] = false;
+    pub fn load_vision(&mut self, gguf_path: &Path) -> Result<()> {
+        self.vision = Some(
+            Qwen35Vision::load(gguf_path, self.device.clone())
+                .map_err(|error| anyhow!("load Vision component: {error}"))?,
+        );
+        Ok(())
+    }
+
+    pub fn unload_vision(&mut self) {
+        self.vision = None;
+        for payload in &mut self.multimodal {
+            *payload = None;
+        }
     }
 
     /// Полный сброс (все слоты) — только для тестов / teardown.
@@ -171,6 +217,12 @@ impl Qwen35BatchAdapter {
         for f in self.slot_seeded.iter_mut() {
             *f = false;
         }
+        for delta in &mut self.rope_deltas {
+            *delta = 0;
+        }
+        for payload in &mut self.multimodal {
+            *payload = None;
+        }
     }
 }
 
@@ -183,12 +235,96 @@ impl BatchModel for Qwen35BatchAdapter {
         }
     }
 
+    fn install_multimodal(&mut self, slot: usize, payload: MultimodalPrefill) -> Result<()> {
+        if slot >= self.multimodal.len() {
+            return Err(anyhow!("multimodal slot {slot} is out of range"));
+        }
+        if self.vision.is_none() {
+            return Err(anyhow!("Vision component is not loaded"));
+        }
+        if payload.token_ids.len() != payload.mm_token_types.len()
+            || payload
+                .rope_positions
+                .iter()
+                .any(|axis| axis.len() != payload.token_ids.len())
+            || payload.mm_token_types.iter().all(|kind| *kind == 0)
+            || payload.mm_token_types.iter().any(|kind| *kind > 2)
+        {
+            return Err(anyhow!("multimodal token/position lengths differ or contain no media"));
+        }
+        if payload.patch_values.len()
+            != payload
+                .patch_rows
+                .checked_mul(payload.patch_width)
+                .ok_or_else(|| anyhow!("multimodal patch size overflow"))?
+        {
+            return Err(anyhow!("multimodal patch value count mismatch"));
+        }
+        let expected_features = payload
+            .mm_token_types
+            .iter()
+            .filter(|kind| **kind != 0)
+            .count();
+        let grids: Vec<_> = payload
+            .media_grids
+            .into_iter()
+            .map(|[t, h, w]| GridThw { t, h, w })
+            .collect();
+        let actual_features = grids.iter().try_fold(0usize, |total, grid| {
+            if !grid.h.is_multiple_of(2) || !grid.w.is_multiple_of(2) {
+                return Err(anyhow!("multimodal grid is not divisible by merge size"));
+            }
+            let count = grid
+                .t
+                .checked_mul(grid.h / 2)
+                .and_then(|value| value.checked_mul(grid.w / 2))
+                .ok_or_else(|| anyhow!("multimodal grid overflow"))?;
+            total
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("multimodal feature count overflow"))
+        })?;
+        if actual_features != expected_features {
+            return Err(anyhow!(
+                "multimodal feature/grid count {actual_features} != placeholder count {expected_features}"
+            ));
+        }
+        let patches = Tensor::from_vec(
+            payload.patch_values,
+            (payload.patch_rows, payload.patch_width),
+            &self.device,
+        )?;
+        let plan = PositionPlan {
+            text_positions: (0..payload.token_ids.len())
+                .map(u32::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            rope_positions: payload.rope_positions,
+            decode_rope_delta: payload.decode_rope_delta,
+        };
+        self.multimodal[slot] = Some(InstalledMultimodal {
+            token_ids: payload.token_ids,
+            grids,
+            patches,
+            mm_token_types: payload.mm_token_types,
+            plan,
+            features: None,
+        });
+        self.rope_deltas[slot] = payload.decode_rope_delta;
+        Ok(())
+    }
+
     fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>> {
         let sidx = chunk.slot_idx;
+        if sidx >= self.slot_snaps.len() || chunk.tokens.is_empty() {
+            return Err(anyhow!("prefill slot is out of range or chunk is empty"));
+        }
         if chunk.reset_first {
-            // Новый запрос: обнуляем single-stream state для свежего prefill.
-            // Batched buffers других активных слотов не трогаем.
-            self.reset_for_prefill(sidx);
+            // Keep installed media for first chunk; reset only model state.
+            self.model.clear_state();
+            self.slot_snaps[sidx] = None;
+            self.slot_seeded[sidx] = false;
+            if self.multimodal[sidx].is_none() {
+                self.rope_deltas[sidx] = 0;
+            }
         } else if let Some(snap) = self.slot_snaps[sidx].as_ref() {
             // Продолжение prefill после чанка: восстанавливаем single-slot state.
             self.model
@@ -200,16 +336,65 @@ impl BatchModel for Qwen35BatchAdapter {
             ));
         }
 
-        // forward(prompt chunk) — prefill path (seq_len>1). Single-slot state.
         let ids = Tensor::from_vec(
-            chunk.tokens.iter().map(|&t| t as u32).collect::<Vec<_>>(),
+            chunk.tokens.clone(),
             (1usize, chunk.tokens.len()),
             &self.device,
         )?;
-        let logits = self
-            .model
-            .forward(&ids, chunk.start_pos)
-            .map_err(|e| anyhow!("prefill forward: {e}"))?;
+        let logits = if let Some(media) = self.multimodal[sidx].as_mut() {
+            let end = chunk
+                .start_pos
+                .checked_add(chunk.tokens.len())
+                .ok_or_else(|| anyhow!("prefill range overflow"))?;
+            if media.token_ids.get(chunk.start_pos..end) != Some(chunk.tokens.as_slice()) {
+                return Err(anyhow!(
+                    "multimodal prefill tokens differ from installed prompt"
+                ));
+            }
+            if media.features.is_none() {
+                media.features = Some(
+                    self.vision
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Vision component is not loaded"))?
+                        .forward(&media.patches, &media.grids)
+                        .map_err(|error| anyhow!("Vision forward: {error}"))?,
+                );
+            }
+            let embeds = self.model.embed_tokens(&ids, &self.device)?;
+            let mut feature_offset = media.mm_token_types[..chunk.start_pos]
+                .iter()
+                .filter(|kind| **kind != 0)
+                .count();
+            let features = media.features.as_ref().unwrap();
+            let mut cursor = 0usize;
+            while cursor < chunk.tokens.len() {
+                if media.mm_token_types[chunk.start_pos + cursor] == 0 {
+                    cursor += 1;
+                    continue;
+                }
+                let start = cursor;
+                while cursor < chunk.tokens.len()
+                    && media.mm_token_types[chunk.start_pos + cursor] != 0
+                {
+                    cursor += 1;
+                }
+                let len = cursor - start;
+                embeds.slice_set(
+                    &features.narrow(0, feature_offset, len)?.unsqueeze(0)?,
+                    1,
+                    start,
+                )?;
+                feature_offset += len;
+            }
+            let plan = slice_position_plan(&media.plan, chunk.start_pos, chunk.tokens.len())?;
+            self.model
+                .forward_embeds_mrope(&embeds, &plan, chunk.start_pos)
+                .map_err(|error| anyhow!("multimodal prefill forward: {error}"))?
+        } else {
+            self.model
+                .forward(&ids, chunk.start_pos)
+                .map_err(|e| anyhow!("prefill forward: {e}"))?
+        };
         let logits_f32 = logits
             .squeeze(0)?
             .to_dtype(DType::F32)?
@@ -231,6 +416,9 @@ impl BatchModel for Qwen35BatchAdapter {
 
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
         let b = batch.items.len();
+        if batch.items.iter().any(|item| item.slot_idx >= self.slot_snaps.len()) {
+            return Err(anyhow!("decode slot is out of range"));
+        }
         if b == 0 {
             return Ok(vec![]);
         }
@@ -255,18 +443,26 @@ impl BatchModel for Qwen35BatchAdapter {
         // После сжатия батча (ранний EOS) это сохраняет привязку слота к его state.
         let mut tokens = Vec::with_capacity(b);
         let mut positions = Vec::with_capacity(b);
+        let mut rope_positions = Vec::with_capacity(b);
         let mut slot_order = Vec::with_capacity(b); // (batch_idx, slot_idx)
         let mut slots = Vec::with_capacity(b);
         for it in &batch.items {
             tokens.push(it.token);
             positions.push(it.pos);
+            let rope_position = i64::try_from(it.pos)?
+                .checked_add(self.rope_deltas[it.slot_idx])
+                .ok_or_else(|| anyhow!("decode RoPE position overflow"))?;
+            rope_positions.push(
+                usize::try_from(rope_position)
+                    .map_err(|_| anyhow!("negative decode RoPE position"))?,
+            );
             slot_order.push(it.slot_idx);
             slots.push(it.slot_idx as u32);
         }
         let ids = Tensor::from_vec(tokens, (b, 1usize), &self.device)?;
         let logits = self
             .model
-            .forward_decode_batch(&ids, &positions, &slots)
+            .forward_decode_batch(&ids, &rope_positions, &slots)
             .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
         // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
         // serialized four CUDA synchronizations/copies for B=4.
@@ -306,8 +502,13 @@ impl BatchModel for Qwen35BatchAdapter {
     }
 
     fn reset_slot(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.slot_snaps.len() {
+            return Err(anyhow!("reset slot {idx} is out of range"));
+        }
         self.slot_snaps[idx] = None;
         self.slot_seeded[idx] = false;
+        self.multimodal[idx] = None;
+        self.rope_deltas[idx] = 0;
         Ok(())
     }
 }
@@ -331,6 +532,19 @@ impl Qwen35BatchAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimodal_position_plan_slices_fail_closed() {
+        let plan = PositionPlan {
+            text_positions: vec![0, 1, 2],
+            rope_positions: [vec![0, 1, 2], vec![0, 1, 2], vec![0, 1, 2]],
+            decode_rope_delta: -1,
+        };
+        let slice = slice_position_plan(&plan, 1, 2).unwrap();
+        assert_eq!(slice.text_positions, vec![1, 2]);
+        assert_eq!(slice.rope_positions[0], vec![1, 2]);
+        assert!(slice_position_plan(&plan, 2, 2).is_err());
+    }
 
     #[test]
     fn load_rejects_excess_slots_before_opening_gguf() {

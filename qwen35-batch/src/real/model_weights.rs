@@ -31,6 +31,7 @@ use super::delta_rule_batched_cuda;
 #[cfg(feature = "cuda")]
 use super::delta_rule_cuda;
 use super::moe::{ForwardMode, Qwen35MoeBlock};
+use super::multimodal::{PositionPlan, MROPE_DIMENSION_SOURCES};
 #[cfg(target_os = "macos")]
 use super::metal;
 use std::cell::RefCell;
@@ -2618,23 +2619,34 @@ impl GatedAttentionLayer {
     /// Разделяем на [rope_dim] + [head_dim - rope_dim], применяем RoPE к первой части,
     /// конкатенируем обратно.
     fn apply_partial_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        let (_b_sz, _n_head, seq_len, head_dim) = x.dims4()?;
-
-        if self.rope_dim >= head_dim {
-            // Полный RoPE (fallback, не должен случаться для Qwen3.5)
-            let cos = self.cos.narrow(0, index_pos, seq_len)?;
-            let sin = self.sin.narrow(0, index_pos, seq_len)?;
-            return candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin);
-        }
-
-        // Разделяем: первые rope_dim → RoPE, остальные → pass-through
-        let x_rot = x.narrow(3, 0, self.rope_dim)?;
-        let x_pass = x.narrow(3, self.rope_dim, head_dim - self.rope_dim)?;
-
+        let (_, _, seq_len, _) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        let x_rot = candle_nn::rotary_emb::rope(&x_rot.contiguous()?, &cos, &sin)?;
+        self.apply_partial_rotary_emb_with(x, &cos, &sin)
+    }
 
+    fn apply_partial_rotary_emb_with(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (_b_sz, _n_head, seq_len, head_dim) = x.dims4()?;
+        if cos.dims() != [seq_len, self.rope_dim / 2] || sin.dims() != [seq_len, self.rope_dim / 2]
+        {
+            candle_core::bail!(
+                "MRoPE table shape mismatch: cos={:?}, sin={:?}, expected [{seq_len}, {}]",
+                cos.dims(),
+                sin.dims(),
+                self.rope_dim / 2
+            );
+        }
+        if self.rope_dim >= head_dim {
+            return candle_nn::rotary_emb::rope(&x.contiguous()?, cos, sin);
+        }
+        let x_rot = x.narrow(3, 0, self.rope_dim)?;
+        let x_pass = x.narrow(3, self.rope_dim, head_dim - self.rope_dim)?;
+        let x_rot = candle_nn::rotary_emb::rope(&x_rot.contiguous()?, cos, sin)?;
         Tensor::cat(&[&x_rot, &x_pass], 3)
     }
 
@@ -2643,6 +2655,15 @@ impl GatedAttentionLayer {
     /// Вход: x shape [batch, seq_len, n_embd].
     /// Выход: [batch, seq_len, n_embd].
     fn forward_attn(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        self.forward_attn_with_rope(x, index_pos, None)
+    }
+
+    fn forward_attn_with_rope(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
 
         // 1. Joint Q+gate проекция
@@ -2694,9 +2715,18 @@ impl GatedAttentionLayer {
             self.head_dim,
         ))?;
 
-        // Partial RoPE
-        let q = self.apply_partial_rotary_emb(&q, index_pos)?;
-        let k = self.apply_partial_rotary_emb(&k, index_pos)?;
+        // Partial RoPE. Multimodal prefill supplies interleaved T/H/W tables;
+        // scalar text path keeps contiguous cache-position tables unchanged.
+        let (q, k) = match rope {
+            Some((cos, sin)) => (
+                self.apply_partial_rotary_emb_with(&q, cos, sin)?,
+                self.apply_partial_rotary_emb_with(&k, cos, sin)?,
+            ),
+            None => (
+                self.apply_partial_rotary_emb(&q, index_pos)?,
+                self.apply_partial_rotary_emb(&k, index_pos)?,
+            ),
+        };
         let t_reshape = t0.elapsed();
 
         // 6. KV-cache с sliding window
@@ -3453,25 +3483,26 @@ impl HybridBlock {
     ///   (Metal SDPA kernel не поддерживает head_dim=256 + seq_len > 1 из-за
     ///   лимита threadgroup memory 32KB)
     fn forward_prefill(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        self.forward_prefill_with_rope(x, index_pos, None)
+    }
+
+    fn forward_prefill_with_rope(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
         let (_b_sz, _seq_len, _n_embd) = x.dims3()?;
         let trace = crate::scheduler::trace_on();
         let t_mix = std::time::Instant::now();
 
-        // Pre-norm (batch — эффективно на GPU)
         let residual = x;
         let normed = self.attn_norm.forward(x)?;
 
         let layer_out = match &mut self.layer {
-            HybridLayerType::DeltaNet(delta) => {
-                // Batch prefill: GPU проекции за один вызов, CPU delta rule последовательно
-                delta.forward_prefill(&normed)?
-            }
+            HybridLayerType::DeltaNet(delta) => delta.forward_prefill(&normed)?,
             HybridLayerType::Attention(attn) => {
-                // Batch attention через manual matmul (Q@K^T → mask → softmax → @V).
-                // Metal SDPA kernel не поддерживает head_dim=256 + seq_len > 1
-                // (threadgroup memory 53760 > limit 32768), поэтому forward_attn
-                // использует ручную реализацию для prefill path.
-                attn.forward_attn(&normed, index_pos)?
+                attn.forward_attn_with_rope(&normed, index_pos, rope)?
             }
         };
         let x = (layer_out + residual)?;
@@ -5692,6 +5723,12 @@ impl ModelWeights {
         self.context_length
     }
 
+    /// Token embeddings on model device. Media pipeline replaces placeholder rows
+    /// before entering multimodal prefill; text-only forward does not call this.
+    pub fn embed_tokens(&self, tokens: &Tensor, device: &Device) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)?.to_device(device)
+    }
+
     /// Forward с pre-computed embeddings (skip embedding lookup).
     ///
     /// Используется в multimodal pipeline'ах (vision input через Qwen3.5-2B):
@@ -5717,6 +5754,61 @@ impl ModelWeights {
     }
 
     fn forward_embeds_inner(&mut self, embeds: &Tensor, index_pos: usize) -> Result<Tensor> {
+        self.forward_embeds_inner_with_rope(embeds, index_pos, None)
+    }
+
+    /// Multimodal prefill uses token-index cache positions but Qwen3.5 T/H/W
+    /// RoPE. `plan` must cover exactly this chunk; decode applies its rope delta.
+    #[cfg(target_os = "macos")]
+    pub fn forward_embeds_mrope(
+        &mut self,
+        embeds: &Tensor,
+        plan: &PositionPlan,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        crate::real::metal_utils::with_autoreleasepool(|| {
+            self.forward_embeds_mrope_inner(embeds, plan, index_pos)
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn forward_embeds_mrope(
+        &mut self,
+        embeds: &Tensor,
+        plan: &PositionPlan,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        self.forward_embeds_mrope_inner(embeds, plan, index_pos)
+    }
+
+    fn forward_embeds_mrope_inner(
+        &mut self,
+        embeds: &Tensor,
+        plan: &PositionPlan,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        let (_, seq_len, _) = embeds.dims3()?;
+        if plan.rope_positions.iter().any(|axis| axis.len() != seq_len) {
+            candle_core::bail!("MRoPE position count does not match embedding sequence");
+        }
+        let (rope_dim, device) = self
+            .blocks
+            .iter()
+            .find_map(|block| match &block.layer {
+                HybridLayerType::Attention(attn) => Some((attn.rope_dim, attn.cos.device())),
+                HybridLayerType::DeltaNet(_) => None,
+            })
+            .ok_or_else(|| candle_core::Error::Msg("model has no attention block".into()))?;
+        let (cos, sin) = precompute_mrope(&plan.rope_positions, rope_dim, 10_000_000.0, &device)?;
+        self.forward_embeds_inner_with_rope(embeds, index_pos, Some((&cos, &sin)))
+    }
+
+    fn forward_embeds_inner_with_rope(
+        &mut self,
+        embeds: &Tensor,
+        index_pos: usize,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
         let (_b_sz, seq_len, hidden) = embeds.dims3()?;
         if hidden != self.hidden_size() {
             candle_core::bail!(
@@ -5763,8 +5855,15 @@ impl ModelWeights {
                     ArenaDeactivateGuardEmbeds(activated_dev)
                 };
 
-                let result =
-                    prefill_loop_multi_cb!(layer_in, self.blocks, index_pos, &metal_dev, literal 4);
+                let result: Result<()> = if let Some(rope) = rope {
+                    for block in self.blocks.iter_mut() {
+                        layer_in =
+                            block.forward_prefill_with_rope(&layer_in, index_pos, Some(rope))?;
+                    }
+                    Ok(())
+                } else {
+                    prefill_loop_multi_cb!(layer_in, self.blocks, index_pos, &metal_dev, literal 4)
+                };
 
                 candle_metal_kernels::metal::commands::set_graph_scope_limit(prev_limit);
                 result?;
@@ -5776,13 +5875,19 @@ impl ModelWeights {
                 let mut a_ms = 0f64;
                 for (bi, block) in self.blocks.iter_mut().enumerate() {
                     let t0 = std::time::Instant::now();
-                    layer_in = block.forward_prefill(&layer_in, index_pos)?;
+                    layer_in = block.forward_prefill_with_rope(&layer_in, index_pos, rope)?;
                     if trace {
                         let el = t0.elapsed().as_secs_f64() * 1000.0;
-                        if block.is_deltanet() { d_ms += el; } else { a_ms += el; }
+                        if block.is_deltanet() {
+                            d_ms += el;
+                        } else {
+                            a_ms += el;
+                        }
                         if el > 50.0 {
-                            eprintln!("[pf] slow block {bi} {} {el:.1}ms",
-                                if block.is_deltanet() { "delta" } else { "attn" });
+                            eprintln!(
+                                "[pf] slow block {bi} {} {el:.1}ms",
+                                if block.is_deltanet() { "delta" } else { "attn" }
+                            );
                         }
                     }
                 }
@@ -5913,6 +6018,37 @@ impl ModelWeights {
 ///
 /// Для Qwen3.5: rope_dim = head_dim * partial_rotary_factor = 256 * 0.25 = 64.
 /// Таблицы shape: [context_length, rope_dim / 2].
+fn precompute_mrope(
+    positions: &[Vec<u32>; 3],
+    rope_dim: usize,
+    freq_base: f32,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let seq_len = positions[0].len();
+    if positions.iter().any(|axis| axis.len() != seq_len)
+        || rope_dim / 2 != MROPE_DIMENSION_SOURCES.len()
+    {
+        candle_core::bail!("invalid Qwen3.5 MRoPE dimensions");
+    }
+    let inv: Vec<f32> = (0..rope_dim)
+        .step_by(2)
+        .map(|index| 1f32 / freq_base.powf(index as f32 / rope_dim as f32))
+        .collect();
+    let mut cos = Vec::with_capacity(seq_len * inv.len());
+    let mut sin = Vec::with_capacity(seq_len * inv.len());
+    for token in 0..seq_len {
+        for (dimension, &frequency) in MROPE_DIMENSION_SOURCES.iter().zip(&inv) {
+            let angle = positions[*dimension as usize][token] as f32 * frequency;
+            cos.push(angle.cos());
+            sin.push(angle.sin());
+        }
+    }
+    Ok((
+        Tensor::from_vec(cos, (seq_len, inv.len()), device)?,
+        Tensor::from_vec(sin, (seq_len, inv.len()), device)?,
+    ))
+}
+
 fn precompute_freqs_cis(
     rope_dim: usize,
     freq_base: f32,
