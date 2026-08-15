@@ -1325,6 +1325,7 @@ impl QCudaStorage {
     ) -> Result<CudaStorage> {
         dequantize_f32_rowslice(&self.data, self.dtype, row_start, row_end, k, self.device())
     }
+}
 
 impl QCudaStorage {
     fn dequantize_matmul_vec(
