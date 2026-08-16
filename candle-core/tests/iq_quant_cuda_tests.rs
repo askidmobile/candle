@@ -630,8 +630,15 @@ fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
 
     let k = 256usize;
     let n = 128usize;
-    let w = Tensor::randn(0f32, 1.0, (n, k), &Device::Cpu)?;
-    let qt = QTensor::quantize(&w, GgmlDType::Q4_K)?.to_device(&device)?;
+    // Q4_K через raw-байты (QTensor::quantize CPU-only для части типов, а to_device — отдельно).
+    let blocks = n * k / 256;
+    let raw = vec![0u8; blocks * GgmlDType::Q4K.type_size()];
+    let qs = candle_core::quantized::QStorage::from_data(
+        std::borrow::Cow::Borrowed(&raw),
+        &device,
+        GgmlDType::Q4K,
+    )?;
+    let qt = QTensor::new(qs, (n, k))?;
     let mm = QMatMul::from_qtensor(qt)?;
     let x = Tensor::randn(0f32, 1.0, (1, 1, k), &device)?;
 
