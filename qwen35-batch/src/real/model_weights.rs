@@ -3851,8 +3851,9 @@ impl HybridBlock {
         ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
         slots: &[u32],
     ) -> Result<Tensor> {
-        let residual = x;
-        let normed = self.attn_norm.forward(x)?;
+        let x = x.contiguous()?;
+        let residual = &x;
+        let normed = self.attn_norm.forward(&x)?;
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => {
