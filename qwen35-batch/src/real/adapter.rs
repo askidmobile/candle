@@ -73,7 +73,6 @@ struct DecodeGraphState {
     ids_t: Tensor,
     /// Alias захваченных выходов (graph-pool память).
     logits_t: Tensor,
-    hidden_t: Tensor,
 }
 
 #[cfg(feature = "cuda")]
@@ -978,6 +977,7 @@ impl Qwen35BatchAdapter {
                     return Err(anyhow!("logits_out copy: {e}"));
                 }
                 drop(logits_t);
+                drop(hidden_t);
                 let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
                     .map_err(|e| anyhow!("end_capture: {e}"))?;
                 if cu_graph.is_null() {
@@ -1011,7 +1011,6 @@ impl Qwen35BatchAdapter {
                     slots: slots.to_vec(),
                     ids_t: ids_eager.clone(),
                     logits_t: logits_out,
-                    hidden_t,
                 })
             })();
             match capture_result {
