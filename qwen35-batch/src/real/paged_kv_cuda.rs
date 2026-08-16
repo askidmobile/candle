@@ -47,8 +47,7 @@ fn tensor_cuda_ptr(t: &Tensor) -> Result<u64> {
     }
     let slice = cuda.as_cuda_slice::<u8>()?;
     let slice = slice.slice(layout.start_offset()..);
-    let stream = cuda.device().cuda_stream();
-    let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(&slice, &stream);
+    let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(&slice, slice.stream());
     Ok(ptr)
 }
 
@@ -122,6 +121,7 @@ impl PagedModelCtx {
             &candle_core::cuda_backend::kernels::QUANTIZED,
         )?;
         let seqlens_k_ptr = tensor_cuda_ptr(&self.seqlens_k_t)?;
+        let b_i32 = b as i32;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -131,7 +131,7 @@ impl PagedModelCtx {
         builder.arg(&self.kv_len_dev);
         builder.arg(&self.slots_dev);
         builder.arg(&seqlens_k_ptr);
-        builder.arg(&(b as i32));
+        builder.arg(&b_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }
@@ -142,6 +142,7 @@ impl PagedModelCtx {
             "kv_len_increment",
             &candle_core::cuda_backend::kernels::QUANTIZED,
         )?;
+        let b_i32 = b as i32;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (32, 1, 1),
@@ -150,7 +151,7 @@ impl PagedModelCtx {
         let mut builder = func.builder();
         builder.arg(&self.kv_len_dev);
         builder.arg(&self.slots_dev);
-        builder.arg(&(b as i32));
+        builder.arg(&b_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }
@@ -171,6 +172,7 @@ impl PagedModelCtx {
 }
 
 /// Per-layer paged KV pool (k/v).
+#[derive(Debug, Clone)]
 pub struct PagedKvPool {
     pub k_pool: Tensor, // [num_blocks, page_size, n_kv, hd] F16
     pub v_pool: Tensor,
@@ -199,16 +201,10 @@ impl PagedKvPool {
         let v_pool_ptr = tensor_cuda_ptr(&self.v_pool)?;
         let k_rows_ptr = tensor_cuda_ptr(k_rows)?;
         let v_rows_ptr = tensor_cuda_ptr(v_rows)?;
-        let kv_len_ptr = {
-            let stream = ctx.dev.cuda_stream();
-            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&ctx.kv_len_dev, &stream);
-            p
-        };
-        let slots_ptr = {
-            let stream = ctx.dev.cuda_stream();
-            let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&ctx.slots_dev, &stream);
-            p
-        };
+        let kv_len_ptr = ctx.dev.cuda_stream();
+        let (kv_len_ptr, _g1) = cudarc::driver::DevicePtr::device_ptr(&ctx.kv_len_dev, &kv_len_ptr);
+        let slots_ptr = ctx.dev.cuda_stream();
+        let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&ctx.slots_dev, &slots_ptr);
         let block_table_ptr = tensor_cuda_ptr(&ctx.block_table_t)?;
         let func = ctx.dev.get_or_load_func(
             "kv_append_paged_f16",
@@ -219,6 +215,12 @@ impl PagedKvPool {
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
+        let b_i32 = b as i32;
+        let n_kv_i32 = n_kv as i32;
+        let hd_i32 = hd as i32;
+        let page_i32 = PAGE_SIZE as i32;
+        let max_blocks_i32 = ctx.max_blocks as i32;
+        let window_i32 = window as i32;
         let mut builder = func.builder();
         builder.arg(&k_pool_ptr);
         builder.arg(&v_pool_ptr);
@@ -227,12 +229,12 @@ impl PagedKvPool {
         builder.arg(&block_table_ptr);
         builder.arg(&slots_ptr);
         builder.arg(&kv_len_ptr);
-        builder.arg(&(b as i32));
-        builder.arg(&(n_kv as i32));
-        builder.arg(&(hd as i32));
-        builder.arg(&(PAGE_SIZE as i32));
-        builder.arg(&(ctx.max_blocks as i32));
-        builder.arg(&(window as i32));
+        builder.arg(&b_i32);
+        builder.arg(&n_kv_i32);
+        builder.arg(&hd_i32);
+        builder.arg(&page_i32);
+        builder.arg(&max_blocks_i32);
+        builder.arg(&window_i32);
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }

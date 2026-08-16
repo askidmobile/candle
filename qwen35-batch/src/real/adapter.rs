@@ -554,197 +554,6 @@ impl BatchModel for Qwen35BatchAdapter {
 
     /// CUDA-graph decode: один cuGraphLaunch вместо ~1700 драйверных вызовов.
     /// Возвращает Ok(None) — если шаг не графable (окно, состав, MTP) → eager fallback.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    fn decode_batch_graphed(
-        &mut self,
-        b: usize,
-        tokens: &[u32],
-        rope_positions: &[usize],
-        slots: &[u32],
-        positions: &[usize],
-    ) -> Result<Option<Vec<Vec<f32>>>> {
-        if !self.graphs_enabled {
-            return Ok(None);
-        }
-        let Device::Cuda(cuda_dev) = &self.device else {
-            return Ok(None);
-        };
-        // MTP transactions читают hidden — graph-pool буфер перезаписывается
-        // следующим launch, поэтому MTP-слоты → eager.
-        if self.target_transactions.iter().any(|t| t.is_some()) {
-            return Ok(None);
-        }
-        self.model
-            .init_paged_decode(&self.device)
-            .map_err(|e| anyhow!("init paged decode: {e}"))?;
-        let window = self.model.paged_window();
-        if window == 0 {
-            return Ok(None);
-        }
-        let num_slots = self.slot_snaps.len();
-
-        // Миграция KV из per-slot кэша в paged pool для dirty слотов.
-        for it in &batch.items {
-            let sidx = it.slot_idx;
-            if sidx >= num_slots {
-                return Ok(None);
-            }
-            if self.paged_dirty[sidx] {
-                let len = self
-                    .model
-                    .migrate_kv_to_paged(sidx)
-                    .map_err(|e| anyhow!("migrate KV slot {sidx}: {e}"))?;
-                if len > window {
-                    return Ok(None);
-                }
-                self.paged_dirty[sidx] = false;
-                // Синхронизируем device kv_len с мигрированным содержимым.
-                let lens: Vec<u32> = {
-                    let ctx = self.model.paged_ctx.as_ref().unwrap();
-                    let mut v = ctx.kv_len_host.clone();
-                    v[sidx] = len as u32;
-                    v
-                };
-                self.model
-                    .paged_ctx
-                    .as_mut()
-                    .unwrap()
-                    .reset_kv_len(&lens)?;
-            }
-        }
-
-        // Окно и позиции: позиция должна совпадать с device kv_len (host mirror).
-        {
-            let ctx = self.model.paged_ctx.as_ref().unwrap();
-            for (i, it) in batch.items.iter().enumerate() {
-                let cur = ctx.kv_len_host[it.slot_idx] as usize;
-                if positions[i] != cur || cur + 1 > window {
-                    return Ok(None);
-                }
-            }
-        }
-
-        // Block table: slot s владеет страницами [s*mb .. (s+1)*mb).
-        let (max_blocks, block_table) = {
-            let ctx = self.model.paged_ctx.as_ref().unwrap();
-            let mb = ctx.max_blocks;
-            let mut bt = vec![0u32; b * mb];
-            for (bidx, &s) in slots.iter().enumerate() {
-                for j in 0..mb {
-                    bt[bidx * mb + j] = s * mb as u32 + j as u32;
-                }
-            }
-            (mb, bt)
-        };
-        let _ = max_blocks;
-
-        let need_capture = match &self.decode_graph {
-            Some(g) => g.b != b || g.slots != slots,
-            None => true,
-        };
-
-        if need_capture {
-            self.decode_graph = None;
-            // Eager graphed-forward: реальный результат шага + prime всех ядер/кэшей.
-            let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
-            {
-                let ctx = self.model.paged_ctx.as_mut().unwrap();
-                ctx.stage_inputs(slots, rope_positions, &block_table)?;
-            }
-            let (logits, hidden) = self
-                .model
-                .forward_decode_batch_graphed(&ids_eager, slots)
-                .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
-            // host mirror kv_len после инкремента
-            {
-                let ctx = self.model.paged_ctx.as_mut().unwrap();
-                for &s in slots {
-                    ctx.kv_len_host[s as usize] += 1;
-                }
-            }
-            let flat = logits
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1()
-                .map_err(|e| anyhow!("graphed logits: {e}"))?;
-            let vocab = self.vocab_size();
-            if flat.len() != b * vocab {
-                return Err(anyhow!("graphed logits length mismatch"));
-            }
-            let out: Vec<Vec<f32>> = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
-            // Capture для следующих шагов (захват не исполняет ядра).
-            let stream = cuda_dev.cuda_stream();
-            stream
-                .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-                .map_err(|e| anyhow!("begin_capture: {e}"))?;
-            let capture_result = (|| -> Result<DecodeGraphState> {
-                let (logits_t, hidden_t) = self
-                    .model
-                    .forward_decode_batch_graphed(&ids_eager, slots)
-                    .map_err(|e| anyhow!("graphed forward (capture): {e}"))?;
-                let graph = stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-                    .map_err(|e| anyhow!("end_capture: {e}"))?
-                    .ok_or_else(|| anyhow!("end_capture returned no graph"))?;
-                Ok(DecodeGraphState {
-                    graph,
-                    b,
-                    slots: slots.to_vec(),
-                    ids_t: ids_eager.clone(),
-                    logits_t,
-                    hidden_t,
-                })
-            })();
-            match capture_result {
-                Ok(state) => {
-                    self.decode_graph = Some(state);
-                    if crate::scheduler::trace_on() {
-                        eprintln!("[graphs] captured decode graph B={b} slots={slots:?}");
-                    }
-                }
-                Err(e) => {
-                    // Захват не удался — продолжаем eager, логируем один раз.
-                    log::warn!("[graphs] capture failed (eager fallback): {e}");
-                    self.graphs_enabled = false;
-                }
-            }
-            let _ = hidden;
-            return Ok(Some(out));
-        }
-
-        // Replay path.
-        let state = self.decode_graph.as_ref().unwrap();
-        let stream = cuda_dev.cuda_stream();
-        {
-            let ctx = self.model.paged_ctx.as_mut().unwrap();
-            ctx.stage_inputs(slots, rope_positions, &block_table)?;
-        }
-        // ids: htod через staging tensor + slice_set (вне графа).
-        let ids_staging =
-            Tensor::from_vec(tokens.to_vec(), (b, 1usize), &Device::Cpu)?.to_device(&self.device)?;
-        state.ids_t.slice_set(&ids_staging, 0, 0)?;
-        state.graph.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
-        {
-            let ctx = self.model.paged_ctx.as_mut().unwrap();
-            for &s in slots {
-                ctx.kv_len_host[s as usize] += 1;
-            }
-        }
-        let _ = stream;
-        let flat = state
-            .logits_t
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1()
-            .map_err(|e| anyhow!("graph logits read: {e}"))?;
-        let vocab = self.vocab_size();
-        if flat.len() != b * vocab {
-            return Err(anyhow!("graph logits length mismatch"));
-        }
-        Ok(Some(flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect()))
-    }
-
     fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
         let b = batch.items.len();
         if batch.items.iter().any(|item| item.slot_idx >= self.slot_snaps.len()) {
@@ -981,6 +790,197 @@ impl BatchModel for Qwen35BatchAdapter {
 }
 
 impl Qwen35BatchAdapter {
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_batch_graphed(
+        &mut self,
+        b: usize,
+        tokens: &[u32],
+        rope_positions: &[usize],
+        slots: &[u32],
+        positions: &[usize],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        if !self.graphs_enabled {
+            return Ok(None);
+        }
+        let Device::Cuda(cuda_dev) = &self.device else {
+            return Ok(None);
+        };
+        // MTP transactions читают hidden — graph-pool буфер перезаписывается
+        // следующим launch, поэтому MTP-слоты → eager.
+        if self.target_transactions.iter().any(|t| t.is_some()) {
+            return Ok(None);
+        }
+        self.model
+            .init_paged_decode(&self.device)
+            .map_err(|e| anyhow!("init paged decode: {e}"))?;
+        let window = self.model.paged_window();
+        if window == 0 {
+            return Ok(None);
+        }
+        let num_slots = self.slot_snaps.len();
+
+        // Миграция KV из per-slot кэша в paged pool для dirty слотов.
+        for it in &batch.items {
+            let sidx = it.slot_idx;
+            if sidx >= num_slots {
+                return Ok(None);
+            }
+            if self.paged_dirty[sidx] {
+                let len = self
+                    .model
+                    .migrate_kv_to_paged(sidx)
+                    .map_err(|e| anyhow!("migrate KV slot {sidx}: {e}"))?;
+                if len > window {
+                    return Ok(None);
+                }
+                self.paged_dirty[sidx] = false;
+                // Синхронизируем device kv_len с мигрированным содержимым.
+                let lens: Vec<u32> = {
+                    let ctx = self.model.paged_ctx.as_ref().unwrap();
+                    let mut v = ctx.kv_len_host.clone();
+                    v[sidx] = len as u32;
+                    v
+                };
+                self.model
+                    .paged_ctx
+                    .as_mut()
+                    .unwrap()
+                    .reset_kv_len(&lens)?;
+            }
+        }
+
+        // Окно и позиции: позиция должна совпадать с device kv_len (host mirror).
+        {
+            let ctx = self.model.paged_ctx.as_ref().unwrap();
+            for (i, it) in batch.items.iter().enumerate() {
+                let cur = ctx.kv_len_host[it.slot_idx] as usize;
+                if positions[i] != cur || cur + 1 > window {
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Block table: slot s владеет страницами [s*mb .. (s+1)*mb).
+        let (max_blocks, block_table) = {
+            let ctx = self.model.paged_ctx.as_ref().unwrap();
+            let mb = ctx.max_blocks;
+            let mut bt = vec![0u32; b * mb];
+            for (bidx, &s) in slots.iter().enumerate() {
+                for j in 0..mb {
+                    bt[bidx * mb + j] = s * mb as u32 + j as u32;
+                }
+            }
+            (mb, bt)
+        };
+        let _ = max_blocks;
+
+        let need_capture = match &self.decode_graph {
+            Some(g) => g.b != b || g.slots != slots,
+            None => true,
+        };
+
+        if need_capture {
+            self.decode_graph = None;
+            // Eager graphed-forward: реальный результат шага + prime всех ядер/кэшей.
+            let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
+            {
+                let ctx = self.model.paged_ctx.as_mut().unwrap();
+                ctx.stage_inputs(slots, rope_positions, &block_table)?;
+            }
+            let (logits, hidden) = self
+                .model
+                .forward_decode_batch_graphed(&ids_eager, slots)
+                .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
+            // host mirror kv_len после инкремента
+            {
+                let ctx = self.model.paged_ctx.as_mut().unwrap();
+                for &s in slots {
+                    ctx.kv_len_host[s as usize] += 1;
+                }
+            }
+            let flat = logits
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
+                .map_err(|e| anyhow!("graphed logits: {e}"))?;
+            let vocab = self.vocab_size();
+            if flat.len() != b * vocab {
+                return Err(anyhow!("graphed logits length mismatch"));
+            }
+            let out: Vec<Vec<f32>> = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
+            // Capture для следующих шагов (захват не исполняет ядра).
+            let stream = cuda_dev.cuda_stream();
+            stream
+                .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+                .map_err(|e| anyhow!("begin_capture: {e}"))?;
+            let capture_result = (|| -> Result<DecodeGraphState> {
+                let (logits_t, hidden_t) = self
+                    .model
+                    .forward_decode_batch_graphed(&ids_eager, slots)
+                    .map_err(|e| anyhow!("graphed forward (capture): {e}"))?;
+                let graph = stream
+                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                    .map_err(|e| anyhow!("end_capture: {e}"))?
+                    .ok_or_else(|| anyhow!("end_capture returned no graph"))?;
+                Ok(DecodeGraphState {
+                    graph,
+                    b,
+                    slots: slots.to_vec(),
+                    ids_t: ids_eager.clone(),
+                    logits_t,
+                    hidden_t,
+                })
+            })();
+            match capture_result {
+                Ok(state) => {
+                    self.decode_graph = Some(state);
+                    if crate::scheduler::trace_on() {
+                        eprintln!("[graphs] captured decode graph B={b} slots={slots:?}");
+                    }
+                }
+                Err(e) => {
+                    // Захват не удался — продолжаем eager, логируем один раз.
+                    log::warn!("[graphs] capture failed (eager fallback): {e}");
+                    self.graphs_enabled = false;
+                }
+            }
+            let _ = hidden;
+            return Ok(Some(out));
+        }
+
+        // Replay path.
+        let state = self.decode_graph.as_ref().unwrap();
+        let stream = cuda_dev.cuda_stream();
+        {
+            let ctx = self.model.paged_ctx.as_mut().unwrap();
+            ctx.stage_inputs(slots, rope_positions, &block_table)?;
+        }
+        // ids: htod через staging tensor + slice_set (вне графа).
+        let ids_staging =
+            Tensor::from_vec(tokens.to_vec(), (b, 1usize), &Device::Cpu)?.to_device(&self.device)?;
+        state.ids_t.slice_set(&ids_staging, 0, 0)?;
+        state.graph.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
+        {
+            let ctx = self.model.paged_ctx.as_mut().unwrap();
+            for &s in slots {
+                ctx.kv_len_host[s as usize] += 1;
+            }
+        }
+        let _ = stream;
+        let flat = state
+            .logits_t
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()
+            .map_err(|e| anyhow!("graph logits read: {e}"))?;
+        let vocab = self.vocab_size();
+        if flat.len() != b * vocab {
+            return Err(anyhow!("graph logits length mismatch"));
+        }
+        Ok(Some(flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect()))
+    }
+
     /// EOS token id модели.
     pub fn eos(&self) -> u32 {
         self.eos
