@@ -635,6 +635,45 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     Ok(())
 }
 
+/// Граф с alloc+free узлами (промежуточный тензор дропнут внутри захвата).
+#[test]
+fn cuda_graph_alloc_free_balanced_double_launch() -> Result<()> {
+    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    use candle_core::cuda_backend::cudarc;
+    use cudarc::driver::{result as cres, sys as csys};
+    let device = Device::new_cuda(0)?;
+    let cuda_dev = device.as_cuda_device()?;
+    let stream = cuda_dev.cuda_stream();
+
+    let x = Tensor::ones((16,), DType::F32, &device)?;
+    // Prime.
+    let _ = (x.clone() * 2.0)?;
+
+    unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
+        .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    {
+        // alloc + free внутри захвата (y дропается до end_capture).
+        let y = (x.clone() * 2.0)?;
+        drop(y);
+    }
+    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?;
+    assert!(!cu_graph.is_null());
+    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+    unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+    assert!(!exec.is_null(), "instantiate failed");
+    for i in 0..3 {
+        let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+        assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch{i}: {res:?}");
+        stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync{i}: {e}")))?;
+    }
+    unsafe {
+        csys::cuGraphExecDestroy(exec);
+        csys::cuGraphDestroy(cu_graph);
+    }
+    Ok(())
+}
+
 /// Граф БЕЗ alloc-узлов: запись в пред-аллоцированный буфер (WDDM проверка).
 #[test]
 fn cuda_graph_no_alloc_nodes_double_launch() -> Result<()> {
