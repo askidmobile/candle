@@ -692,6 +692,84 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
     Ok(())
 }
 
+/// Полный L=0 набор ядер модели в графе: embedding + rmsnorm + q8_1 + matvec + copy2d.
+#[test]
+fn cuda_graph_model_l0_stack_capture() -> Result<()> {
+    use candle_core::cuda_backend::cudarc;
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    use cudarc::driver::{result as cres, sys as csys};
+    let device = Device::new_cuda(0)?;
+    let cuda_dev = device.as_cuda_device()?;
+    let stream = cuda_dev.cuda_stream();
+
+    // Embedding table Q6_K [vocab=512, hidden=256] + ids.
+    let blocks = 512 * 256 / 256;
+    let raw = vec![0u8; blocks * GgmlDType::Q6K.type_size()];
+    let emb_qt = QTensor::new(
+        candle_core::quantized::QStorage::from_data(
+            std::borrow::Cow::Borrowed(&raw),
+            &device,
+            GgmlDType::Q6K,
+        )?,
+        (512, 256),
+    )?;
+    let emb = QMatMul::from_qtensor(emb_qt)?;
+    // Output Q6_K [256, 512].
+    let raw2 = vec![0u8; blocks * GgmlDType::Q6K.type_size()];
+    let out_qt = QTensor::new(
+        candle_core::quantized::QStorage::from_data(
+            std::borrow::Cow::Borrowed(&raw2),
+            &device,
+            GgmlDType::Q6K,
+        )?,
+        (512, 256),
+    )?;
+    let out_mm = QMatMul::from_qtensor(out_qt)?;
+    let norm_w = Tensor::ones(256, DType::F32, &device)?;
+    let norm = candle_nn::RmsNorm::new(norm_w, 1e-6);
+
+    let ids_t = Tensor::from_vec(vec![7u32], (1, 1usize), &device)?;
+    // Prime.
+    {
+        let e = emb.embedding(&ids_t)?.reshape((1, 1usize, 256))?;
+        let h = norm.forward(&e.i((.., 0, ..))?)?;
+        let l = out_mm.forward(&h)?;
+        let _ = l.flatten_all()?.to_vec1::<f32>()?;
+    }
+    let logits_out = Tensor::zeros((1, 512), DType::F32, &device)?;
+
+    unsafe {
+        cres::stream::begin_capture(
+            stream.cu_stream(),
+            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    let e = emb.embedding(&ids_t)?.reshape((1, 1usize, 256))?;
+    let h = norm.forward(&e.i((.., 0, ..))?)?;
+    let l = out_mm.forward(&h)?;
+    logits_out.slice_set(&l, 0, 0)?;
+    drop(l);
+    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?;
+    assert!(!cu_graph.is_null());
+    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+    let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "instantiate: {res:?}");
+    let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch: {res:?}");
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+    let v = logits_out.flatten_all()?.to_vec1::<f32>()?;
+    assert!(v.iter().all(|x| x.is_finite()));
+    unsafe {
+        csys::cuGraphExecDestroy(exec);
+        csys::cuGraphDestroy(cu_graph);
+    }
+    Ok(())
+}
+
 /// То же, но с PTX quantized ядром + cuBLAS matmul внутри захвата.
 #[test]
 fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
