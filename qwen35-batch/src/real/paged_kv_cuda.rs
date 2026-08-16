@@ -72,9 +72,9 @@ impl PagedModelCtx {
         let device = Device::Cuda(dev.clone());
         let kv_len_dev = dev.alloc_zeros::<u32>(capacity_b)?;
         let slots_dev = dev.alloc_zeros::<u32>(capacity_b)?;
-        let seqlens_q_host: Vec<i32> = (0..=capacity_b as i32).collect();
+        let seqlens_q_host: Vec<u32> = (0..=capacity_b as u32).collect();
         let seqlens_q_t = Tensor::from_vec(seqlens_q_host, capacity_b + 1, &device)?;
-        let seqlens_k_t = Tensor::zeros(capacity_b + 1, DType::I32, &device)?;
+        let seqlens_k_t = Tensor::zeros(capacity_b + 1, DType::U32, &device)?;
         let block_table_t = Tensor::zeros((capacity_b, max_blocks), DType::U32, &device)?;
         let rope_pos_t = Tensor::zeros(capacity_b, DType::U32, &device)?;
         Ok(Self {
