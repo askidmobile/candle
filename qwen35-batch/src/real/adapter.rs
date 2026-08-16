@@ -630,7 +630,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    log::warn!("[graphs] graphed decode failed, eager fallback: {e}");
+                    eprintln!("[graphs] graphed decode failed, eager fallback: {e}");
                     self.decode_graph = None;
                     self.graphs_enabled = false;
                 }
