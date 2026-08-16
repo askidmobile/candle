@@ -611,6 +611,10 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     let mut exec: csys::CUgraphExec = std::ptr::null_mut();
     unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
     assert!(!exec.is_null(), "instantiate failed");
+    // WDDM probe: upload фиксирует graph pool перед первым launch.
+    if std::env::var("QWEN36_TEST_GRAPH_UPLOAD").as_deref() == Ok("1") {
+        unsafe { csys::cuGraphUpload(exec, stream.cu_stream()) };
+    }
     let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
     assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch1: {res:?}");
     stream
