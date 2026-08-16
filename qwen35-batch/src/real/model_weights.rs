@@ -3324,6 +3324,7 @@ impl GatedAttentionLayer {
         let seqlens_k = ctx.seqlens_k(b_sz)?;
         let block_table = ctx.block_table(b_sz)?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
         let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
             &q_f16,
             &pool.k_pool,
@@ -3333,7 +3334,7 @@ impl GatedAttentionLayer {
             &block_table,
             None,
             1,
-            self.attn_window,
+            window,
             scale,
             None,
             None,
