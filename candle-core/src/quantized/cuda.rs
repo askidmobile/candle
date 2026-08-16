@@ -134,7 +134,7 @@ fn quantize_q8_1(
         // --- slice the destination (u8) tensor by bytes ---
         let dst_start_byte = rows_processed * dst_row_size_bytes;
         let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
-        let dst_chunk = dst.slice_mut(dst_start_byte..(dst_start_byte + dst_num_bytes));
+        let mut dst_chunk = dst.slice_mut(dst_start_byte..(dst_start_byte + dst_num_bytes));
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (num_blocks as u32, rows_in_chunk as u32, 1),
