@@ -6349,7 +6349,8 @@ impl ModelWeights {
 
         // 2. Автоматический расчет окна на основе доступной свободной памяти VRAM
         let (free_vram, _total_vram) = cuda_dev
-            .context
+            .cuda_stream()
+            .context()
             .mem_get_info()
             .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo failed: {e}")))?;
 
