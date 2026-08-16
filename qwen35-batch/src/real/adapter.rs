@@ -916,6 +916,9 @@ impl Qwen35BatchAdapter {
         if need_capture {
             self.decode_graph = None;
             // Eager graphed-forward: реальный результат шага + prime всех ядер/кэшей.
+            // Guard включает htod param cache: params_from_vec идёт в кэш (prime),
+            // а при захвате промах → явная ошибка вместо pageable memcpy в графе.
+            let _htod_guard = cuda_dev.enable_cuda_graph_htod_cache();
             let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
