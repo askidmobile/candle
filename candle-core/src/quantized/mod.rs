@@ -1340,7 +1340,7 @@ impl QTensor {
                         out_shape.pop();
                         out_shape.push(n);
                         let none = crate::op::BackpropOp::none();
-                        return Ok(from_storage(Storage::Cuda(out), out_shape, none, false));
+                        return Ok(crate::tensor::from_storage(Storage::Cuda(out), out_shape, none, false));
                     }
                 }
             }
