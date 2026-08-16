@@ -45,6 +45,11 @@ cuda = [
 ]
 
 [[test]]
+name = "fa2_paged"
+path = "tests/fa2_paged.rs"
+required-features = ["cuda"]
+
+[[test]]
 name = "scheduler_parity"
 path = "tests/scheduler_parity.rs"
 
