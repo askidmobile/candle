@@ -6327,6 +6327,7 @@ impl ModelWeights {
         if self.paged_ready {
             return Ok(());
         }
+        eprintln!("[graphs-debug] init_paged_decode start");
         let cuda_dev = device
             .as_cuda_device()
             .map_err(|_| candle_core::Error::Msg("paged decode requires CUDA".into()))?;
@@ -6348,16 +6349,19 @@ impl ModelWeights {
         let (n_kv, hd) = dims.unwrap();
         let max_blocks = window.div_ceil(crate::real::paged_kv_cuda::PAGE_SIZE);
         let num_blocks = capacity_b * max_blocks;
+        eprintln!("[graphs-debug] init ctx: num_blocks={num_blocks}, n_kv={n_kv}, hd={hd}");
         let ctx = crate::real::paged_kv_cuda::PagedModelCtx::new(cuda_dev, capacity_b, max_blocks)?;
         self.paged_ctx = Some(ctx);
-        for block in self.blocks.iter_mut() {
+        for (i, block) in self.blocks.iter_mut().enumerate() {
             if let HybridLayerType::Attention(a) = &mut block.layer {
+                eprintln!("[graphs-debug] init block {i} paged pool");
                 a.paged_pool = Some(crate::real::paged_kv_cuda::PagedKvPool::new(
                     device, num_blocks, n_kv, hd,
                 )?);
             }
         }
         self.paged_ready = true;
+        eprintln!("[graphs-debug] init_paged_decode done");
         log::info!(
             "[qwen35-batch] paged decode: window={window} pages/slot={max_blocks} blocks={num_blocks}"
         );
