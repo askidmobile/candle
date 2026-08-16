@@ -1043,6 +1043,14 @@ impl Qwen35BatchAdapter {
             Tensor::from_vec(tokens.to_vec(), (b, 1usize), &Device::Cpu)?.to_device(&self.device)?;
         state.ids_t.slice_set(&ids_staging, 0, 0)?;
         state.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
+        // Диагностика: sync сразу после launch, чтобы async-ошибка графа
+        // привязывалась к этому шагу, а не всплывала sticky на следующем.
+        if crate::scheduler::trace_on() {
+            cuda_dev
+                .cuda_stream()
+                .synchronize()
+                .map_err(|e| anyhow!("graph post-launch sync: {e}"))?;
+        }
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
             for &s in slots {
