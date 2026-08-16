@@ -125,18 +125,16 @@ fn test_iq_matmul(dtype: GgmlDType) -> Result<()> {
     // Compare.
     let res_cpu = res.to_device(&Device::Cpu)?;
     let diff = (&res_cpu - &ref_mm)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    // With zeroed quant data and d=1.0, dequant values are deterministic but
-    // may be nonzero (grid index 0 has nonzero entries). With quantized matmul (q8_1 input dot product),
-    // tolerance is scaled relative to reference dot product precision.
+    // Relative tolerance: q8_1 activation quantization (8-bit, per-32 scale)
+    // gives ~0.1-0.4% error regardless of the absolute magnitude of the
+    // reference (zeroed blocks with d=1.0 dequantize to ~1.0 for IQ2/IQ3 and
+    // ~4064 for IQ4XS, so absolute diffs differ by ~4000x across dtypes while
+    // the relative error is the same).
+    let ref_abs = ref_mm.abs()?.max_all()?.to_scalar::<f32>()?;
     assert!(diff.is_finite(), "non-finite diff {diff} for {dtype:?}");
-    let tolerance = if matches!(dtype, GgmlDType::IQ4XS) {
-        150.0
-    } else {
-        0.15
-    };
     assert!(
-        diff <= tolerance,
-        "diff {diff} too large for {dtype:?} (CUDA vs CPU-ref, tolerance {tolerance})"
+        diff <= 2e-3 * ref_abs.max(1.0),
+        "relative diff {diff} vs ref {ref_abs} too large for {dtype:?}"
     );
 
     Ok(())
@@ -267,18 +265,14 @@ fn test_iq_matmul_multiblock(dtype: GgmlDType) -> Result<()> {
 
     let res_cpu = res.to_device(&Device::Cpu)?;
     let diff = (&res_cpu - &ref_mm)?.abs()?.max_all()?.to_scalar::<f32>()?;
+    let ref_abs = ref_mm.abs()?.max_all()?.to_scalar::<f32>()?;
     assert!(
         diff.is_finite(),
         "non-finite multiblock diff {diff} for {dtype:?}"
     );
-    let tolerance = if matches!(dtype, GgmlDType::IQ4XS) {
-        300.0
-    } else {
-        0.15
-    };
     assert!(
-        diff <= tolerance,
-        "multiblock diff {diff} too large for {dtype:?} (tolerance {tolerance})"
+        diff <= 2e-3 * ref_abs.max(1.0),
+        "relative multiblock diff {diff} vs ref {ref_abs} too large for {dtype:?}"
     );
     Ok(())
 }
