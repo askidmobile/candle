@@ -23,6 +23,7 @@ use candle_core::{
     DType, Device, IndexOp, Result, Tensor, D,
 };
 use candle_nn::{Module, RmsNorm};
+use std::io::Write;
 #[cfg(target_os = "macos")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
