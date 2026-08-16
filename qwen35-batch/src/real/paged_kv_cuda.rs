@@ -196,9 +196,31 @@ pub struct PagedKvPool {
 
 impl PagedKvPool {
     pub fn new(dev: &Device, num_blocks: usize, n_kv: usize, hd: usize) -> Result<Self> {
+        let cuda_dev = dev
+            .as_cuda_device()
+            .map_err(|_| candle_core::Error::Msg("paged pool requires CUDA".into()))?;
         let shape = (num_blocks, PAGE_SIZE, n_kv, hd);
-        let k_pool = unsafe { dev.alloc_uninit(shape, DType::F16)? };
-        let v_pool = unsafe { dev.alloc_uninit(shape, DType::F16)? };
+        let total_elems = num_blocks * PAGE_SIZE * n_kv * hd;
+        let k_slice = unsafe { cuda_dev.alloc::<half::f16>(total_elems)? };
+        let v_slice = unsafe { cuda_dev.alloc::<half::f16>(total_elems)? };
+        let k_pool = Tensor::from_storage(
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                k_slice,
+                cuda_dev.clone(),
+            )),
+            shape,
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        let v_pool = Tensor::from_storage(
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                v_slice,
+                cuda_dev.clone(),
+            )),
+            shape,
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
         Ok(Self { k_pool, v_pool })
     }
 
