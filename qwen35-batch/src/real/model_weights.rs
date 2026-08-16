@@ -6464,7 +6464,7 @@ impl ModelWeights {
                     let v_src = vc.as_cuda_slice::<half::f16>()?;
                     let mut kp_dst = kpc.as_cuda_slice::<half::f16>()?;
                     let mut vp_dst = vpc.as_cuda_slice::<half::f16>()?;
-                    let stream = kc.device().cuda_stream();
+                    let stream = kc.device.cuda_stream();
 
                     let pages = kv_len.div_ceil(ps);
                     for page in 0..pages {
