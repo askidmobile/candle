@@ -596,19 +596,23 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     assert!(x0.iter().all(|&v| v == 1.0));
 
     // Capture: x = x * 2 (device op, capturable)
-    stream
-        .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+    use cudarc::driver::{result as cres, sys as csys};
+    unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
         .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
     let y = (x.clone() * 2.0)?;
-    let graph = stream
-        .end_capture(unsafe {
-            std::mem::transmute::<u32, cudarc::driver::sys::CUgraphInstantiate_flags>(0)
-        })
-        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?
-        .ok_or_else(|| candle_core::Error::Msg("no graph".into()))?;
-
-    graph.launch().map_err(|e| candle_core::Error::Msg(format!("launch: {e}")))?;
+    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?;
+    assert!(!cu_graph.is_null(), "end_capture returned null graph");
+    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+    unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+    assert!(!exec.is_null(), "instantiate failed");
+    unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    stream.synchronize()?;
     let y0 = y.to_vec1::<f32>()?;
     assert!(y0.iter().all(|&v| v == 2.0), "graph replay wrong: {:?}", &y0[..4]);
+    unsafe {
+        csys::cuGraphExecDestroy(exec);
+        csys::cuGraphDestroy(cu_graph);
+    }
     Ok(())
 }
