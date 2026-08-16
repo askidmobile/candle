@@ -6462,9 +6462,14 @@ impl ModelWeights {
                 ) = (&*k_st, &*v_st, &*kp_st, &*vp_st) {
                     let k_src = kc.as_cuda_slice::<half::f16>()?;
                     let v_src = vc.as_cuda_slice::<half::f16>()?;
-                    let mut kp_dst = kpc.as_cuda_slice::<half::f16>()?;
-                    let mut vp_dst = vpc.as_cuda_slice::<half::f16>()?;
+                    let kp_dst = kpc.as_cuda_slice::<half::f16>()?;
+                    let vp_dst = vpc.as_cuda_slice::<half::f16>()?;
                     let stream = kc.device.cuda_stream();
+
+                    let (k_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(k_src, &stream);
+                    let (v_src_ptr, _) = cudarc::driver::DevicePtr::device_ptr(v_src, &stream);
+                    let (kp_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(kp_dst, &stream);
+                    let (vp_dst_ptr, _) = cudarc::driver::DevicePtr::device_ptr(vp_dst, &stream);
 
                     let pages = kv_len.div_ceil(ps);
                     for page in 0..pages {
@@ -6473,16 +6478,24 @@ impl ModelWeights {
                         let phys = slot * mb + page;
 
                         let src_start = k_l.start_offset() + start * elem_per_token;
+                        let src_v_start = v_l.start_offset() + start * elem_per_token;
                         let dst_start = (phys * ps) * elem_per_token;
-                        let count = n * elem_per_token;
+                        let count_bytes = n * elem_per_token * 2; // f16 = 2 bytes
 
-                        let src_k_view = k_src.slice(src_start..src_start + count);
-                        let mut dst_k_view = kp_dst.slice_mut(dst_start..dst_start + count);
-                        stream.memcpy_dtod(&src_k_view, &mut dst_k_view).map_err(candle_core::Error::wrap)?;
-
-                        let src_v_view = v_src.slice(src_start..src_start + count);
-                        let mut dst_v_view = vp_dst.slice_mut(dst_start..dst_start + count);
-                        stream.memcpy_dtod(&src_v_view, &mut dst_v_view).map_err(candle_core::Error::wrap)?;
+                        unsafe {
+                            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                                kp_dst_ptr + (dst_start * 2) as u64,
+                                k_src_ptr + (src_start * 2) as u64,
+                                count_bytes,
+                                stream.cu_stream(),
+                            );
+                            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                                vp_dst_ptr + (dst_start * 2) as u64,
+                                v_src_ptr + (src_v_start * 2) as u64,
+                                count_bytes,
+                                stream.cu_stream(),
+                            );
+                        }
                     }
                 }
             }
