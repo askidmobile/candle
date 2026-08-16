@@ -982,6 +982,13 @@ impl Qwen35BatchAdapter {
                         csys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut nodes)
                     };
                     eprintln!("[graphs] captured nodes={nodes} res={res:?}");
+                    if std::env::var("QWEN36_GRAPH_DOT").as_deref() == Ok("1") {
+                        let path = std::ffi::CString::new("D:\\Projects\\yttri-build\\decode-graph.dot").unwrap();
+                        let res = unsafe {
+                            csys::cuGraphDebugDotPrint(cu_graph, path.as_ptr(), 1u32)
+                        };
+                        eprintln!("[graphs] dot dump res={res:?}");
+                    }
                 }
                 let mut exec: csys::CUgraphExec = std::ptr::null_mut();
                 let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
