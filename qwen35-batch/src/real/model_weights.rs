@@ -3851,10 +3851,9 @@ impl HybridBlock {
         ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
         slots: &[u32],
     ) -> Result<Tensor> {
-        let x = x.contiguous()?;
-        let residual = &x;
+        let residual = x;
         if crate::scheduler::trace_on() { eprintln!("[fdbp] 1. attn_norm"); }
-        let normed = self.attn_norm.forward(&x)?;
+        let normed = self.attn_norm.forward(x)?;
         if crate::scheduler::trace_on() { eprintln!("[fdbp] 2. layer dispatch"); }
 
         let layer_out = match &mut self.layer {
