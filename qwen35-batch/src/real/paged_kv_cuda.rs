@@ -46,8 +46,9 @@ fn tensor_cuda_ptr(t: &Tensor) -> Result<u64> {
         candle_core::bail!("tensor is not contiguous");
     }
     let slice = cuda.as_cuda_slice::<u8>()?;
+    let stream = slice.stream();
     let slice = slice.slice(layout.start_offset()..);
-    let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(&slice, slice.stream());
+    let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(&slice, stream);
     Ok(ptr)
 }
 

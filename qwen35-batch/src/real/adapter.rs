@@ -821,8 +821,8 @@ impl Qwen35BatchAdapter {
         let num_slots = self.slot_snaps.len();
 
         // Миграция KV из per-slot кэша в paged pool для dirty слотов.
-        for it in &batch.items {
-            let sidx = it.slot_idx;
+        for &s in slots {
+            let sidx = s as usize;
             if sidx >= num_slots {
                 return Ok(None);
             }
@@ -853,8 +853,8 @@ impl Qwen35BatchAdapter {
         // Окно и позиции: позиция должна совпадать с device kv_len (host mirror).
         {
             let ctx = self.model.paged_ctx.as_ref().unwrap();
-            for (i, it) in batch.items.iter().enumerate() {
-                let cur = ctx.kv_len_host[it.slot_idx] as usize;
+            for (i, &s) in slots.iter().enumerate() {
+                let cur = ctx.kv_len_host[s as usize] as usize;
                 if positions[i] != cur || cur + 1 > window {
                     return Ok(None);
                 }
