@@ -923,7 +923,9 @@ impl Qwen35BatchAdapter {
                     .forward_decode_batch_graphed(&ids_eager, slots)
                     .map_err(|e| anyhow!("graphed forward (capture): {e}"))?;
                 let graph = stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_UPLOAD)
+                    // flags=0: AUTO_FREE_ON_LAUNCH освобождает graph pool при
+                    // первом launch (illegal address); UPLOAD невалиден на этом драйвере.
+                    .end_capture(unsafe { std::mem::transmute::<u32, cudarc::driver::sys::CUgraphInstantiate_flags>(0) })
                     .map_err(|e| anyhow!("end_capture: {e}"))?
                     .ok_or_else(|| anyhow!("end_capture returned no graph"))?;
                 Ok(DecodeGraphState {
