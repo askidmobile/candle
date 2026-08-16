@@ -4486,14 +4486,25 @@ impl ModelWeights {
             device,
         )?;
 
-        // Output projection и token embedding (с защитой от дублирования VRAM)
+        // Output projection и token embedding (с защитой от переполнения VRAM)
         let output_res = load_heavy("output.weight");
         let (output, tok_embeddings_cuda) = match output_res {
             Ok(v) => {
                 let out_mm = QMatMul::from_qtensor(v)?;
                 #[cfg(feature = "cuda")]
                 let emb_mm = if device.is_cuda() {
-                    Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?)
+                    // Загружаем дублирующий token_embd на GPU только если достаточно свободной VRAM (> 2 GB)
+                    let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
+                        cuda_dev.cuda_stream().context().mem_get_info().map(|(free, _)| free > 2 * 1024 * 1024 * 1024).unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if has_vram_headroom {
+                        Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?)
+                    } else {
+                        log::info!("[{}] low VRAM headroom: keeping token_embd on CPU mmap (zero GPU overhead)", tag);
+                        None
+                    }
                 } else {
                     None
                 };
