@@ -6331,11 +6331,11 @@ impl ModelWeights {
         let cuda_dev = device
             .as_cuda_device()
             .map_err(|_| candle_core::Error::Msg("paged decode requires CUDA".into()))?;
-        // Окно графа: не более 8K (VRAM) и не более attn_window модели.
+        // Окно графа: по умолчанию 2048 для экономии VRAM (для 4B можно поднять через QWEN36_GRAPH_WINDOW=8192).
         let graph_window: usize = std::env::var("QWEN36_GRAPH_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
+            .unwrap_or(2048);
         let capacity_b = DECODE_BATCH_CAPACITY as usize;
         let mut window: Option<usize> = None;
         let mut dims: Option<(usize, usize)> = None; // (n_kv, hd)
