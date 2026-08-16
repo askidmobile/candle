@@ -879,6 +879,9 @@ impl Qwen35BatchAdapter {
             Some(g) => g.b != b || g.slots != slots,
             None => true,
         };
+        if crate::scheduler::trace_on() {
+            eprintln!("[graphs] step b={b} need_capture={need_capture}");
+        }
 
         if need_capture {
             self.decode_graph = None;
@@ -941,7 +944,7 @@ impl Qwen35BatchAdapter {
                 }
                 Err(e) => {
                     // Захват не удался — продолжаем eager, логируем один раз.
-                    log::warn!("[graphs] capture failed (eager fallback): {e}");
+                    eprintln!("[graphs] capture failed (eager fallback): {e}");
                     self.graphs_enabled = false;
                 }
             }
