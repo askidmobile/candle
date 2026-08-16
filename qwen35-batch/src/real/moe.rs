@@ -317,26 +317,10 @@ impl SharedExpert {
 ///
 /// At `x = 0` the limit is `0.5`; we return `0.5` to avoid `0/0` NaN.
 /// Bit-exact with llama.cpp for all nonzero `x` (same op sequence: silu then div).
-///
-/// Gate logits are tiny (`[n_tokens, 1]`) — CPU round-trip is negligible.
+/// $f(x) = \text{silu}(x)/x = \text{sigmoid}(x)$ — математически тождественно для всех $x$,
+/// включая $x=0$ ($\text{sigmoid}(0) = 0.5$). Выполняется на GPU без CPU round-trip.
 fn silu_div(xs: &Tensor) -> Result<Tensor> {
-    let device = xs.device();
-    let (rows, cols) = xs.dims2()?;
-    let xs_cpu = xs.to_device(&Device::Cpu)?.flatten_all()?;
-    let vals: Vec<f32> = xs_cpu.to_vec1()?;
-    let out: Vec<f32> = vals
-        .iter()
-        .map(|&x| {
-            if x == 0.0 {
-                0.5
-            } else {
-                let s = x / (1.0 + (-x).exp());
-                s / x
-            }
-        })
-        .collect();
-    let t = Tensor::from_vec(out, (rows, cols), &Device::Cpu)?;
-    t.to_device(device)
+    candle_nn::ops::sigmoid(xs)
 }
 
 // ─── MoE block ────────────────────────────────────────────────────────────────
