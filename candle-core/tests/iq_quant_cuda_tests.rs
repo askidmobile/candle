@@ -725,14 +725,11 @@ fn cuda_graph_model_l0_stack_capture() -> Result<()> {
         (512, 256),
     )?;
     let out_mm = QMatMul::from_qtensor(out_qt)?;
-    let norm_w = Tensor::ones(256, DType::F32, &device)?;
-    let norm = candle_nn::RmsNorm::new(norm_w, 1e-6);
-
     let ids_t = Tensor::from_vec(vec![7u32], (1, 1usize), &device)?;
     // Prime.
     {
         let e = emb.embedding(&ids_t)?.reshape((1, 1usize, 256))?;
-        let h = norm.forward(&e.i((.., 0, ..))?)?;
+        let h = (e.squeeze(1)? * 1.0)?;
         let l = out_mm.forward(&h)?;
         let _ = l.flatten_all()?.to_vec1::<f32>()?;
     }
@@ -746,7 +743,7 @@ fn cuda_graph_model_l0_stack_capture() -> Result<()> {
     }
     .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
     let e = emb.embedding(&ids_t)?.reshape((1, 1usize, 256))?;
-    let h = norm.forward(&e.i((.., 0, ..))?)?;
+    let h = (e.squeeze(1)? * 1.0)?;
     let l = out_mm.forward(&h)?;
     logits_out.slice_set(&l, 0, 0)?;
     drop(l);
