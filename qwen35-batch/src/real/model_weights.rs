@@ -3252,6 +3252,7 @@ impl GatedAttentionLayer {
             candle_core::bail!("paged decode: seq_len must be 1, got {seq_len}");
         }
         // 1. Batched projections (общий prequant Q8_1).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 1. proj"); }
         let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
             .ok()
             .flatten();
@@ -3260,6 +3261,7 @@ impl GatedAttentionLayer {
         let v = self.attention_wv.forward_with_prequant(x, prequant.as_ref())?;
 
         // 2. Reshape + norms (как eager path).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 2. norms"); }
         let qg = qg.reshape((b_sz, 1, self.n_head, self.head_dim * 2))?;
         let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
         let gate_all = qg
@@ -3287,11 +3289,13 @@ impl GatedAttentionLayer {
         ))?;
 
         // 3. RoPE по device-позициям (один gather на весь batch).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 3. rope"); }
         let rope_pos = ctx.rope_pos(b_sz)?;
         let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, &rope_pos)?;
         let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
 
         // 4. head-last строки + q8 round-trip (численный паритет с eager path).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 4. q8"); }
         let k_hl = k_rope.transpose(1, 2)?.contiguous()?;
         let v_hl = v_all.transpose(1, 2)?.contiguous()?;
         let (kq, ks) = q8_quantize_rows(&k_hl)?;
@@ -3304,6 +3308,7 @@ impl GatedAttentionLayer {
             .contiguous()?;
 
         // 5. Append в paged pool (device kv_len).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 5. append"); }
         let pool = self
             .paged_pool
             .as_ref()
@@ -3319,6 +3324,7 @@ impl GatedAttentionLayer {
         )?;
 
         // 6. FA2 varlen paged.
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 6. fa2"); }
         let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, hd]
         let seqlens_q = ctx.seqlens_q(b_sz)?;
         let seqlens_k = ctx.seqlens_k(b_sz)?;
@@ -3343,13 +3349,16 @@ impl GatedAttentionLayer {
         )?;
 
         // 7. Gate + Wo (как eager path).
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 7. out"); }
         let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, n_head, 1, hd]
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?;
         let y_all = (y_all * gate_sigmoid)?;
         let y_all = y_all
             .transpose(1, 2)?
             .reshape(&[b_sz, 1, self.n_head * self.head_dim])?;
-        self.attention_wo.forward(&y_all)
+        let res = self.attention_wo.forward(&y_all);
+        if crate::scheduler::trace_on() { eprintln!("[attn-paged] 8. done"); }
+        res
     }
 
     fn forward_attn_decode_batch(
