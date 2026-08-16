@@ -3776,6 +3776,11 @@ impl HybridBlock {
 
 pub struct ModelWeights {
     tok_embeddings: QuantizedEmbedding,
+    /// CUDA-resident embedding table (get_rows kernel вместо CPU dequant + H2D
+    /// на каждый токен). Загружается только на CUDA; при tied output.weight
+    /// переиспользует тот же QMatMul (Arc-shared, без дублирования VRAM).
+    #[cfg(feature = "cuda")]
+    tok_embeddings_cuda: Option<QMatMul>,
     pub(crate) blocks: Vec<HybridBlock>,
     norm: RmsNorm,
     output: QMatMul,
@@ -4290,6 +4295,18 @@ impl ModelWeights {
                 log::info!("[{}] output.weight not found, using tied embeddings", tag);
                 QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?
             }
+        };
+
+        // CUDA embedding: get_rows kernel читает квантованную таблицу прямо на GPU.
+        // Иначе каждый токен: D2H ids → CPU dequant → H2D [B, n_embd] (host sync ×2/шаг).
+        #[cfg(feature = "cuda")]
+        let tok_embeddings_cuda: Option<QMatMul> = if device.is_cuda() {
+            match load_heavy("output.weight") {
+                Ok(_) => Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?),
+                Err(_) => Some(output.clone()),
+            }
+        } else {
+            None
         };
 
         // RoPE: предрассчитанные cos/sin для PARTIAL RoPE (rope_dim, не full head_dim).
@@ -5024,6 +5041,8 @@ impl ModelWeights {
 
         Ok(Self {
             tok_embeddings,
+            #[cfg(feature = "cuda")]
+            tok_embeddings_cuda,
             blocks,
             norm,
             output,
@@ -5731,8 +5750,16 @@ impl ModelWeights {
         }
 
         // Embedding lookup: один batch вызов (деквантизируем все seq_len строк за раз).
-        let emb_cpu = self.tok_embeddings.forward(x)?;
-        let mut layer_in = emb_cpu.to_device(x.device())?;
+        #[cfg(feature = "cuda")]
+        let emb_ready = if let Some(emb) = &self.tok_embeddings_cuda {
+            // CUDA: get_rows на GPU — без CPU dequant и H2D round-trip.
+            emb.embedding(x)?
+        } else {
+            self.tok_embeddings.forward(x)?.to_device(x.device())?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let emb_ready = self.tok_embeddings.forward(x)?.to_device(x.device())?;
+        let mut layer_in = emb_ready;
         let t_embed = t_start.elapsed();
 
         let t_layers_start = std::time::Instant::now();
@@ -6009,9 +6036,15 @@ impl ModelWeights {
 
         // Embedding: QuantizedEmbedding.forward возвращает [1, b_sz, n_embd] (hardcoded
         // leading 1). Reshape в [b_sz, 1, n_embd] для batched layers.
-        let emb_cpu = self.tok_embeddings.forward(tokens)?; // [1, b_sz, n_embd]
-        let mut layer_in = emb_cpu.to_device(tokens.device())?; // [1, b_sz, n_embd]
-        layer_in = layer_in.reshape((b_sz, 1usize, self.hidden_size()))?; // [b_sz, 1, n_embd]
+        #[cfg(feature = "cuda")]
+        let emb_ready = if let Some(emb) = &self.tok_embeddings_cuda {
+            emb.embedding(tokens)? // [b_sz, 1, n_embd] прямо на GPU
+        } else {
+            self.tok_embeddings.forward(tokens)?.to_device(tokens.device())?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let emb_ready = self.tok_embeddings.forward(tokens)?.to_device(tokens.device())?;
+        let mut layer_in = emb_ready.reshape((b_sz, 1usize, self.hidden_size()))?; // [b_sz, 1, n_embd]
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
         let trace = crate::scheduler::trace_on();
