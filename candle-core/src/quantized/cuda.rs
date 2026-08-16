@@ -536,6 +536,12 @@ impl QCudaStorage {
             GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
             GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
             GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+            GgmlDType::IQ2XXS => "mul_mat_vec_iq2_xxs_q8_1_cuda",
+            GgmlDType::IQ2XS => "mul_mat_vec_iq2_xs_q8_1_cuda",
+            GgmlDType::IQ2S => "mul_mat_vec_iq2_s_q8_1_cuda",
+            GgmlDType::IQ3XXS => "mul_mat_vec_iq3_xxs_q8_1_cuda",
+            GgmlDType::IQ3S => "mul_mat_vec_iq3_s_q8_1_cuda",
+            GgmlDType::IQ4XS => "mul_mat_vec_iq4_xs_q8_1_cuda",
             _ => crate::bail!("unsupported dtype for quantized matmul {:?}", self.dtype),
         };
         let kernel_name = format!("{kernel_name}{b_size}");
@@ -623,6 +629,12 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
         GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+        GgmlDType::IQ2XXS => "mul_mat_vec_iq2_xxs_q8_1_cuda",
+        GgmlDType::IQ2XS => "mul_mat_vec_iq2_xs_q8_1_cuda",
+        GgmlDType::IQ2S => "mul_mat_vec_iq2_s_q8_1_cuda",
+        GgmlDType::IQ3XXS => "mul_mat_vec_iq3_xxs_q8_1_cuda",
+        GgmlDType::IQ3S => "mul_mat_vec_iq3_s_q8_1_cuda",
+        GgmlDType::IQ4XS => "mul_mat_vec_iq4_xs_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let kernel_name = format!("{kernel_name}{b_size}");
@@ -772,69 +784,12 @@ fn indexed_moe_forward_dispatch(
         )
     }
 
-    if matches!(
-        w_dtype,
-        GgmlDType::IQ2S
-            | GgmlDType::IQ2XS
-            | GgmlDType::IQ2XXS
-            | GgmlDType::IQ3S
-            | GgmlDType::IQ3XXS
-            | GgmlDType::IQ4XS
-    ) {
-        let kernel_name = match w_dtype {
-            GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_f32",
-            GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_f32",
-            GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_f32",
-            GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_f32",
-            GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_f32",
-            GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_f32",
-            _ => unreachable!(),
-        };
-        let out = unsafe { dev.alloc::<f32>(batch * topk * n)? };
-        let grouped = batch > 4;
-        let kernel_name = if grouped {
-            format!("{kernel_name}_grouped")
-        } else {
-            kernel_name.to_owned()
-        };
-        let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
-        let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: if grouped {
-                (n as u32, n_experts as u32, 1)
-            } else {
-                (n as u32, batch as u32, topk as u32)
-            },
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = func.builder();
-        builder.arg(weight);
-        builder.arg(input);
-        builder.arg(ids);
-        builder.arg(&out);
-        barg!(
-            builder,
-            n as i32,
-            k as i32,
-            batch as i32,
-            topk as i32,
-            input_dim1 as i32
-        );
-        unsafe { builder.launch(cfg) }.w()?;
-        return Ok((
-            CudaStorage::wrap_cuda_slice(out, dev.clone()),
-            (batch, topk, n).into(),
-        ));
-    }
-
     // Quantize input into q8_1.
     let total_rows = batch * input_dim1;
     let k_padded = pad(k, MATRIX_ROW_PADDING);
-    // Get Q8_1 metadata.
     let q8_1_block_size = GgmlDType::Q8_1.block_size();
     let q8_1_type_size = GgmlDType::Q8_1.type_size();
 
-    // Calculate the size of the output buffer in bytes.
     let num_blocks_per_row = k_padded / q8_1_block_size;
     let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
@@ -847,6 +802,12 @@ fn indexed_moe_forward_dispatch(
     let out = unsafe { dev.alloc::<f32>(outsize)? };
 
     let kernel_name = match w_dtype {
+        GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_q8_1",
+        GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_q8_1",
+        GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_q8_1",
+        GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1",
+        GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_q8_1",
+        GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_q8_1",
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
         GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
         GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
@@ -912,40 +873,13 @@ impl QCudaStorage {
         let input_view = contiguous_view(input_storage, input_l, "input")?;
         let ids_storage = ids.as_cuda_slice::<u32>()?;
         let ids_view = contiguous_view(ids_storage, ids_l, "ids")?;
-        if matches!(
-            dtype,
-            GgmlDType::IQ2S
-                | GgmlDType::IQ2XS
-                | GgmlDType::IQ2XXS
-                | GgmlDType::IQ3S
-                | GgmlDType::IQ3XXS
-                | GgmlDType::IQ4XS
-        ) {
-            // Two launches beat dual-register pressure on RTX 3060 for current
-            // 2048x512 experts. Input stays F32; neither path allocates Q8_1.
-            let first = indexed_moe_forward_dispatch(
-                &self.data.inner.slice(0..),
-                self_shape,
-                dtype,
-                &input_view,
-                input_l.shape(),
-                &ids_view,
-                ids_l.shape(),
-                &self.device,
-            )?;
-            let second = indexed_moe_forward_dispatch(
-                &other.data.inner.slice(0..),
-                self_shape,
-                dtype,
-                &input_view,
-                input_l.shape(),
-                &ids_view,
-                ids_l.shape(),
-                &self.device,
-            )?;
-            return Ok((first.0, second.0, first.1));
-        }
         let kernel_name = match dtype {
+            GgmlDType::IQ2XXS => "indexed_moe_forward_dual_iq2_xxs_q8_1",
+            GgmlDType::IQ2XS => "indexed_moe_forward_dual_iq2_xs_q8_1",
+            GgmlDType::IQ2S => "indexed_moe_forward_dual_iq2_s_q8_1",
+            GgmlDType::IQ3XXS => "indexed_moe_forward_dual_iq3_xxs_q8_1",
+            GgmlDType::IQ3S => "indexed_moe_forward_dual_iq3_s_q8_1",
+            GgmlDType::IQ4XS => "indexed_moe_forward_dual_iq4_xs_q8_1",
             GgmlDType::Q8_0 => "indexed_moe_forward_dual_q8_0_q8_1",
             GgmlDType::Q2K => "indexed_moe_forward_dual_q2k_q8_1",
             GgmlDType::Q4K => "indexed_moe_forward_dual_q4k_q8_1",
@@ -1334,18 +1268,6 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        // IQ-types have no MMQ/DMMV kernels yet — always use dequantize + cuBLAS fallback.
-        if matches!(
-            self.dtype,
-            GgmlDType::IQ3XXS
-                | GgmlDType::IQ2S
-                | GgmlDType::IQ3S
-                | GgmlDType::IQ2XS
-                | GgmlDType::IQ2XXS
-                | GgmlDType::IQ4XS
-        ) {
-            return self.dequantize_matmul(self_shape, storage, layout);
-        }
         // Optimized MMVQ and MMQ paths (support most paths: BF16/F16/F32, batch 1-8, all quant types, reuses per-device workspace).
         if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
@@ -1443,7 +1365,7 @@ impl QCudaStorage {
                 | GgmlDType::IQ2XXS
                 | GgmlDType::IQ4XS
         );
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) || iq_type {
+        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             if iq_type && dequant_cache_enabled() {
                 use crate::backend::BackendStorage;
                 let w = self.cached_dequant_f32(nrows * ncols)?;
