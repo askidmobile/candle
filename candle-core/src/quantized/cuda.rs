@@ -567,6 +567,8 @@ impl QCudaStorage {
         unsafe { builder.launch(cfg) }.w()?;
         Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
     }
+}
+
 impl QCudaStorage {
     /// Pre-quantize f32 activations to Q8_1 for reuse across multiple QMatMul operations.
     pub fn prequantize_q8_1(
@@ -593,6 +595,7 @@ fn mul_mat_vec_via_q8_1(
     b_size: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    let data_elems = data.len / dtype.type_size() * dtype.block_size();
     if data_elems < ncols * nrows {
         crate::bail!("unexpected data size {}, ncols {ncols} {nrows}", data_elems)
     }
