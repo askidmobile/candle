@@ -1302,7 +1302,8 @@ impl CudaStorage {
     ) -> Result<CudaStorage> {
         let el_count = lhs_l.shape().elem_count();
         let dev = self.device();
-        let kname = match self.dtype {
+        let dt = self.dtype();
+        let kname = match dt {
             DType::F32 => "bsilu_mul_f32",
             DType::F16 => "bsilu_mul_f16",
             DType::BF16 => "bsilu_mul_bf16",
@@ -1311,7 +1312,7 @@ impl CudaStorage {
         let func = dev.get_or_load_func(kname, &kernels::BINARY)?;
         let cfg = LaunchConfig::for_num_elems(el_count as u32);
 
-        let slice = match self.dtype {
+        let slice = match dt {
             DType::F32 => {
                 let lhs = self.as_cuda_slice::<f32>()?.slice(lhs_l.start_offset()..);
                 let rhs = rhs.as_cuda_slice::<f32>()?.slice(rhs_l.start_offset()..);
@@ -1363,7 +1364,6 @@ impl CudaStorage {
         Ok(CudaStorage {
             slice,
             device: dev.clone(),
-            dtype: self.dtype,
         })
     }
 
