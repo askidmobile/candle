@@ -607,7 +607,9 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
     assert!(!exec.is_null(), "instantiate failed");
     unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
-    stream.synchronize()?;
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
     let y0 = y.to_vec1::<f32>()?;
     assert!(y0.iter().all(|&v| v == 2.0), "graph replay wrong: {:?}", &y0[..4]);
     unsafe {
