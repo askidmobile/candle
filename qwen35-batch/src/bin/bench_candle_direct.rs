@@ -20,8 +20,10 @@ fn main() -> Result<()> {
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let device = Device::Cpu;
 
-    // Модель загружается ОДИН раз на процесс (как в сервере).
-    let mut adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 4)?;
+    // Для моделей >8 GB (27B) на 12GB GPU используем 1 слот, чтобы уложиться в 11.26 GB физической VRAM
+    let is_large_model = text.contains("27B") || text.contains("35B");
+    let num_slots = if is_large_model { 1 } else { 4 };
+    let mut adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), num_slots)?;
 
     // Warmup
     {
@@ -97,8 +99,8 @@ fn main() -> Result<()> {
         scheduler.model_mut().reset_slot(0)?;
     }
 
-    // Decode B=4 (tg128 x 4)
-    {
+    // Decode B=4 (tg128 x 4) — только для моделей <= 9B (на 27B 4 слота превышают 12GB VRAM)
+    if !is_large_model {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(c) = &device {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);

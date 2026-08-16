@@ -6406,17 +6406,17 @@ impl ModelWeights {
         let cuda_dev = device
             .as_cuda_device()
             .map_err(|_| candle_core::Error::Msg("paged decode requires CUDA".into()))?;
-        let capacity_b = DECODE_BATCH_CAPACITY as usize;
-
         // 1. Собираем параметры слоёв внимания
         let mut model_attn_window: Option<usize> = None;
         let mut dims: Option<(usize, usize)> = None; // (n_kv, hd)
         let mut num_attn_layers = 0usize;
+        let mut capacity_b = DECODE_BATCH_CAPACITY as usize;
         for block in self.blocks.iter() {
             if let HybridLayerType::Attention(a) = &block.layer {
                 model_attn_window = Some(a.attn_window);
                 dims = Some((a.n_kv_head, a.head_dim));
                 num_attn_layers += 1;
+                capacity_b = a.kv_cache_batched.len().min(capacity_b);
             }
         }
         let model_attn_window = model_attn_window
