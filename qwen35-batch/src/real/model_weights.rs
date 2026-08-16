@@ -3845,8 +3845,20 @@ impl HybridBlock {
         let normed = self.attn_norm.forward(x)?;
 
         let layer_out = match &mut self.layer {
-            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed, slots)?,
-            HybridLayerType::Attention(attn) => attn.forward_attn_decode_paged(&normed, ctx)?,
+            HybridLayerType::DeltaNet(delta) => {
+                if std::env::var("QWEN36_GRAPH_SKIP_DELTA").as_deref() == Ok("1") {
+                    normed.clone()
+                } else {
+                    delta.forward_decode_batch(&normed, slots)?
+                }
+            }
+            HybridLayerType::Attention(attn) => {
+                if std::env::var("QWEN36_GRAPH_SKIP_ATTN").as_deref() == Ok("1") {
+                    normed.clone()
+                } else {
+                    attn.forward_attn_decode_paged(&normed, ctx)?
+                }
+            }
         };
         let x = (layer_out + residual)?;
 
