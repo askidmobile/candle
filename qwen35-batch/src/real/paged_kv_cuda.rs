@@ -45,11 +45,26 @@ fn tensor_cuda_ptr(t: &Tensor) -> Result<u64> {
     if !layout.is_contiguous() {
         candle_core::bail!("tensor is not contiguous");
     }
-    let slice = cuda.as_cuda_slice::<u8>()?;
-    let stream = slice.stream();
-    let slice = slice.slice(layout.start_offset()..);
-    let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(&slice, stream);
-    Ok(ptr)
+    macro_rules! ptr_of {
+        ($ty:ty) => {{
+            let slice = cuda.as_cuda_slice::<$ty>()?;
+            let stream = slice.stream();
+            let slice = slice.slice(layout.start_offset()..);
+            let (ptr, _guard) = cudarc::driver::DevicePtr::device_ptr(&slice, stream);
+            ptr
+        }};
+    }
+    Ok(match t.dtype() {
+        DType::U8 => ptr_of!(u8),
+        DType::U32 => ptr_of!(u32),
+        DType::I32 => ptr_of!(i32),
+        DType::I64 => ptr_of!(i64),
+        DType::F16 => ptr_of!(half::f16),
+        DType::BF16 => ptr_of!(half::bf16),
+        DType::F32 => ptr_of!(f32),
+        DType::F64 => ptr_of!(f64),
+        d => candle_core::bail!("tensor_cuda_ptr: unsupported dtype {:?}", d),
+    })
 }
 
 impl PagedModelCtx {
