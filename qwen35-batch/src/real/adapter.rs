@@ -923,7 +923,7 @@ impl Qwen35BatchAdapter {
                     .forward_decode_batch_graphed(&ids_eager, slots)
                     .map_err(|e| anyhow!("graphed forward (capture): {e}"))?;
                 let graph = stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_UPLOAD)
                     .map_err(|e| anyhow!("end_capture: {e}"))?
                     .ok_or_else(|| anyhow!("end_capture returned no graph"))?;
                 Ok(DecodeGraphState {
