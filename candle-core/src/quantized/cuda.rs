@@ -839,6 +839,23 @@ fn indexed_moe_forward_dispatch(
         ));
     }
 
+    // Quantize input into q8_1.
+    let total_rows = batch * input_dim1;
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    let q8_1_block_size = GgmlDType::Q8_1.block_size();
+    let q8_1_type_size = GgmlDType::Q8_1.type_size();
+
+    let num_blocks_per_row = k_padded / q8_1_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
+    let y_size_in_bytes = total_rows * dst_row_size_bytes;
+    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+
+    quantize_q8_1(input, &mut input_quant, k, total_rows, dev)?;
+
+    // output buffer
+    let outsize = batch * topk * n;
+    let out = unsafe { dev.alloc::<f32>(outsize)? };
+
     let kernel_name = match w_dtype {
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
         GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
