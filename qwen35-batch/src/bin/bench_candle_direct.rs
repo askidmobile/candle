@@ -38,14 +38,22 @@ fn main() -> Result<()> {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
         }
         let prompt = vec![9707u32; p_len];
+        let chunk_size = 512usize;
         let t0 = Instant::now();
-        let _ = adapter.prefill_chunk(&qwen35_batch::model::PrefillChunk {
-            slot_idx: 0,
-            reset_first: true,
-            tokens: prompt,
-            start_pos: 0,
-            is_final: true,
-        })?;
+        let mut pos = 0usize;
+        while pos < p_len {
+            let next_pos = (pos + chunk_size).min(p_len);
+            let chunk_tokens = prompt[pos..next_pos].to_vec();
+            let is_final = next_pos == p_len;
+            let _ = adapter.prefill_chunk(&qwen35_batch::model::PrefillChunk {
+                slot_idx: 0,
+                reset_first: pos == 0,
+                tokens: chunk_tokens,
+                start_pos: pos,
+                is_final,
+            })?;
+            pos = next_pos;
+        }
         device.synchronize()?;
         let el = t0.elapsed().as_secs_f64();
         let tps = p_len as f64 / el;
