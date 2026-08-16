@@ -63,7 +63,10 @@ fn slice_position_plan(plan: &PositionPlan, start: usize, len: usize) -> Result<
 /// CUDA-graph replay состояние для decode-шага.
 #[cfg(feature = "cuda")]
 struct DecodeGraphState {
-    graph: cudarc::driver::CudaGraph,
+    /// Raw handles: cudarc CudaGraph wrapper требует flags-enum без валидного 0.
+    exec: cudarc::driver::sys::CUgraphExec,
+    cu_graph: cudarc::driver::sys::CUgraph,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
     b: usize,
     slots: Vec<u32>,
     /// Persistent входы: [B, 1] U32 токены (htod до launch).
@@ -71,6 +74,29 @@ struct DecodeGraphState {
     /// Alias захваченных выходов (graph-pool память).
     logits_t: Tensor,
     hidden_t: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl DecodeGraphState {
+    fn launch(&self) -> Result<()> {
+        let res = unsafe {
+            cudarc::driver::sys::cuGraphLaunch(self.exec, self.stream.cu_stream())
+        };
+        if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(anyhow!("cuGraphLaunch failed: {res:?}"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DecodeGraphState {
+    fn drop(&mut self) {
+        unsafe {
+            cudarc::driver::sys::cuGraphExecDestroy(self.exec);
+            cudarc::driver::sys::cuGraphDestroy(self.cu_graph);
+        }
+    }
 }
 
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
@@ -914,22 +940,41 @@ impl Qwen35BatchAdapter {
             let out: Vec<Vec<f32>> = flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect();
             // Capture для следующих шагов (захват не исполняет ядра).
             let stream = cuda_dev.cuda_stream();
-            stream
-                .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-                .map_err(|e| anyhow!("begin_capture: {e}"))?;
             let capture_result = (|| -> Result<DecodeGraphState> {
-                let (logits_t, hidden_t) = self
+                use cudarc::driver::{result as cres, sys as csys};
+                unsafe {
+                    cres::stream::begin_capture(
+                        stream.cu_stream(),
+                        csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+                    )
+                }
+                .map_err(|e| anyhow!("begin_capture: {e}"))?;
+                let forward_result = self
                     .model
-                    .forward_decode_batch_graphed(&ids_eager, slots)
-                    .map_err(|e| anyhow!("graphed forward (capture): {e}"))?;
-                let graph = stream
-                    // flags=0: AUTO_FREE_ON_LAUNCH освобождает graph pool при
-                    // первом launch (illegal address); UPLOAD невалиден на этом драйвере.
-                    .end_capture(unsafe { std::mem::transmute::<u32, cudarc::driver::sys::CUgraphInstantiate_flags>(0) })
-                    .map_err(|e| anyhow!("end_capture: {e}"))?
-                    .ok_or_else(|| anyhow!("end_capture returned no graph"))?;
+                    .forward_decode_batch_graphed(&ids_eager, slots);
+                let (logits_t, hidden_t) = match forward_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Обязательно завершаем захват, иначе stream остаётся в capture mode.
+                        let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                        return Err(anyhow!("graphed forward (capture): {e}"));
+                    }
+                };
+                let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+                    .map_err(|e| anyhow!("end_capture: {e}"))?;
+                if cu_graph.is_null() {
+                    return Err(anyhow!("end_capture returned null graph"));
+                }
+                let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+                let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+                if res != csys::CUresult::CUDA_SUCCESS || exec.is_null() {
+                    unsafe { csys::cuGraphDestroy(cu_graph) };
+                    return Err(anyhow!("graph instantiate failed: {res:?}"));
+                }
                 Ok(DecodeGraphState {
-                    graph,
+                    exec,
+                    cu_graph,
+                    stream: stream.clone(),
                     b,
                     slots: slots.to_vec(),
                     ids_t: ids_eager.clone(),
@@ -965,7 +1010,7 @@ impl Qwen35BatchAdapter {
         let ids_staging =
             Tensor::from_vec(tokens.to_vec(), (b, 1usize), &Device::Cpu)?.to_device(&self.device)?;
         state.ids_t.slice_set(&ids_staging, 0, 0)?;
-        state.graph.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
+        state.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();
             for &s in slots {
