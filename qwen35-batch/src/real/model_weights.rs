@@ -6332,11 +6332,15 @@ impl ModelWeights {
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             if crate::scheduler::trace_on() {
+                use std::io::Write;
                 eprintln!("[graphed-step] block {bi} start");
+                let _ = std::io::stderr().flush();
             }
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots)?;
             if crate::scheduler::trace_on() {
+                use std::io::Write;
                 eprintln!("[graphed-step] block {bi} end");
+                let _ = std::io::stderr().flush();
             }
         }
         // Инкремент kv_len — после ВСЕХ attention слоёв.
