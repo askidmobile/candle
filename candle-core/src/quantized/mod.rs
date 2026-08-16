@@ -1283,6 +1283,72 @@ impl QMatMul {
     }
 }
 
+pub enum Q8_1Activation {
+    #[cfg(feature = "cuda")]
+    Cuda {
+        slice: cudarc::driver::CudaSlice<u8>,
+        ncols: usize,
+        b_size: usize,
+    },
+}
+
+impl QTensor {
+    #[cfg(feature = "cuda")]
+    pub fn prequantize_q8_1(x: &Tensor) -> Result<Option<Q8_1Activation>> {
+        let (b_size, k) = match x.dims() {
+            [b, m, k] => (b * m, *k),
+            [b, k] => (*b, *k),
+            _ => return Ok(None),
+        };
+        if b_size == 0 || b_size > 8 {
+            return Ok(None);
+        }
+        let (storage, layout) = x.storage_and_layout();
+        if !layout.is_contiguous() {
+            return Ok(None);
+        }
+        if let Storage::Cuda(c) = &*storage {
+            let slice = c.as_cuda_slice::<f32>()?;
+            let view = slice.slice(layout.start_offset()..layout.start_offset() + b_size * k);
+            let q8_1_buf = cuda::QCudaStorage::prequantize_q8_1(c.device(), &view, k, b_size)?;
+            return Ok(Some(Q8_1Activation::Cuda {
+                slice: q8_1_buf,
+                ncols: k,
+                b_size,
+            }));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn forward_with_prequant(&self, x: &Tensor, prequant: Option<&Q8_1Activation>) -> Result<Tensor> {
+        if let Some(Q8_1Activation::Cuda { slice, ncols, b_size }) = prequant {
+            if let QStorage::Cuda(c) = &self.storage {
+                if !matches!(
+                    c.dtype(),
+                    GgmlDType::IQ3XXS
+                        | GgmlDType::IQ2S
+                        | GgmlDType::IQ3S
+                        | GgmlDType::IQ2XS
+                        | GgmlDType::IQ2XXS
+                        | GgmlDType::IQ4XS
+                ) {
+                    let (n, k) = self.shape.dims2()?;
+                    if *ncols == k {
+                        let out = c.mul_mat_vec_with_prequant_q8_1(&self.shape, slice, *ncols, n, *b_size)?;
+                        let mut out_shape = x.dims().to_vec();
+                        out_shape.pop();
+                        out_shape.push(n);
+                        let none = crate::op::BackpropOp::none();
+                        return Ok(from_storage(Storage::Cuda(out), out_shape, none, false));
+                    }
+                }
+            }
+        }
+        x.apply_op1_no_bwd(self)
+    }
+}
+
 impl crate::CustomOp1 for QTensor {
     fn name(&self) -> &'static str {
         "qmatmul"
@@ -1401,6 +1467,18 @@ impl crate::CustomOp1 for QTensor {
             _ => unreachable!("Cannot call cuda matmul on non cuda QTensor"),
         };
         self_storage.fwd(&self.shape, storage, layout)
+    }
+}
+
+impl QMatMul {
+    #[allow(unused_variables)]
+    pub fn forward_with_prequant(&self, xs: &Tensor, prequant: Option<&Q8_1Activation>) -> Result<Tensor> {
+        use crate::Module;
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::QTensor(t) => t.forward_with_prequant(xs, prequant),
+            _ => self.forward(xs),
+        }
     }
 }
 

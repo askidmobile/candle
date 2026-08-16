@@ -503,15 +503,88 @@ fn dequantize_mul_mat_vec(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+impl QCudaStorage {
+    /// Batch-vector matmul using pre-quantized Q8_1 activations.
+    /// `y_q8_1` is the pre-quantized [b_size, k_padded] buffer.
+    pub fn mul_mat_vec_with_prequant_q8_1(
+        &self,
+        self_shape: &crate::Shape,
+        y_q8_1: &CudaSlice<u8>,
+        ncols: usize,
+        nrows: usize,
+        b_size: usize,
+    ) -> Result<CudaStorage> {
+        let (n, k) = self_shape.dims2()?;
+        if n != nrows || k != ncols {
+            crate::bail!("shape mismatch in mul_mat_vec_with_prequant_q8_1: expected ({nrows}, {ncols}), got ({n}, {k})");
+        }
+        let data_elems = self.data.len / self.dtype.type_size() * self.dtype.block_size();
+        if data_elems < ncols * nrows {
+            crate::bail!("unexpected data size {}, ncols {ncols} {nrows}", data_elems)
+        }
+        let dev = self.device();
+        let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+
+        let kernel_name = match self.dtype {
+            GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
+            GgmlDType::Q4_1 => "mul_mat_vec_q4_1_q8_1_cuda",
+            GgmlDType::Q5_0 => "mul_mat_vec_q5_0_q8_1_cuda",
+            GgmlDType::Q5_1 => "mul_mat_vec_q5_1_q8_1_cuda",
+            GgmlDType::Q8_0 => "mul_mat_vec_q8_0_q8_1_cuda",
+            GgmlDType::Q2K => "mul_mat_vec_q2_K_q8_1_cuda",
+            GgmlDType::Q3K => "mul_mat_vec_q3_K_q8_1_cuda",
+            GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
+            GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
+            GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+            _ => crate::bail!("unsupported dtype for quantized matmul {:?}", self.dtype),
+        };
+        let kernel_name = format!("{kernel_name}{b_size}");
+        let func = dev.get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
+        let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+        let (nblocks, nwarps) = match b_size {
+            1 => (nrows as u32, 4),
+            2..=4 => ((nrows as u32).div_ceil(2), 4),
+            5..=8 => ((nrows as u32).div_ceil(2), 2),
+            _ => crate::bail!("unexpected bsize {b_size}"),
+        };
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (nblocks, 1, 1),
+            block_dim: (WARP_SIZE as u32, nwarps, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut builder = func.builder();
+        builder.arg(&self.data.inner);
+        builder.arg(y_q8_1);
+        builder.arg(&dst);
+        barg!(
+            builder,
+            /* ncols_x */ ncols as i32,
+            /* nrows_x */ nrows as i32,
+            /* nrows_y */ ncols_padded as i32,
+            /* nrows_dst */ nrows as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    }
+impl QCudaStorage {
+    /// Pre-quantize f32 activations to Q8_1 for reuse across multiple QMatMul operations.
+    pub fn prequantize_q8_1(
+        dev: &CudaDevice,
+        y: &CudaView<f32>,
+        ncols: usize,
+        b_size: usize,
+    ) -> Result<CudaSlice<u8>> {
+        let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+        let y_size_in_bytes =
+            b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+        let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+        quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
+        Ok(y_q8_1)
+    }
+}
+
 fn mul_mat_vec_via_q8_1(
-    data: &PaddedCudaSlice,
-    y: &CudaView<f32>,
-    dtype: GgmlDType,
-    ncols: usize,
-    nrows: usize,
-    b_size: usize,
-    dev: &CudaDevice,
-) -> Result<CudaStorage> {
     let data_elems = data.len / dtype.type_size() * dtype.block_size();
     if data_elems < ncols * nrows {
         crate::bail!("unexpected data size {}, ncols {ncols} {nrows}", data_elems)

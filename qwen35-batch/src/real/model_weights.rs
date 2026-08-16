@@ -1028,9 +1028,12 @@ impl Module for DenseMlp {
         #[cfg(target_os = "macos")]
         let w3 = dispatch_q4k_matmul(&self.feed_forward_w3, self.feed_forward_w3_opt.as_ref(), xs)?;
         #[cfg(not(target_os = "macos"))]
-        let w1 = self.feed_forward_w1.forward(xs)?;
-        #[cfg(not(target_os = "macos"))]
-        let w3 = self.feed_forward_w3.forward(xs)?;
+        let (w1, w3) = {
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs).ok().flatten();
+            let w1 = self.feed_forward_w1.forward_with_prequant(xs, prequant.as_ref())?;
+            let w3 = self.feed_forward_w3.forward_with_prequant(xs, prequant.as_ref())?;
+            (w1, w3)
+        };
         // T-275: fused silu_mul via direct MetalStorage path (один kernel вместо двух)
         let silu_mul = w1.silu_mul_direct(&w3)?;
         #[cfg(target_os = "macos")]
@@ -1848,13 +1851,14 @@ impl DeltaNetLayer {
         #[cfg(target_os = "macos")]
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
-        let qkv_t = self.wqkv.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let z_t = self.wgate.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let beta_t = self.w_beta.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let alpha_t = self.w_alpha.forward(x)?;
+        let (qkv_t, z_t, beta_t, alpha_t) = {
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x).ok().flatten();
+            let qkv_t = self.wqkv.forward_with_prequant(x, prequant.as_ref())?;
+            let z_t = self.wgate.forward_with_prequant(x, prequant.as_ref())?;
+            let beta_t = self.w_beta.forward_with_prequant(x, prequant.as_ref())?;
+            let alpha_t = self.w_alpha.forward_with_prequant(x, prequant.as_ref())?;
+            (qkv_t, z_t, beta_t, alpha_t)
+        };
 
         // ── Metal batched path: 4 batched kernel'а на GPU (slot ось B) ──
         #[cfg(target_os = "macos")]
@@ -3235,11 +3239,13 @@ impl GatedAttentionLayer {
         #[cfg(target_os = "macos")]
         let v = dispatch_q4k_matmul(&self.attention_wv, self.attention_wv_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
-        let qg = self.attention_wq.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let k = self.attention_wk.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let v = self.attention_wv.forward(x)?;
+        let (qg, k, v) = {
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x).ok().flatten();
+            let qg = self.attention_wq.forward_with_prequant(x, prequant.as_ref())?;
+            let k = self.attention_wk.forward_with_prequant(x, prequant.as_ref())?;
+            let v = self.attention_wv.forward_with_prequant(x, prequant.as_ref())?;
+            (qg, k, v)
+        };
 
         // 2. Reshape [B,1,n_head,head_dim*2] -> q [B,n_head,1,hd], gate [B,n_head,1,hd]
         let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
