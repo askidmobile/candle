@@ -6317,15 +6317,6 @@ impl ModelWeights {
             if crate::scheduler::trace_on() {
                 eprintln!("[graphed-step] block {bi} start");
             }
-            // Бисекция захвата: QWEN36_GRAPH_MAX_LAYERS=N обрезает слои (только для отладки,
-            // математика сломана — не для продакшена).
-            if let Ok(max_layers) = std::env::var("QWEN36_GRAPH_MAX_LAYERS") {
-                if let Ok(m) = max_layers.parse::<usize>() {
-                    if bi >= m {
-                        break;
-                    }
-                }
-            }
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots)?;
             if crate::scheduler::trace_on() {
                 eprintln!("[graphed-step] block {bi} end");
@@ -6454,17 +6445,45 @@ impl ModelWeights {
                 let pool = a.paged_pool.as_ref().ok_or_else(|| {
                     candle_core::Error::Msg("migrate: paged pool missing".into())
                 })?;
-                let pages = kv_len.div_ceil(ps);
-                for page in 0..pages {
-                    let start = page * ps;
-                    let n = (kv_len - start).min(ps);
-                    let phys = slot * mb + page;
-                    pool.k_pool
-                        .narrow(0, phys, 1)?
-                        .slice_set(&k.narrow(1, start, n)?, 1, start)?;
-                    pool.v_pool
-                        .narrow(0, phys, 1)?
-                        .slice_set(&v.narrow(1, start, n)?, 1, start)?;
+                let n_kv = a.n_kv_head;
+                let hd = a.head_dim;
+                let elem_per_token = n_kv * hd;
+
+                let (k_st, k_l) = k.storage_and_layout();
+                let (v_st, v_l) = v.storage_and_layout();
+                let (kp_st, _) = pool.k_pool.storage_and_layout();
+                let (vp_st, _) = pool.v_pool.storage_and_layout();
+
+                if let (
+                    candle_core::Storage::Cuda(kc),
+                    candle_core::Storage::Cuda(vc),
+                    candle_core::Storage::Cuda(kpc),
+                    candle_core::Storage::Cuda(vpc),
+                ) = (&*k_st, &*v_st, &*kp_st, &*vp_st) {
+                    let k_src = kc.as_cuda_slice::<half::f16>()?;
+                    let v_src = vc.as_cuda_slice::<half::f16>()?;
+                    let mut kp_dst = kpc.as_cuda_slice::<half::f16>()?;
+                    let mut vp_dst = vpc.as_cuda_slice::<half::f16>()?;
+                    let stream = kc.device().cuda_stream();
+
+                    let pages = kv_len.div_ceil(ps);
+                    for page in 0..pages {
+                        let start = page * ps;
+                        let n = (kv_len - start).min(ps);
+                        let phys = slot * mb + page;
+
+                        let src_start = k_l.start_offset() + start * elem_per_token;
+                        let dst_start = (phys * ps) * elem_per_token;
+                        let count = n * elem_per_token;
+
+                        let src_k_view = k_src.slice(src_start..src_start + count);
+                        let mut dst_k_view = kp_dst.slice_mut(dst_start..dst_start + count);
+                        stream.memcpy_dtod(&src_k_view, &mut dst_k_view).map_err(candle_core::Error::wrap)?;
+
+                        let src_v_view = v_src.slice(src_start..src_start + count);
+                        let mut dst_v_view = vp_dst.slice_mut(dst_start..dst_start + count);
+                        stream.memcpy_dtod(&src_v_view, &mut dst_v_view).map_err(candle_core::Error::wrap)?;
+                    }
                 }
             }
         }
