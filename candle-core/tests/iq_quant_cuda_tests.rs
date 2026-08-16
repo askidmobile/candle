@@ -618,3 +618,60 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     }
     Ok(())
 }
+
+/// То же, но с PTX quantized ядром + cuBLAS matmul внутри захвата.
+#[test]
+fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
+    use candle_core::cuda_backend::cudarc;
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    let device = Device::new_cuda(0)?;
+    let cuda_dev = device.as_cuda_device()?;
+    let stream = cuda_dev.cuda_stream();
+
+    let k = 256usize;
+    let n = 128usize;
+    let w = Tensor::randn(0f32, 1.0, (n, k), &Device::Cpu)?;
+    let qt = QTensor::quantize(&w, GgmlDType::Q4_K)?.to_device(&device)?;
+    let mm = QMatMul::from_qtensor(qt)?;
+    let x = Tensor::randn(0f32, 1.0, (1, 1, k), &device)?;
+
+    // Prime всех ядер вне захвата.
+    let _ = mm.forward(&x)?;
+    let _ = x.matmul(&x.transpose(1, 2)?)?;
+
+    use cudarc::driver::{result as cres, sys as csys};
+    unsafe {
+        cres::stream::begin_capture(
+            stream.cu_stream(),
+            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    let y = mm.forward(&x)?;
+    let z = x.matmul(&x.transpose(1, 2)?)?;
+    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?;
+    assert!(!cu_graph.is_null());
+    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+    let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "instantiate: {res:?}");
+    assert!(!exec.is_null());
+    let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    assert_eq!(
+        res,
+        csys::CUresult::CUDA_SUCCESS,
+        "cuGraphLaunch failed: {res:?}"
+    );
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+    let y0 = y.flatten_all()?.to_vec1::<f32>()?;
+    assert!(y0.iter().all(|v| v.is_finite()));
+    let z0 = z.flatten_all()?.to_vec1::<f32>()?;
+    assert!(z0.iter().all(|v| v.is_finite()));
+    unsafe {
+        csys::cuGraphExecDestroy(exec);
+        csys::cuGraphDestroy(cu_graph);
+    }
+    Ok(())
+}
