@@ -31,9 +31,14 @@ fn model_dir() -> PathBuf {
     std::env::var("YTTRI_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(
-                "/Volumes/Askid Dev/Projects/Yttri/frontend/src-tauri/resources/models/qwen3.5-4b",
-            )
+            let win_path = PathBuf::from("D:\\Models\\lmstudio-community\\Qwen3.5-4B-GGUF");
+            if win_path.exists() {
+                win_path
+            } else {
+                PathBuf::from(
+                    "/Volumes/Askid Dev/Projects/Yttri/frontend/src-tauri/resources/models/qwen3.5-4b",
+                )
+            }
         })
 }
 
