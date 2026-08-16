@@ -3839,6 +3839,11 @@ impl HybridBlock {
         Ok(x)
     }
 
+    /// Устройство, на котором размещены веса этого блока (CUDA или CPU).
+    pub fn device(&self) -> Device {
+        self.attn_norm.weight().device().clone()
+    }
+
     /// Является ли этот блок DeltaNet слоем?
     fn is_deltanet(&self) -> bool {
         matches!(self.layer, HybridLayerType::DeltaNet(_))
@@ -4015,8 +4020,26 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let data: &[u8] = &mmap;
+        let max_gpu_layers: usize = std::env::var("QWEN36_GPU_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
         let load_heavy = |name: &str| -> Result<candle_core::quantized::QTensor> {
-            tensor_from_data(&ct, data, name, device)
+            // Если тензор принадлежит блоку `blk.N.*` и N >= max_gpu_layers,
+            // загружаем его на CPU для предотвращения WDDM paging на 27B+.
+            let target_device = if let Some(blk_idx) = name.strip_prefix("blk.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|num| num.parse::<usize>().ok())
+            {
+                if blk_idx >= max_gpu_layers {
+                    &Device::Cpu
+                } else {
+                    device
+                }
+            } else {
+                device
+            };
+            tensor_from_data(&ct, data, name, target_device)
         };
         Self::build_model_common(&ct, data, &mmap, device, "Qwen3.5", load_heavy)
     }
@@ -6059,6 +6082,10 @@ impl ModelWeights {
                 let mut a_ms = 0f64;
                 for (bi, block) in self.blocks.iter_mut().enumerate() {
                     let t0 = std::time::Instant::now();
+                    let block_dev = block.device();
+                    if !layer_in.device().same_device(&block_dev) {
+                        layer_in = layer_in.to_device(&block_dev)?;
+                    }
                     layer_in = block.forward_prefill(&layer_in, index_pos)?;
                     if trace {
                         let el = t0.elapsed().as_secs_f64() * 1000.0;
@@ -6084,6 +6111,10 @@ impl ModelWeights {
         } else {
             // Оптимальный путь: single token (авторегрессивная генерация)
             for block in self.blocks.iter_mut() {
+                let block_dev = block.device();
+                if !layer_in.device().same_device(&block_dev) {
+                    layer_in = layer_in.to_device(&block_dev)?;
+                }
                 layer_in = block.forward(&layer_in, index_pos)?;
             }
         }
@@ -6276,6 +6307,10 @@ impl ModelWeights {
         let mut t_delta = std::time::Duration::ZERO;
         let mut t_attn = std::time::Duration::ZERO;
         for (bi, block) in self.blocks.iter_mut().enumerate() {
+            let block_dev = block.device();
+            if !layer_in.device().same_device(&block_dev) {
+                layer_in = layer_in.to_device(&block_dev)?;
+            }
             if trace {
                 let is_delta = matches!(block.layer, HybridLayerType::DeltaNet(_));
                 let t0 = std::time::Instant::now();
