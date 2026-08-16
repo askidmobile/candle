@@ -6327,44 +6327,75 @@ impl ModelWeights {
         if self.paged_ready {
             return Ok(());
         }
-        eprintln!("[graphs-debug] init_paged_decode start");
         let cuda_dev = device
             .as_cuda_device()
             .map_err(|_| candle_core::Error::Msg("paged decode requires CUDA".into()))?;
-        // Окно графа: по умолчанию 2048 для экономии VRAM (для 4B можно поднять через QWEN36_GRAPH_WINDOW=8192).
-        let graph_window: usize = std::env::var("QWEN36_GRAPH_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
         let capacity_b = DECODE_BATCH_CAPACITY as usize;
-        let mut window: Option<usize> = None;
+
+        // 1. Собираем параметры слоёв внимания
+        let mut model_attn_window: Option<usize> = None;
         let mut dims: Option<(usize, usize)> = None; // (n_kv, hd)
+        let mut num_attn_layers = 0usize;
         for block in self.blocks.iter() {
             if let HybridLayerType::Attention(a) = &block.layer {
-                window = Some(a.attn_window.min(graph_window));
+                model_attn_window = Some(a.attn_window);
                 dims = Some((a.n_kv_head, a.head_dim));
+                num_attn_layers += 1;
             }
         }
-        let window = window.ok_or_else(|| candle_core::Error::Msg("no attention layers".into()))?;
+        let model_attn_window = model_attn_window
+            .ok_or_else(|| candle_core::Error::Msg("no attention layers found in model".into()))?;
         let (n_kv, hd) = dims.unwrap();
-        let max_blocks = window.div_ceil(crate::real::paged_kv_cuda::PAGE_SIZE);
+
+        // 2. Автоматический расчет окна на основе доступной свободной памяти VRAM
+        let (free_vram, _total_vram) = cuda_dev
+            .context
+            .mem_get_info()
+            .map_err(|e| candle_core::Error::Msg(format!("cuMemGetInfo failed: {e}")))?;
+
+        // Размер 1 токена (K+V в F16) для всех слоёв внимания и всех B слотов
+        let bytes_per_token_all_layers = num_attn_layers * capacity_b * (2 * n_kv * hd * 2);
+        // Резервируем 1.5 ГБ на рабочие буферы активаций и драйвера
+        let reserved_headroom = 1536 * 1024 * 1024;
+        let vram_for_paged_kv = free_vram.saturating_sub(reserved_headroom);
+        let max_tokens_by_vram = if bytes_per_token_all_layers > 0 {
+            vram_for_paged_kv / bytes_per_token_all_layers
+        } else {
+            2048
+        };
+
+        // Базовое окно: минимум из ограничения модели, доступной VRAM и потолка 32K (кратно PAGE_SIZE=64)
+        let auto_window = max_tokens_by_vram
+            .min(model_attn_window)
+            .min(32768)
+            .max(512); // минимум 512 токенов
+        let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
+        let auto_window_aligned = (auto_window / ps) * ps;
+
+        // Ручной оверрайд через QWEN36_GRAPH_WINDOW остаётся доступен только при явном указании
+        let window = std::env::var("QWEN36_GRAPH_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(auto_window_aligned);
+
+        let max_blocks = window.div_ceil(ps);
         let num_blocks = capacity_b * max_blocks;
-        eprintln!("[graphs-debug] init ctx: num_blocks={num_blocks}, n_kv={n_kv}, hd={hd}");
+        let pool_vram_mb = (num_blocks * ps * num_attn_layers * 2 * n_kv * hd * 2) / (1024 * 1024);
+        log::info!(
+            "[qwen35-batch] auto paged decode: window={window} (max_blocks={max_blocks}, pool_vram={pool_vram_mb}MB, free_vram={:.0}MB)",
+            free_vram as f64 / (1024.0 * 1024.0)
+        );
+
         let ctx = crate::real::paged_kv_cuda::PagedModelCtx::new(cuda_dev, capacity_b, max_blocks)?;
         self.paged_ctx = Some(ctx);
-        for (i, block) in self.blocks.iter_mut().enumerate() {
+        for block in self.blocks.iter_mut() {
             if let HybridLayerType::Attention(a) = &mut block.layer {
-                eprintln!("[graphs-debug] init block {i} paged pool");
                 a.paged_pool = Some(crate::real::paged_kv_cuda::PagedKvPool::new(
                     device, num_blocks, n_kv, hd,
                 )?);
             }
         }
         self.paged_ready = true;
-        eprintln!("[graphs-debug] init_paged_decode done");
-        log::info!(
-            "[qwen35-batch] paged decode: window={window} pages/slot={max_blocks} blocks={num_blocks}"
-        );
         Ok(())
     }
 
