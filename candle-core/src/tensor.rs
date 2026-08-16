@@ -677,6 +677,27 @@ impl Tensor {
                 }
             }
         }
+        #[cfg(feature = "cuda")]
+        {
+            let lhs_l = self.layout();
+            let rhs_l = rhs.layout();
+            if lhs_l.is_contiguous() && rhs_l.is_contiguous() && self.dtype() == rhs.dtype() {
+                let lhs_storage = self.storage();
+                let rhs_storage = rhs.storage();
+                if let (Storage::Cuda(lhs_c), Storage::Cuda(rhs_c)) =
+                    (&*lhs_storage, &*rhs_storage)
+                {
+                    let out = lhs_c.silu_mul_cuda_direct(rhs_c, lhs_l, rhs_l)?;
+                    let none = crate::op::BackpropOp::none();
+                    return Ok(from_storage(
+                        Storage::Cuda(out),
+                        shape.clone(),
+                        none,
+                        false,
+                    ));
+                }
+            }
+        }
         // Fallback: CPU path or non-contiguous Metal
         self.silu()? * rhs
     }

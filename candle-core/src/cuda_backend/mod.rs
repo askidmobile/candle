@@ -1294,6 +1294,79 @@ cuda_dtype!(f64, F64);
 cuda_dtype!(float8::F8E4M3, F8E4M3);
 
 impl CudaStorage {
+    pub fn silu_mul_cuda_direct(
+        &self,
+        rhs: &CudaStorage,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<CudaStorage> {
+        let el_count = lhs_l.shape().elem_count();
+        let dev = self.device();
+        let kname = match self.dtype {
+            DType::F32 => "bsilu_mul_f32",
+            DType::F16 => "bsilu_mul_f16",
+            DType::BF16 => "bsilu_mul_bf16",
+            d => crate::bail!("silu_mul_cuda_direct: unsupported dtype {:?}", d),
+        };
+        let func = dev.get_or_load_func(kname, &kernels::BINARY)?;
+        let cfg = LaunchConfig::for_num_elems(el_count as u32);
+
+        let slice = match self.dtype {
+            DType::F32 => {
+                let lhs = self.as_cuda_slice::<f32>()?.slice(lhs_l.start_offset()..);
+                let rhs = rhs.as_cuda_slice::<f32>()?.slice(rhs_l.start_offset()..);
+                let out = unsafe { dev.alloc::<f32>(el_count)? };
+                let mut builder = func.builder();
+                barg!(builder, el_count);
+                barg!(builder, 0usize);
+                let null_info: usize = 0;
+                barg!(builder, null_info);
+                builder.arg(&lhs);
+                builder.arg(&rhs);
+                builder.arg(&out);
+                unsafe { builder.launch(cfg) }.w()?;
+                CudaStorageSlice::F32(out)
+            }
+            DType::F16 => {
+                let lhs = self.as_cuda_slice::<f16>()?.slice(lhs_l.start_offset()..);
+                let rhs = rhs.as_cuda_slice::<f16>()?.slice(rhs_l.start_offset()..);
+                let out = unsafe { dev.alloc::<f16>(el_count)? };
+                let mut builder = func.builder();
+                barg!(builder, el_count);
+                barg!(builder, 0usize);
+                let null_info: usize = 0;
+                barg!(builder, null_info);
+                builder.arg(&lhs);
+                builder.arg(&rhs);
+                builder.arg(&out);
+                unsafe { builder.launch(cfg) }.w()?;
+                CudaStorageSlice::F16(out)
+            }
+            DType::BF16 => {
+                let lhs = self.as_cuda_slice::<bf16>()?.slice(lhs_l.start_offset()..);
+                let rhs = rhs.as_cuda_slice::<bf16>()?.slice(rhs_l.start_offset()..);
+                let out = unsafe { dev.alloc::<bf16>(el_count)? };
+                let mut builder = func.builder();
+                barg!(builder, el_count);
+                barg!(builder, 0usize);
+                let null_info: usize = 0;
+                barg!(builder, null_info);
+                builder.arg(&lhs);
+                builder.arg(&rhs);
+                builder.arg(&out);
+                unsafe { builder.launch(cfg) }.w()?;
+                CudaStorageSlice::BF16(out)
+            }
+            _ => unreachable!(),
+        };
+
+        Ok(CudaStorage {
+            slice,
+            device: dev.clone(),
+            dtype: self.dtype,
+        })
+    }
+}
     pub fn wrap_cuda_slice<T: CudaDType>(slice: CudaSlice<T>, device: CudaDevice) -> CudaStorage {
         T::wrap_cuda_slice(slice, device)
     }

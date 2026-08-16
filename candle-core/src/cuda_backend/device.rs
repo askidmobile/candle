@@ -53,6 +53,7 @@ impl Drop for CudaGraphHtodCacheGuard {
 
 pub struct ModuleStore {
     mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
+    func_cache: std::collections::HashMap<(usize, String), cudarc::driver::CudaFunction>,
 }
 
 #[derive(Clone)]
@@ -360,10 +361,20 @@ impl CudaDevice {
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
         let ms = self.modules.read().unwrap();
-        if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
-            let func = mdl.load_function(fn_name).map_err(|e| {
+        let key = (mdl.index(), fn_name.to_string());
+        if let Some(func) = ms.func_cache.get(&key) {
+            return Ok(CudaFunc {
+                func: func.clone(),
+                stream: self.stream.clone(),
+            });
+        }
+        if let Some(cuda_module) = ms.mdls[mdl.index()].as_ref() {
+            let func = cuda_module.load_function(fn_name).map_err(|e| {
                 crate::Error::Msg(format!("failed to load function '{fn_name}' from loaded module: {e}"))
             })?;
+            drop(ms);
+            let mut ms_w = self.modules.write().unwrap();
+            ms_w.func_cache.insert(key, func.clone());
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
@@ -371,13 +382,25 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).map_err(|e| {
-            crate::Error::Msg(format!("failed to load PTX module: {e}"))
-        })?;
-        ms.mdls[mdl.index()] = Some(cuda_module.clone());
+        if let Some(func) = ms.func_cache.get(&key) {
+            return Ok(CudaFunc {
+                func: func.clone(),
+                stream: self.stream.clone(),
+            });
+        }
+        let cuda_module = if let Some(cuda_module) = ms.mdls[mdl.index()].as_ref() {
+            cuda_module.clone()
+        } else {
+            let cuda_module = self.context.load_module(mdl.ptx().into()).map_err(|e| {
+                crate::Error::Msg(format!("failed to load PTX module: {e}"))
+            })?;
+            ms.mdls[mdl.index()] = Some(cuda_module.clone());
+            cuda_module
+        };
         let func = cuda_module.load_function(fn_name).map_err(|e| {
             crate::Error::Msg(format!("failed to load function '{fn_name}' from fresh module: {e}"))
         })?;
+        ms.func_cache.insert(key, func.clone());
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
@@ -404,6 +427,7 @@ impl CudaDevice {
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
+            func_cache: HashMap::new(),
         };
         Ok(Self {
             id: DeviceId::new(),
