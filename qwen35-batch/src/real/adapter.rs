@@ -947,7 +947,7 @@ impl Qwen35BatchAdapter {
                 // illegal address. Поэтому выход копируем во ВНЕШНИЙ (default pool,
                 // выделен ДО захвата) буфер D2D-нодой внутри графа.
                 let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
-                let logits_out = Tensor::zeros((b, 1usize, self.vocab), DType::F32, &self.device)?;
+                let logits_out = Tensor::zeros((b, self.vocab), DType::F32, &self.device)?;
                 unsafe {
                     cres::stream::begin_capture(
                         stream.cu_stream(),
