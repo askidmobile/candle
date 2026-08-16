@@ -581,10 +581,15 @@ fn iq_indexed_moe_rejects_noncontiguous_input() -> Result<()> {
     Ok(())
 }
 
+/// Глобальная блокировка для CUDA-graph тестов: захват на одном stream не
+/// потокобезопасен при параллельных тестах (cargo test default threads).
+static GRAPH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Minimal CUDA graph capture/replay sanity: fill kernel через graph, replay дважды.
 /// Изолирует механику cudarc begin/end_capture + launch от модели.
 #[test]
 fn cuda_graph_minimal_capture_replay() -> Result<()> {
+    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
     use candle_core::cuda_backend::cudarc;
     let device = Device::new_cuda(0)?;
     let cuda_dev = device.as_cuda_device()?;
@@ -622,6 +627,7 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
 /// Кастомные ядра с raw u64-pointer аргументами (cumsum/increment стиль) в графе.
 #[test]
 fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
+    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
     use candle_core::cuda_backend::cudarc;
     use cudarc::driver::{result as cres, sys as csys, LaunchConfig, PushKernelArg};
     let device = Device::new_cuda(0)?;
@@ -695,6 +701,7 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
 /// Полный L=0 набор ядер модели в графе: embedding + rmsnorm + q8_1 + matvec + copy2d.
 #[test]
 fn cuda_graph_model_l0_stack_capture() -> Result<()> {
+    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
     use candle_core::cuda_backend::cudarc;
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use cudarc::driver::{result as cres, sys as csys};
@@ -770,6 +777,7 @@ fn cuda_graph_model_l0_stack_capture() -> Result<()> {
 /// То же, но с PTX quantized ядром + cuBLAS matmul внутри захвата.
 #[test]
 fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
+    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
     use candle_core::cuda_backend::cudarc;
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     let device = Device::new_cuda(0)?;
