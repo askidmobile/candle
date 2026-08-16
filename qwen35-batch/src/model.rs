@@ -213,6 +213,36 @@ pub trait BatchModel {
     fn reset_slot(&mut self, idx: usize) -> Result<()>;
 }
 
+impl<T: BatchModel + ?Sized> BatchModel for &mut T {
+    fn vocab_size(&self) -> usize {
+        (**self).vocab_size()
+    }
+    fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>> {
+        (**self).prefill_chunk(chunk)
+    }
+    fn decode_batch(&mut self, batch: &DecodeBatch) -> Result<Vec<Vec<f32>>> {
+        (**self).decode_batch(batch)
+    }
+    fn reset_slot(&mut self, idx: usize) -> Result<()> {
+        (**self).reset_slot(idx)
+    }
+    fn speculative_available(&self, slot: usize) -> bool {
+        (**self).speculative_available(slot)
+    }
+    fn speculative_begin(&mut self, slot: usize) -> Result<()> {
+        (**self).speculative_begin(slot)
+    }
+    fn speculative_draft(&mut self, slot: usize, token: u32, cp: usize, rp: usize, max_tok: usize) -> Result<Vec<u32>> {
+        (**self).speculative_draft(slot, token, cp, rp, max_tok)
+    }
+    fn speculative_commit(&mut self, slot: usize) -> Result<()> {
+        (**self).speculative_commit(slot)
+    }
+    fn speculative_rollback(&mut self, slot: usize) -> Result<()> {
+        (**self).speculative_rollback(slot)
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Mock-модель для unit-тестов scheduler'а.
 //

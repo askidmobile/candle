@@ -20,17 +20,19 @@ fn main() -> Result<()> {
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let device = Device::Cpu;
 
+    // Модель загружается ОДИН раз на процесс (как в сервере).
+    let mut adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 4)?;
+
     // Warmup
     {
-        let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
-        let mut scheduler = BatchScheduler::new(adapter, 1, 248046, 248320);
+        let mut scheduler = BatchScheduler::new(&mut adapter, 1, 248046, 248320);
         scheduler.submit(vec![9707; 16], 8);
         while scheduler.step()? != qwen35_batch::scheduler::StepOutcome::Idle {}
+        scheduler.model_mut().reset_slot(0)?;
     }
 
     // Prefill 512 & 2048 (B=1)
     for p_len in [512, 2048] {
-        let mut adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
         let prompt = vec![9707u32; p_len];
         let t0 = Instant::now();
         let _ = adapter.prefill_chunk(&qwen35_batch::model::PrefillChunk {
@@ -44,12 +46,12 @@ fn main() -> Result<()> {
         let el = t0.elapsed().as_secs_f64();
         let tps = p_len as f64 / el;
         println!("CANDLE pp{} B=1: {:.2} tok/s ({:.3}s)", p_len, tps, el);
+        adapter.reset_slot(0)?;
     }
 
     // Decode B=1 (tg128)
     {
-        let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
-        let mut scheduler = BatchScheduler::new(adapter, 1, 248046, 248320);
+        let mut scheduler = BatchScheduler::new(&mut adapter, 1, 248046, 248320);
         scheduler.submit(vec![9707; 32], 128);
         scheduler.step()?; // prefill
         let t0 = Instant::now();
@@ -68,12 +70,12 @@ fn main() -> Result<()> {
         let el = t0.elapsed().as_secs_f64();
         let tps = gen as f64 / el;
         println!("CANDLE tg128 B=1: {:.2} tok/s ({:.3}s, {} tok)", tps, el, gen);
+        scheduler.model_mut().reset_slot(0)?;
     }
 
     // Decode B=4 (tg128 x 4)
     {
-        let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 4)?;
-        let mut scheduler = BatchScheduler::new(adapter, 4, 248046, 248320);
+        let mut scheduler = BatchScheduler::new(&mut adapter, 4, 248046, 248320);
         for _ in 0..4 {
             scheduler.submit(vec![9707; 32], 128);
         }
