@@ -33,6 +33,10 @@ fn main() -> Result<()> {
 
     // Prefill 512 & 2048 (B=1)
     for p_len in [512, 2048] {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &device {
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
         let prompt = vec![9707u32; p_len];
         let t0 = Instant::now();
         let _ = adapter.prefill_chunk(&qwen35_batch::model::PrefillChunk {
@@ -51,6 +55,10 @@ fn main() -> Result<()> {
 
     // Decode B=1 (tg128)
     {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &device {
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
         let mut scheduler = BatchScheduler::new(&mut adapter, 1, 248046, 248320);
         scheduler.submit(vec![9707; 32], 128);
         scheduler.step()?; // prefill
@@ -75,6 +83,10 @@ fn main() -> Result<()> {
 
     // Decode B=4 (tg128 x 4)
     {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &device {
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
         let mut scheduler = BatchScheduler::new(&mut adapter, 4, 248046, 248320);
         for _ in 0..4 {
             scheduler.submit(vec![9707; 32], 128);
