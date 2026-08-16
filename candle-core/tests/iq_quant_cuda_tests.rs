@@ -643,8 +643,10 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
             candle_core::Storage::Cuda(c) => c,
             _ => candle_core::bail!("not cuda"),
         };
-        let slice = cuda.as_cuda_slice::<u32>()?;
-        let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&slice.slice(layout.start_offset()..), slice.stream());
+        let slice0 = cuda.as_cuda_slice::<u32>()?;
+        let stream = slice0.stream();
+        let slice = slice0.slice(layout.start_offset()..);
+        let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&slice, stream);
         p
     };
     {
