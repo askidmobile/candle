@@ -6479,3 +6479,78 @@ DUAL_MOE_EXTERN(indexed_moe_forward_dual_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VD
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q4k_q8_1,  QK_K,  QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q6k_q8_1,  QK_K,  QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
 DUAL_MOE_EXTERN(indexed_moe_forward_dual_q2k_q8_1,  QK_K,  QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
+
+// ═══════════════════════════════════════════════════════════════
+// Paged KV cache decode helpers (CUDA graphs support).
+// KV pool layout: [num_blocks, page_size, n_kv, hd] f16 — matches paged FA2
+// (block_table maps batch row → slot-owned physical pages).
+// ═══════════════════════════════════════════════════════════════
+
+// Append one K/V row per (batch, kv_head) into the paged pool at the position
+// read from device-side kv_len[slot], then increment kv_len[slot].
+// All step-varying state is device-side: this kernel is CUDA-graph capturable.
+extern "C" __global__ void kv_append_paged_f16(
+    half* __restrict__ k_pool,
+    half* __restrict__ v_pool,
+    const half* __restrict__ k_rows,  // [B, n_kv, hd]
+    const half* __restrict__ v_rows,  // [B, n_kv, hd]
+    const unsigned int* __restrict__ block_table,  // [B, max_blocks]
+    const unsigned int* __restrict__ slots,        // [B]
+    unsigned int* __restrict__ kv_len,             // [S] in/out
+    const int b,
+    const int n_kv,
+    const int hd,
+    const int page_size,
+    const int max_blocks,
+    const int window)
+{
+    const int bidx = blockIdx.y;
+    const int head = blockIdx.x;
+    if (bidx >= b || head >= n_kv) return;
+    const unsigned int slot = slots[bidx];
+    unsigned int len = kv_len[slot];
+    if (len >= (unsigned int)window) len = window - 1; // eviction guard (host falls back)
+    const unsigned int page = block_table[bidx * max_blocks + len / page_size];
+    const unsigned int off = len % page_size;
+    const size_t dst_base = ((size_t)page * page_size + off) * n_kv * hd;
+    half* k_dst = k_pool + dst_base + (size_t)head * hd;
+    half* v_dst = v_pool + dst_base + (size_t)head * hd;
+    const size_t src_base = ((size_t)bidx * n_kv + head) * hd;
+    const half* k_src = k_rows + src_base;
+    const half* v_src = v_rows + src_base;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        k_dst[i] = k_src[i];
+        v_dst[i] = v_src[i];
+    }
+    // kv_len инкрементируется отдельным ядром в конце шага (все слои
+    // должны видеть одну и ту же длину в пределах шага).
+}
+
+// Cumulative seqlens_k for varlen FA2 from device kv_len. kv_len is the
+// pre-step length; FA2 must see len+1 (the row appended this step).
+extern "C" __global__ void cumsum_seqlens_from_kvlen(
+    const unsigned int* __restrict__ kv_len,
+    const unsigned int* __restrict__ slots,  // [B]
+    int* __restrict__ out,                    // [B+1]
+    const int b)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int acc = 0;
+    out[0] = 0;
+    for (int i = 0; i < b; ++i) {
+        acc += (int)kv_len[slots[i]] + 1;
+        out[i + 1] = acc;
+    }
+}
+
+// Increment per-slot kv_len once at the end of the decode step.
+extern "C" __global__ void kv_len_increment(
+    unsigned int* __restrict__ kv_len,
+    const unsigned int* __restrict__ slots,  // [B]
+    const int b)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (int i = 0; i < b; ++i) {
+        kv_len[slots[i]] += 1u;
+    }
+}

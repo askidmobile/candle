@@ -23,6 +23,9 @@ pub mod model_weights;
 pub mod moe;
 pub mod mtp;
 pub mod multimodal;
+/// Paged KV decode + CUDA graph plumbing.
+#[cfg(feature = "cuda")]
+pub mod paged_kv_cuda;
 #[cfg(feature = "real-model")]
 pub mod tokenizer;
 #[cfg(feature = "real-model")]

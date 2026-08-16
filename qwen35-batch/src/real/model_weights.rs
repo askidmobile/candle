@@ -2757,6 +2757,9 @@ pub(crate) struct GatedAttentionLayer {
     /// Pre-allocated ёмкость KV-кэша для batched path (== attn_window cap).
     /// Одно значение для всех слотов.
     kv_cache_cap_batched: usize,
+    /// Paged KV pool для CUDA-graph decode (опция, env QWEN36_CUDA_GRAPHS=1).
+    #[cfg(feature = "cuda")]
+    paged_pool: Option<crate::real::paged_kv_cuda::PagedKvPool>,
 }
 
 impl GatedAttentionLayer {
@@ -2770,6 +2773,28 @@ impl GatedAttentionLayer {
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         self.apply_partial_rotary_emb_with(x, &cos, &sin)
+    }
+
+    /// RoPE с позициями из device-тензора (CUDA-graph совместимый путь).
+    /// x: [B, n_head, 1, head_dim]; pos_dev: [B] u32 на device.
+    /// Математика идентична candle_nn::rotary_emb::rope (half-rotation,
+    /// cat(-x2,x1) ≡ x1*cos - x2*sin побитово в f32).
+    #[cfg(feature = "cuda")]
+    fn apply_partial_rotary_emb_devpos(&self, x: &Tensor, pos_dev: &Tensor) -> Result<Tensor> {
+        let (b_sz, _n_head, _seq_len, head_dim) = x.dims4()?;
+        let cos = self.cos.index_select(pos_dev, 0)?; // [B, rope/2]
+        let sin = self.sin.index_select(pos_dev, 0)?;
+        let cos = cos.unsqueeze(1)?.unsqueeze(1)?; // [B, 1, 1, rope/2]
+        let sin = sin.unsqueeze(1)?.unsqueeze(1)?;
+        let half = self.rope_dim / 2;
+        let x_rot = x.narrow(3, 0, self.rope_dim)?.contiguous()?;
+        let x_pass = x.narrow(3, self.rope_dim, head_dim - self.rope_dim)?;
+        let x1 = x_rot.narrow(3, 0, half)?;
+        let x2 = x_rot.narrow(3, half, half)?;
+        let out1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
+        let out2 = (x2.broadcast_mul(&cos)? + x1.broadcast_mul(&sin)?)?;
+        let _ = b_sz;
+        Tensor::cat(&[&out1, &out2, &x_pass], 3)
     }
 
     fn apply_partial_rotary_emb_with(
@@ -3214,6 +3239,118 @@ impl GatedAttentionLayer {
     /// Per-slot KV-cache: lazy allocate [1, n_kv_head, cap, hd] F16, cap растёт
     ///   по мере необходимости (как `forward_attn` growth branch). Не
     ///   pre-аллоцируем полный attn_window × B (4× context_length = ~10 ГБ).
+    /// Paged decode forward для CUDA-графов: вся step-varying логика на device.
+    /// Требует инициализированный paged_pool + PagedModelCtx (ModelWeights).
+    #[cfg(feature = "cuda")]
+    fn forward_attn_decode_paged(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        if seq_len != 1 {
+            candle_core::bail!("paged decode: seq_len must be 1, got {seq_len}");
+        }
+        // 1. Batched projections (общий prequant Q8_1).
+        let prequant = candle_core::quantized::QTensor::prequantize_q8_1(x)
+            .ok()
+            .flatten();
+        let qg = self.attention_wq.forward_with_prequant(x, prequant.as_ref())?;
+        let k = self.attention_wk.forward_with_prequant(x, prequant.as_ref())?;
+        let v = self.attention_wv.forward_with_prequant(x, prequant.as_ref())?;
+
+        // 2. Reshape + norms (как eager path).
+        let qg = qg.reshape((b_sz, 1, self.n_head, self.head_dim * 2))?;
+        let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
+        let gate_all = qg
+            .narrow(3, self.head_dim, self.head_dim)?
+            .contiguous()?
+            .transpose(1, 2)?;
+        let k_all = k
+            .reshape((b_sz, 1, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v_all = v
+            .reshape((b_sz, 1, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
+            b_sz,
+            self.n_head,
+            1,
+            self.head_dim,
+        ))?;
+        let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
+            b_sz,
+            self.n_kv_head,
+            1,
+            self.head_dim,
+        ))?;
+
+        // 3. RoPE по device-позициям (один gather на весь batch).
+        let rope_pos = ctx.rope_pos(b_sz)?;
+        let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, &rope_pos)?;
+        let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, &rope_pos)?;
+
+        // 4. head-last строки + q8 round-trip (численный паритет с eager path).
+        let k_hl = k_rope.transpose(1, 2)?.contiguous()?;
+        let v_hl = v_all.transpose(1, 2)?.contiguous()?;
+        let (kq, ks) = q8_quantize_rows(&k_hl)?;
+        let (vq, vs) = q8_quantize_rows(&v_hl)?;
+        let k_rows = q8_dequantize_rows(&kq, &ks)?
+            .reshape((b_sz, self.n_kv_head, self.head_dim))?
+            .contiguous()?;
+        let v_rows = q8_dequantize_rows(&vq, &vs)?
+            .reshape((b_sz, self.n_kv_head, self.head_dim))?
+            .contiguous()?;
+
+        // 5. Append в paged pool (device kv_len).
+        let pool = self
+            .paged_pool
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("paged pool not initialized".into()))?;
+        pool.launch_append(
+            ctx,
+            &k_rows,
+            &v_rows,
+            b_sz,
+            self.n_kv_head,
+            self.head_dim,
+            self.attn_window,
+        )?;
+
+        // 6. FA2 varlen paged.
+        let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, hd]
+        let seqlens_q = ctx.seqlens_q(b_sz)?;
+        let seqlens_k = ctx.seqlens_k(b_sz)?;
+        let block_table = ctx.block_table(b_sz)?;
+        let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
+            &q_f16,
+            &pool.k_pool,
+            &pool.v_pool,
+            &seqlens_q,
+            &seqlens_k,
+            &block_table,
+            None,
+            1,
+            self.attn_window,
+            scale,
+            None,
+            None,
+            crate::real::paged_kv_cuda::PAGE_SIZE,
+            None,
+        )?;
+
+        // 7. Gate + Wo (как eager path).
+        let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, n_head, 1, hd]
+        let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?;
+        let y_all = (y_all * gate_sigmoid)?;
+        let y_all = y_all
+            .transpose(1, 2)?
+            .reshape(&[b_sz, 1, self.n_head * self.head_dim])?;
+        self.attention_wo.forward(&y_all)
+    }
+
     fn forward_attn_decode_batch(
         &mut self,
         x: &Tensor,
@@ -3696,6 +3833,30 @@ impl HybridBlock {
         matches!(self.layer, HybridLayerType::DeltaNet(_))
     }
 
+    /// Paged variant для CUDA-графов: attention идёт через paged pool + ctx.
+    #[cfg(feature = "cuda")]
+    fn forward_decode_batch_paged(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+        slots: &[u32],
+    ) -> Result<Tensor> {
+        let residual = x;
+        let normed = self.attn_norm.forward(x)?;
+
+        let layer_out = match &mut self.layer {
+            HybridLayerType::DeltaNet(delta) => delta.forward_decode_batch(&normed, slots)?,
+            HybridLayerType::Attention(attn) => attn.forward_attn_decode_paged(&normed, ctx)?,
+        };
+        let x = (layer_out + residual)?;
+
+        let residual = &x;
+        let normed = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.ff.forward_decode_batch(&normed)?;
+        let x = (ffn_out + residual)?;
+        Ok(x)
+    }
+
     /// True batched decode forward: B одновременных слотов за один passage.
     ///
     /// Вход: x [B, 1, n_embd], separate per-slot cache and RoPE positions.
@@ -3804,6 +3965,12 @@ pub struct ModelWeights {
     /// Полная интеграция в следующей сессии (MetalStorage offset field).
     #[cfg(target_os = "macos")]
     pub(crate) unified_arena: Option<Arc<candle_metal_kernels::metal::UnifiedScratchArena>>,
+    /// Paged decode контекст для CUDA-графов (env QWEN36_CUDA_GRAPHS=1).
+    #[cfg(feature = "cuda")]
+    pub(crate) paged_ctx: Option<crate::real::paged_kv_cuda::PagedModelCtx>,
+    /// Признак, что хотя бы один decode уже подготовил paged pools у attention слоёв.
+    #[cfg(feature = "cuda")]
+    pub(crate) paged_ready: bool,
 }
 
 impl ModelWeights {
@@ -5004,6 +5171,8 @@ impl ModelWeights {
                     use_q8_f16_kv_cache,
                     kv_cache_len_batched: vec![0; DECODE_BATCH_CAPACITY as usize],
                     kv_cache_cap_batched: 0,
+                    #[cfg(feature = "cuda")]
+                    paged_pool: None,
                 })
             };
 
@@ -5056,6 +5225,10 @@ impl ModelWeights {
             // Unified arena инициализируется после build_model_common в from_gguf_zero_copy.
             #[cfg(target_os = "macos")]
             unified_arena: None,
+            #[cfg(feature = "cuda")]
+            paged_ctx: None,
+            #[cfg(feature = "cuda")]
+            paged_ready: false,
         })
     }
 
@@ -6088,6 +6261,140 @@ impl ModelWeights {
         // MTP consumes target hidden after output norm, matching h_nextn oracle.
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
         Ok((self.output.forward(&hidden)?, hidden))
+    }
+
+    /// CUDA-graph-совместимый decode forward: вся динамика в device-буферах ctx.
+    /// tokens — persistent Tensor [B,1] U32; остальные входы стейджатся через ctx.
+    #[cfg(feature = "cuda")]
+    pub fn forward_decode_batch_graphed(
+        &mut self,
+        tokens: &Tensor,
+        slots: &[u32],
+    ) -> Result<(Tensor, Tensor)> {
+        let ctx = self
+            .paged_ctx
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("paged ctx not initialized".into()))?;
+        let (b_sz, seq_len) = tokens.dims2()?;
+        if seq_len != 1 || slots.len() != b_sz {
+            candle_core::bail!("invalid graphed decode dimensions");
+        }
+        // seqlens_k — до attention слоёв (kv_len ещё не инкрементирован).
+        ctx.launch_cumsum(b_sz)?;
+
+        let emb = self
+            .tok_embeddings_cuda
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("no CUDA embedding".into()))?;
+        let mut layer_in = emb
+            .embedding(tokens)?
+            .reshape((b_sz, 1usize, self.hidden_size()))?;
+
+        for block in self.blocks.iter_mut() {
+            layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots)?;
+        }
+        // Инкремент kv_len — после ВСЕХ attention слоёв.
+        ctx.launch_increment(b_sz)?;
+
+        let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
+        Ok((self.output.forward(&hidden)?, hidden))
+    }
+
+    /// Ленивая инициализация paged pools + ctx (первый graph decode).
+    #[cfg(feature = "cuda")]
+    pub fn init_paged_decode(&mut self, device: &Device) -> Result<()> {
+        if self.paged_ready {
+            return Ok(());
+        }
+        let cuda_dev = device
+            .as_cuda_device()
+            .map_err(|_| candle_core::Error::Msg("paged decode requires CUDA".into()))?;
+        // Окно графа: не более 8K (VRAM) и не более attn_window модели.
+        let graph_window: usize = std::env::var("QWEN36_GRAPH_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let capacity_b = DECODE_BATCH_CAPACITY as usize;
+        let mut window: Option<usize> = None;
+        let mut dims: Option<(usize, usize)> = None; // (n_kv, hd)
+        for block in self.blocks.iter() {
+            if let HybridLayerType::Attention(a) = &block.layer {
+                window = Some(a.attn_window.min(graph_window));
+                dims = Some((a.n_kv_head, a.head_dim));
+            }
+        }
+        let window = window.ok_or_else(|| candle_core::Error::Msg("no attention layers".into()))?;
+        let (n_kv, hd) = dims.unwrap();
+        let max_blocks = window.div_ceil(crate::real::paged_kv_cuda::PAGE_SIZE);
+        let num_blocks = capacity_b * max_blocks;
+        let ctx = crate::real::paged_kv_cuda::PagedModelCtx::new(cuda_dev, capacity_b, max_blocks)?;
+        self.paged_ctx = Some(ctx);
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                a.paged_pool = Some(crate::real::paged_kv_cuda::PagedKvPool::new(
+                    device, num_blocks, n_kv, hd,
+                )?);
+            }
+        }
+        self.paged_ready = true;
+        log::info!(
+            "[qwen35-batch] paged decode: window={window} pages/slot={max_blocks} blocks={num_blocks}"
+        );
+        Ok(())
+    }
+
+    /// Текущее graph window (для fallback-решений адаптера).
+    #[cfg(feature = "cuda")]
+    pub fn paged_window(&self) -> usize {
+        self.paged_ctx
+            .as_ref()
+            .map(|c| c.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE)
+            .unwrap_or(0)
+    }
+
+    /// Миграция per-slot KV из batched cache (post-prefill/seed) в paged pool.
+    /// Возвращает фактическую длину KV слота.
+    #[cfg(feature = "cuda")]
+    pub fn migrate_kv_to_paged(&mut self, slot: usize) -> Result<usize> {
+        let mb = self
+            .paged_ctx
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("paged ctx missing".into()))?
+            .max_blocks;
+        let ps = crate::real::paged_kv_cuda::PAGE_SIZE;
+        let mut len = 0usize;
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                let kv_len = a.kv_cache_len_batched[slot];
+                if kv_len == 0 {
+                    continue;
+                }
+                if kv_len > mb * ps {
+                    candle_core::bail!("slot {slot} kv_len {kv_len} exceeds paged window");
+                }
+                len = kv_len;
+                let cache = a.kv_cache_batched[slot].as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("migrate: batched KV missing".into())
+                })?;
+                let (k, v) = cache.f16_prefix(kv_len)?; // [1, len, n_kv, hd] F16
+                let pool = a.paged_pool.as_ref().ok_or_else(|| {
+                    candle_core::Error::Msg("migrate: paged pool missing".into())
+                })?;
+                let pages = kv_len.div_ceil(ps);
+                for page in 0..pages {
+                    let start = page * ps;
+                    let n = (kv_len - start).min(ps);
+                    let phys = slot * mb + page;
+                    pool.k_pool
+                        .narrow(0, phys, 1)?
+                        .slice_set(&k.narrow(1, start, n)?, 1, start)?;
+                    pool.v_pool
+                        .narrow(0, phys, 1)?
+                        .slice_set(&v.narrow(1, start, n)?, 1, start)?;
+                }
+            }
+        }
+        Ok(len)
     }
 
     pub(crate) fn shared_output(&self) -> QMatMul {
