@@ -109,7 +109,7 @@ required-features = ["real-model", "cuda"]
 [[bin]]
 name = "bench_candle_direct"
 path = "src/bin/bench_candle_direct.rs"
-required-features = ["real-model", "cuda"]
+required-features = ["real-model"]
 
 [[bin]]
 name = "qwen35_mtp_probe"

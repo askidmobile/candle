@@ -1,5 +1,4 @@
 use anyhow::Result;
-use candle_core::backend::BackendDevice;
 use candle_core::Device;
 use qwen35_batch::model::BatchModel;
 use qwen35_batch::real::Qwen35BatchAdapter;
@@ -9,9 +8,18 @@ use std::path::Path;
 use std::time::Instant;
 
 fn main() -> Result<()> {
-    let text = "D:\\Models\\yttri\\qwen3.5-4b\\Qwen3.5-4B-Q4_K_M.gguf";
+    // Путь к GGUF — argv[1], иначе дефолт yttri-win.
+    let text = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "D:\\Models\\yttri\\qwen3.5-4b\\Qwen3.5-4B-Q4_K_M.gguf".to_string());
+    let text = text.as_str();
+    #[cfg(feature = "cuda")]
     let device = Device::new_cuda(0)?;
-    
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let device = Device::new_metal(0)?;
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    let device = Device::Cpu;
+
     // Warmup
     {
         let adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), 1)?;
@@ -32,7 +40,7 @@ fn main() -> Result<()> {
             start_pos: 0,
             is_final: true,
         })?;
-        device.as_cuda_device()?.synchronize()?;
+        device.synchronize()?;
         let el = t0.elapsed().as_secs_f64();
         let tps = p_len as f64 / el;
         println!("CANDLE pp{} B=1: {:.2} tok/s ({:.3}s)", p_len, tps, el);
@@ -56,7 +64,7 @@ fn main() -> Result<()> {
                 break;
             }
         }
-        device.as_cuda_device()?.synchronize()?;
+        device.synchronize()?;
         let el = t0.elapsed().as_secs_f64();
         let tps = gen as f64 / el;
         println!("CANDLE tg128 B=1: {:.2} tok/s ({:.3}s, {} tok)", tps, el, gen);
@@ -85,7 +93,7 @@ fn main() -> Result<()> {
                 break;
             }
         }
-        device.as_cuda_device()?.synchronize()?;
+        device.synchronize()?;
         let el = t0.elapsed().as_secs_f64();
         let tps = gen as f64 / el;
         println!("CANDLE tg128 B=4: {:.2} aggregate tok/s ({:.2} tok/s per-slot, {:.3}s, {} total tok)", tps, tps / 4.0, el, gen);

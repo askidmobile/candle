@@ -5005,7 +5005,7 @@ impl ModelWeights {
             })
             .count();
         #[cfg(not(target_os = "macos"))]
-        let n_metal = 0usize;
+        let mut n_metal = 0usize;
         log::info!(
             "[{}] Loaded {} layers ({} DeltaNet [{} Metal GPU] + {} Attention) in {:.0}ms",
             tag,
@@ -5104,7 +5104,8 @@ impl ModelWeights {
     /// слои работают на GPU (0 CPU↔GPU sync). Если n_metal == 0 — полный
     /// CPU fallback (медленно).
     pub fn metal_path_status(&self) -> (usize, usize) {
-        let n_metal = 0usize;
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut n_metal = 0usize;
         let mut n_deltanet = 0usize;
         for block in &self.blocks {
             if let HybridLayerType::DeltaNet(d) = &block.layer {
@@ -5236,9 +5237,10 @@ impl ModelWeights {
     ///   `None` snapshot → очистка slot'а (свежий слот).
     ///
     /// `slot` — индекс [0, DECODE_BATCH_CAPACITY). Вне диапазона → Err.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn seed_slot_batched(
         &mut self,
-        _device: &Device,
+        device: &Device,
         slot: usize,
         snap: &StateSnapshot,
     ) -> Result<()> {
@@ -5340,9 +5342,10 @@ impl ModelWeights {
     /// Checkpoint one batched slot at committed boundary. DeltaNet CUDA/Metal
     /// copies stay device-to-device; attention cache uses copy-on-write restore
     /// because speculative append never overwrites committed prefix.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn checkpoint_slot_batched(
         &self,
-        _device: &Device,
+        device: &Device,
         slot: usize,
     ) -> Result<BatchedStateCheckpoint> {
         if slot >= DECODE_BATCH_CAPACITY as usize {
@@ -5393,9 +5396,10 @@ impl ModelWeights {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn restore_slot_batched(
         &mut self,
-        _device: &Device,
+        device: &Device,
         checkpoint: &BatchedStateCheckpoint,
     ) -> Result<()> {
         if checkpoint.model_nonce != self.instance_nonce
@@ -5454,7 +5458,8 @@ impl ModelWeights {
     /// Зануляет batched DeltaNet state (Metal/CUDA) и сбрасывает per-slot
     /// KV-cache для всех attention слоёв. Вызывается адаптером при reset_first
     /// перед prefill, чтобы batched decode начинал со свежего state.
-    pub fn clear_state_batched(&mut self, _device: &Device) {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    pub fn clear_state_batched(&mut self, device: &Device) {
         for block in self.blocks.iter_mut() {
             match &mut block.layer {
                 HybridLayerType::DeltaNet(d) => {
