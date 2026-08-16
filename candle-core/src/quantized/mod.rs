@@ -1322,25 +1322,34 @@ impl QTensor {
 
     #[cfg(feature = "cuda")]
     pub fn forward_with_prequant(&self, x: &Tensor, prequant: Option<&Q8_1Activation>) -> Result<Tensor> {
-        if let Some(Q8_1Activation::Cuda { slice, ncols, b_size }) = prequant {
-            if let QStorage::Cuda(c) = &self.storage {
-                if !matches!(
-                    c.dtype(),
-                    GgmlDType::IQ3XXS
-                        | GgmlDType::IQ2S
-                        | GgmlDType::IQ3S
-                        | GgmlDType::IQ2XS
-                        | GgmlDType::IQ2XXS
-                        | GgmlDType::IQ4XS
-                ) {
-                    let (n, k) = self.shape.dims2()?;
-                    if *ncols == k {
-                        let out = c.mul_mat_vec_with_prequant_q8_1(&self.shape, slice, *ncols, n, *b_size)?;
-                        let mut out_shape = x.dims().to_vec();
-                        out_shape.pop();
-                        out_shape.push(n);
-                        let none = crate::op::BackpropOp::none();
-                        return Ok(crate::tensor::from_storage(Storage::Cuda(out), out_shape, none, false));
+        if !cuda::FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(Q8_1Activation::Cuda { slice, ncols, b_size }) = prequant {
+                let (x_b_size, x_k) = match x.dims() {
+                    [b, m, k] => (b * m, *k),
+                    [b, k] => (*b, *k),
+                    _ => (0, 0),
+                };
+                if x_b_size == *b_size && x_k == *ncols {
+                    if let QStorage::Cuda(c) = &self.storage {
+                        if !matches!(
+                            c.dtype(),
+                            GgmlDType::IQ3XXS
+                                | GgmlDType::IQ2S
+                                | GgmlDType::IQ3S
+                                | GgmlDType::IQ2XS
+                                | GgmlDType::IQ2XXS
+                                | GgmlDType::IQ4XS
+                        ) {
+                            let (n, k) = self.shape.dims2()?;
+                            if *ncols == k {
+                                let out = c.mul_mat_vec_with_prequant_q8_1(&self.shape, slice, *ncols, n, *b_size)?;
+                                let mut out_shape = x.dims().to_vec();
+                                out_shape.pop();
+                                out_shape.push(n);
+                                let none = crate::op::BackpropOp::none();
+                                return Ok(crate::tensor::from_storage(Storage::Cuda(out), out_shape, none, false));
+                            }
+                        }
                     }
                 }
             }
