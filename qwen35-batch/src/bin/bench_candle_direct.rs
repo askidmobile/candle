@@ -59,6 +59,10 @@ fn main() -> Result<()> {
         let tps = p_len as f64 / el;
         println!("CANDLE pp{} B=1: {:.2} tok/s ({:.3}s)", p_len, tps, el);
         adapter.reset_slot(0)?;
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &device {
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
     }
 
     // Decode B=1 (tg128)
