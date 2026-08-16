@@ -93,6 +93,14 @@ impl Qwen35BatchAdapter {
                 "num_slots {num_slots} exceeds decode capacity {DECODE_BATCH_CAPACITY}"
             ));
         }
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda_dev) = &device {
+            // Драйверный mempool с retain: cuMemFreeAsync не отдаёт страницы ОС,
+            // последующие cuMemAllocAsync переиспользуют их без re-map (decode hot path).
+            if let Err(e) = candle_core::cuda_backend::mem_pool::retain_default_mempool(cuda_dev) {
+                log::warn!("[qwen35-batch] retain_default_mempool failed (ignored): {e}");
+            }
+        }
         use candle_core::quantized::gguf_file;
         use std::fs::File;
         use std::sync::Arc;

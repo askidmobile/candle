@@ -42,6 +42,42 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
+// Per-device Q8_1 scratch cache: grow-only, keyed by exact byte size.
+// Decode hot path allocates one quantize buffer per QMatMul — ~129 pairs of
+// cuMemAllocAsync/cuMemFreeAsync per token. All launches are stream-ordered on
+// the same device stream, so reusing the buffer across sequential calls is safe.
+static Q81_SCRATCH: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            crate::cuda_backend::DeviceId,
+            std::collections::HashMap<usize, &'static std::sync::Mutex<CudaSlice<u8>>>,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+type Q81ScratchGuard = std::sync::MutexGuard<'static, CudaSlice<u8>>;
+
+fn q8_1_scratch(dev: &CudaDevice, bytes: usize) -> Q81ScratchGuard {
+    let map = Q81_SCRATCH
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let bytes = bytes.max(1);
+    let entry: &'static std::sync::Mutex<CudaSlice<u8>> = {
+        let mut guard = map.lock().unwrap();
+        let per_size = guard.entry(dev.id()).or_default();
+        match per_size.entry(bytes) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let slice = unsafe { dev.alloc::<u8>(bytes) }
+                    .expect("q8_1 scratch allocation");
+                let leaked: &'static std::sync::Mutex<CudaSlice<u8>> =
+                    Box::leak(Box::new(std::sync::Mutex::new(slice)));
+                e.insert(leaked)
+            }
+        }
+    };
+    entry.lock().unwrap()
+}
+
 pub const WARP_SIZE: usize = 32;
 pub const MMQ_X_Q4_0_AMPERE: usize = 4;
 pub const MMQ_Y_Q4_0_AMPERE: usize = 32;
@@ -63,7 +99,7 @@ fn pad(p: usize, q: usize) -> usize {
 
 fn quantize_q8_1(
     src: &CudaView<f32>,
-    dst: &mut CudaSlice<u8>,
+    dst: &mut cudarc::driver::CudaViewMut<u8>,
     k: usize,
     ky: usize,
     dev: &CudaDevice,
@@ -98,7 +134,7 @@ fn quantize_q8_1(
         // --- slice the destination (u8) tensor by bytes ---
         let dst_start_byte = rows_processed * dst_row_size_bytes;
         let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
-        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+        let dst_chunk = dst.slice_mut(dst_start_byte..(dst_start_byte + dst_num_bytes));
 
         let cfg = cudarc::driver::LaunchConfig {
             grid_dim: (num_blocks as u32, rows_in_chunk as u32, 1),
@@ -582,13 +618,16 @@ impl QCudaStorage {
         y: &CudaView<f32>,
         ncols: usize,
         b_size: usize,
-    ) -> Result<CudaSlice<u8>> {
+    ) -> Result<Q81ScratchGuard> {
         let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
         let y_size_in_bytes =
             b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-        let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-        quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
-        Ok(y_q8_1)
+        let mut guard = q8_1_scratch(dev, y_size_in_bytes);
+        {
+            let mut view = guard.slice_mut(..);
+            quantize_q8_1(y, &mut view, ncols, b_size, dev)?;
+        }
+        Ok(guard)
     }
 }
 
@@ -611,12 +650,15 @@ fn mul_mat_vec_via_q8_1(
     if b_size == 0 || b_size > 8 {
         crate::bail!("only bsize between 1 and 8 are supported, got {b_size}")
     }
-    // Start by quantizing y
+    // Start by quantizing y (scratch: reused across matmuls, stream-ordered).
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-    quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
+    let mut y_q8_1_guard = q8_1_scratch(dev, y_size_in_bytes);
+    {
+        let mut view = y_q8_1_guard.slice_mut(..);
+        quantize_q8_1(y, &mut view, ncols, b_size, dev)?;
+    }
 
     let kernel_name = match dtype {
         GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
@@ -655,7 +697,7 @@ fn mul_mat_vec_via_q8_1(
 
     let mut builder = func.builder();
     builder.arg(&data.inner);
-    builder.arg(&y_q8_1);
+    builder.arg(&*y_q8_1_guard);
     builder.arg(&dst);
     barg!(
         builder,
@@ -690,12 +732,15 @@ fn mul_mat_via_q8_1(
         crate::bail!("unexpected x/y size {x_rows} {x_cols} {y_rows} {y_cols}")
     }
     let k = x_cols;
-    // Start by quantizing y
+    // Start by quantizing y (scratch: reused across matmuls, stream-ordered).
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         k_padded * y_cols * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-    quantize_q8_1(y, &mut y_q8_1, k, y_cols, dev)?;
+    let mut y_q8_1_guard = q8_1_scratch(dev, y_size_in_bytes);
+    {
+        let mut view = y_q8_1_guard.slice_mut(..);
+        quantize_q8_1(y, &mut view, k, y_cols, dev)?;
+    }
 
     let (kernel_name, mmq_x, mmq_y) = match dtype {
         GgmlDType::Q4_0 => ("mul_mat_q4_0", 64, 128),
@@ -724,7 +769,7 @@ fn mul_mat_via_q8_1(
 
     let mut builder = func.builder();
     builder.arg(/* vx */ &data.inner);
-    builder.arg(/* vy */ &y_q8_1);
+    builder.arg(/* vy */ &*y_q8_1_guard);
     builder.arg(/* dst */ &dst);
     barg!(
         builder,
@@ -848,9 +893,11 @@ fn indexed_moe_forward_dispatch(
     let num_blocks_per_row = k_padded / q8_1_block_size;
     let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
-    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-
-    quantize_q8_1(input, &mut input_quant, k, total_rows, dev)?;
+    let mut input_quant_guard = q8_1_scratch(dev, y_size_in_bytes);
+    {
+        let mut view = input_quant_guard.slice_mut(..);
+        quantize_q8_1(input, &mut view, k, total_rows, dev)?;
+    }
 
     // output buffer
     let outsize = batch * topk * n;
@@ -875,7 +922,7 @@ fn indexed_moe_forward_dispatch(
 
     let mut builder = func.builder();
     builder.arg(weight);
-    builder.arg(&input_quant);
+    builder.arg(&*input_quant_guard);
     builder.arg(ids);
     builder.arg(&out);
 
@@ -971,8 +1018,11 @@ impl QCudaStorage {
         let k_padded = pad(k, MATRIX_ROW_PADDING);
         let y_size_in_bytes =
             k_padded * total_rows * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-        let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-        quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+        let mut input_quant_guard = q8_1_scratch(dev, y_size_in_bytes);
+        {
+            let mut view = input_quant_guard.slice_mut(..);
+            quantize_q8_1(&input_view, &mut view, k, total_rows, dev)?;
+        }
 
         let outsize = batch * topk * n;
         let out1 = unsafe { dev.alloc::<f32>(outsize)? };
@@ -987,7 +1037,7 @@ impl QCudaStorage {
         let mut b = func.builder();
         b.arg(&self.data.inner);
         b.arg(&other.data.inner);
-        b.arg(&input_quant);
+        b.arg(&*input_quant_guard);
         b.arg(&ids_view);
         b.arg(&out1);
         b.arg(&out2);
@@ -1642,7 +1692,7 @@ mod test {
         let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
         let vs: Vec<f32> = (0..el).map(|v| v as f32).collect();
         let y = dev.clone_htod(&vs)?;
-        quantize_q8_1(&y.as_view(), &mut y_q8_1, el, 1, &dev)?;
+        quantize_q8_1(&y.as_view(), &mut y_q8_1.slice_mut(..), el, 1, &dev)?;
         Ok(())
     }
 

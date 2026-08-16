@@ -1286,7 +1286,7 @@ impl QMatMul {
 pub enum Q8_1Activation {
     #[cfg(feature = "cuda")]
     Cuda {
-        slice: cudarc::driver::CudaSlice<u8>,
+        slice: std::sync::MutexGuard<'static, cudarc::driver::CudaSlice<u8>>,
         ncols: usize,
         b_size: usize,
     },
@@ -1331,15 +1331,7 @@ impl QTensor {
                 };
                 if x_b_size == *b_size && x_k == *ncols {
                     if let QStorage::Cuda(c) = &self.storage {
-                        if !matches!(
-                            c.dtype(),
-                            GgmlDType::IQ3XXS
-                                | GgmlDType::IQ2S
-                                | GgmlDType::IQ3S
-                                | GgmlDType::IQ2XS
-                                | GgmlDType::IQ2XXS
-                                | GgmlDType::IQ4XS
-                        ) {
+                        {
                             let (n, k) = self.shape.dims2()?;
                             if *ncols == k {
                                 let out = c.mul_mat_vec_with_prequant_q8_1(&self.shape, slice, *ncols, n, *b_size)?;
