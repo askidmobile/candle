@@ -141,14 +141,16 @@ impl Qwen35BatchAdapter {
         }
         #[cfg(feature = "cuda")]
         if let Device::Cuda(cuda_dev) = &device {
-            // Драйверный mempool с retain: cuMemFreeAsync не отдаёт страницы ОС,
-            // последующие cuMemAllocAsync переиспользуют их без re-map (decode hot path).
-            // Отключение для отладки: QWEN36_NO_MEMPOOL_RETAIN=1.
+            static RETAIN_ONCE: std::sync::Once = std::sync::Once::new();
             let disabled = std::env::var("QWEN36_NO_MEMPOOL_RETAIN").as_deref() == Ok("1");
             if !disabled {
-                if let Err(e) = candle_core::cuda_backend::mem_pool::retain_default_mempool(cuda_dev) {
-                    log::warn!("[qwen35-batch] retain_default_mempool failed (ignored): {e}");
-                }
+                RETAIN_ONCE.call_once(|| {
+                    if let Err(e) =
+                        candle_core::cuda_backend::mem_pool::retain_default_mempool(cuda_dev)
+                    {
+                        log::warn!("[qwen35-batch] retain_default_mempool failed: {e}");
+                    }
+                });
             }
         }
         use candle_core::quantized::gguf_file;
