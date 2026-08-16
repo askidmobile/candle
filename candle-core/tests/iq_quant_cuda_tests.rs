@@ -580,3 +580,35 @@ fn iq_indexed_moe_rejects_noncontiguous_input() -> Result<()> {
     );
     Ok(())
 }
+
+/// Minimal CUDA graph capture/replay sanity: fill kernel через graph, replay дважды.
+/// Изолирует механику cudarc begin/end_capture + launch от модели.
+#[test]
+fn cuda_graph_minimal_capture_replay() -> Result<()> {
+    use candle_core::cuda_backend::cudarc;
+    let device = Device::new_cuda(0)?;
+    let cuda_dev = device.as_cuda_device()?;
+    let stream = cuda_dev.cuda_stream();
+
+    // Eager: x = 1
+    let mut x = Tensor::ones((16,), DType::F32, &device)?;
+    let x0 = x.to_vec1::<f32>()?;
+    assert!(x0.iter().all(|&v| v == 1.0));
+
+    // Capture: x = x * 2 (device op, capturable)
+    stream
+        .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    let y = (x.clone() * 2.0)?;
+    let graph = stream
+        .end_capture(unsafe {
+            std::mem::transmute::<u32, cudarc::driver::sys::CUgraphInstantiate_flags>(0)
+        })
+        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?
+        .ok_or_else(|| candle_core::Error::Msg("no graph".into()))?;
+
+    graph.launch().map_err(|e| candle_core::Error::Msg(format!("launch: {e}")))?;
+    let y0 = y.to_vec1::<f32>()?;
+    assert!(y0.iter().all(|&v| v == 2.0), "graph replay wrong: {:?}", &y0[..4]);
+    Ok(())
+}
