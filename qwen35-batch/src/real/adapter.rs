@@ -965,6 +965,13 @@ impl Qwen35BatchAdapter {
                 if cu_graph.is_null() {
                     return Err(anyhow!("end_capture returned null graph"));
                 }
+                {
+                    let mut nodes: usize = 0;
+                    let res = unsafe {
+                        csys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut nodes)
+                    };
+                    eprintln!("[graphs] captured nodes={nodes} res={res:?}");
+                }
                 let mut exec: csys::CUgraphExec = std::ptr::null_mut();
                 let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
                 if res != csys::CUresult::CUDA_SUCCESS || exec.is_null() {
