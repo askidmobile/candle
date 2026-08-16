@@ -4467,25 +4467,35 @@ impl ModelWeights {
             device,
         )?;
 
-        // Output projection (или tie_word_embeddings)
-        let output = match load_heavy("output.weight") {
-            Ok(v) => QMatMul::from_qtensor(v)?,
-            _ => {
+        // Output projection и token embedding (с защитой от дублирования VRAM)
+        let output_res = load_heavy("output.weight");
+        let (output, tok_embeddings_cuda) = match output_res {
+            Ok(v) => {
+                let out_mm = QMatMul::from_qtensor(v)?;
+                #[cfg(feature = "cuda")]
+                let emb_mm = if device.is_cuda() {
+                    Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "cuda"))]
+                let emb_mm: Option<QMatMul> = None;
+                (out_mm, emb_mm)
+            }
+            Err(_) => {
                 log::info!("[{}] output.weight not found, using tied embeddings", tag);
-                QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?
+                let emb_qt = load_heavy("token_embd.weight")?;
+                let emb_mm = QMatMul::from_qtensor(emb_qt)?;
+                #[cfg(feature = "cuda")]
+                let cuda_emb = if device.is_cuda() {
+                    Some(emb_mm.clone())
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "cuda"))]
+                let cuda_emb: Option<QMatMul> = None;
+                (emb_mm, cuda_emb)
             }
-        };
-
-        // CUDA embedding: get_rows kernel читает квантованную таблицу прямо на GPU.
-        // Иначе каждый токен: D2H ids → CPU dequant → H2D [B, n_embd] (host sync ×2/шаг).
-        #[cfg(feature = "cuda")]
-        let tok_embeddings_cuda: Option<QMatMul> = if device.is_cuda() {
-            match load_heavy("output.weight") {
-                Ok(_) => Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?),
-                Err(_) => Some(output.clone()),
-            }
-        } else {
-            None
         };
 
         // RoPE: предрассчитанные cos/sin для PARTIAL RoPE (rope_dim, не full head_dim).
