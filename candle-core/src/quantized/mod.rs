@@ -1472,19 +1472,36 @@ impl crate::CustomOp1 for QTensor {
 }
 
 impl QMatMul {
+    pub fn device(&self) -> Device {
+        match self {
+            Self::QTensor(t) => t.device(),
+            Self::Tensor(w) | Self::TensorF16(w) => w.device().clone(),
+        }
+    }
+
     #[allow(unused_variables)]
     pub fn forward_with_prequant(&self, xs: &Tensor, prequant: Option<&Q8_1Activation>) -> Result<Tensor> {
         use crate::Module;
+        let xs = if !xs.device().same_device(&self.device()) {
+            xs.to_device(&self.device())?
+        } else {
+            xs.clone()
+        };
         match self {
             #[cfg(feature = "cuda")]
-            Self::QTensor(t) => t.forward_with_prequant(xs, prequant),
-            _ => self.forward(xs),
+            Self::QTensor(t) => t.forward_with_prequant(&xs, prequant),
+            _ => self.forward(&xs),
         }
     }
 }
 
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = if !xs.device().same_device(&self.device()) {
+            xs.to_device(&self.device())?
+        } else {
+            xs.clone()
+        };
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {
