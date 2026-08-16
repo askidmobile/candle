@@ -585,7 +585,14 @@ impl QCudaStorage {
 }
 
 fn mul_mat_vec_via_q8_1(
-    let data_elems = data.len / dtype.type_size() * dtype.block_size();
+    data: &PaddedCudaSlice,
+    y: &CudaView<f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b_size: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
     if data_elems < ncols * nrows {
         crate::bail!("unexpected data size {}, ncols {ncols} {nrows}", data_elems)
     }
