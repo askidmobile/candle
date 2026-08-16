@@ -1286,7 +1286,7 @@ impl QMatMul {
 pub enum Q8_1Activation {
     #[cfg(feature = "cuda")]
     Cuda {
-        slice: std::sync::MutexGuard<'static, cudarc::driver::CudaSlice<u8>>,
+        slice: cuda::Q81ScratchRef,
         ncols: usize,
         b_size: usize,
     },

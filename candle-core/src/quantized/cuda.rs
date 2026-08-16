@@ -42,40 +42,84 @@ pub fn set_force_dmmv(f: bool) {
     FORCE_DMMV.store(f, std::sync::atomic::Ordering::Relaxed)
 }
 
-// Per-device Q8_1 scratch cache: grow-only, keyed by exact byte size.
-// Decode hot path allocates one quantize buffer per QMatMul — ~129 pairs of
-// cuMemAllocAsync/cuMemFreeAsync per token. All launches are stream-ordered on
-// the same device stream, so reusing the buffer across sequential calls is safe.
+// Per-device Q8_1 scratch cache: 2 слота на размер, чтобы избежать self-deadlock
+// когда вход слоя и выход attention_wo имеют одинаковую размерность (например 9B: 4096 == 4096).
 static Q81_SCRATCH: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<
             crate::cuda_backend::DeviceId,
-            std::collections::HashMap<usize, &'static std::sync::Mutex<CudaSlice<u8>>>,
+            std::collections::HashMap<usize, (CudaSlice<u8>, CudaSlice<u8>, std::sync::atomic::AtomicBool)>,
         >,
     >,
 > = std::sync::OnceLock::new();
 
-type Q81ScratchGuard = std::sync::MutexGuard<'static, CudaSlice<u8>>;
+pub struct Q81ScratchSlice {
+    dev_id: crate::cuda_backend::DeviceId,
+    bytes: usize,
+    slot_idx: usize,
+}
 
-fn q8_1_scratch(dev: &CudaDevice, bytes: usize) -> Q81ScratchGuard {
+impl Drop for Q81ScratchSlice {
+    fn drop(&mut self) {
+        if let Some(map) = Q81_SCRATCH.get() {
+            if let Ok(guard) = map.lock() {
+                if let Some(per_size) = guard.get(&self.dev_id) {
+                    if let Some((_, _, in_use)) = per_size.get(&self.bytes) {
+                        in_use.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct Q81ScratchRef {
+    ptr: *const CudaSlice<u8>,
+    _token: Q81ScratchSlice,
+}
+
+unsafe impl Send for Q81ScratchRef {}
+unsafe impl Sync for Q81ScratchRef {}
+
+impl std::ops::Deref for Q81ScratchRef {
+    type Target = CudaSlice<u8>;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl std::ops::DerefMut for Q81ScratchRef {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *(self.ptr as *mut CudaSlice<u8>) }
+    }
+}
+
+fn q8_1_scratch(dev: &CudaDevice, bytes: usize) -> Q81ScratchRef {
     let map = Q81_SCRATCH
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let bytes = bytes.max(1);
-    let entry: &'static std::sync::Mutex<CudaSlice<u8>> = {
-        let mut guard = map.lock().unwrap();
-        let per_size = guard.entry(dev.id()).or_default();
-        match per_size.entry(bytes) {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let slice = unsafe { dev.alloc::<u8>(bytes) }
-                    .expect("q8_1 scratch allocation");
-                let leaked: &'static std::sync::Mutex<CudaSlice<u8>> =
-                    Box::leak(Box::new(std::sync::Mutex::new(slice)));
-                e.insert(leaked)
-            }
-        }
+    let mut guard = map.lock().unwrap();
+    let per_size = guard.entry(dev.id()).or_default();
+    let entry = per_size.entry(bytes).or_insert_with(|| {
+        let s0 = unsafe { dev.alloc::<u8>(bytes) }.expect("q8_1 scratch alloc 0");
+        let s1 = unsafe { dev.alloc::<u8>(bytes) }.expect("q8_1 scratch alloc 1");
+        (s0, s1, std::sync::atomic::AtomicBool::new(false))
+    });
+
+    let (ptr, slot_idx) = if !entry.2.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        (&entry.0 as *const CudaSlice<u8>, 0)
+    } else {
+        (&entry.1 as *const CudaSlice<u8>, 1)
     };
-    entry.lock().unwrap()
+
+    Q81ScratchRef {
+        ptr,
+        _token: Q81ScratchSlice {
+            dev_id: dev.id(),
+            bytes,
+            slot_idx,
+        },
+    }
 }
 
 pub const WARP_SIZE: usize = 32;
@@ -618,7 +662,7 @@ impl QCudaStorage {
         y: &CudaView<f32>,
         ncols: usize,
         b_size: usize,
-    ) -> Result<Q81ScratchGuard> {
+    ) -> Result<Q81ScratchRef> {
         let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
         let y_size_in_bytes =
             b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
