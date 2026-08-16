@@ -3853,7 +3853,9 @@ impl HybridBlock {
     ) -> Result<Tensor> {
         let x = x.contiguous()?;
         let residual = &x;
+        if crate::scheduler::trace_on() { eprintln!("[fdbp] 1. attn_norm"); }
         let normed = self.attn_norm.forward(&x)?;
+        if crate::scheduler::trace_on() { eprintln!("[fdbp] 2. layer dispatch"); }
 
         let layer_out = match &mut self.layer {
             HybridLayerType::DeltaNet(delta) => {
@@ -3867,16 +3869,21 @@ impl HybridBlock {
                 if std::env::var("QWEN36_GRAPH_SKIP_ATTN").as_deref() == Ok("1") {
                     normed.clone()
                 } else {
+                    if crate::scheduler::trace_on() { eprintln!("[fdbp] 2a. attn call"); }
                     attn.forward_attn_decode_paged(&normed, ctx)?
                 }
             }
         };
+        if crate::scheduler::trace_on() { eprintln!("[fdbp] 3. residual"); }
         let x = (layer_out + residual)?;
 
         let residual = &x;
+        if crate::scheduler::trace_on() { eprintln!("[fdbp] 4. ffn_norm"); }
         let normed = self.ffn_norm.forward(&x)?;
+        if crate::scheduler::trace_on() { eprintln!("[fdbp] 5. ffn"); }
         let ffn_out = self.ff.forward_decode_batch(&normed)?;
         let x = (ffn_out + residual)?;
+        if crate::scheduler::trace_on() { eprintln!("[fdbp] 6. done"); }
         Ok(x)
     }
 
