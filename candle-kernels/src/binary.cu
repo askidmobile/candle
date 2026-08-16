@@ -114,10 +114,10 @@ BINARY_OP_OUT(uint32_t, uint8_t, ge_u32, x >= y)
 BINARY_OP_OUT(int64_t, uint8_t, ge_i64, x >= y)
 
 #if __CUDA_ARCH__ >= 800
-BINARY_OP(__nv_bfloat16, bsilu_mul_bf16, (__nv_bfloat16)(__half2float(__bfloat162half(x)) / (1.0f + expf(-__half2float(__bfloat162half(x)))) * __half2float(__bfloat162half(y))))
+BINARY_OP(__nv_bfloat16, bsilu_mul_bf16, (x / (static_cast<__nv_bfloat16>(1.0f) + expg(-x))) * y)
 #endif
 #if __CUDA_ARCH__ >= 530
-BINARY_OP(__half, bsilu_mul_f16, (__half)(__half2float(x) / (1.0f + expf(-__half2float(x))) * __half2float(y)))
+BINARY_OP(__half, bsilu_mul_f16, (x / (static_cast<__half>(1.0f) + expg(-x))) * y)
 #endif
 BINARY_OP(float, bsilu_mul_f32, (x / (1.0f + expf(-x))) * y)
 
