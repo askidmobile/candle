@@ -6290,7 +6290,16 @@ impl ModelWeights {
             .embedding(tokens)?
             .reshape((b_sz, 1usize, self.hidden_size()))?;
 
-        for block in self.blocks.iter_mut() {
+        for (bi, block) in self.blocks.iter_mut().enumerate() {
+            // Бисекция захвата: QWEN36_GRAPH_MAX_LAYERS=N обрезает слои (только для отладки,
+            // математика сломана — не для продакшена).
+            if let Ok(max_layers) = std::env::var("QWEN36_GRAPH_MAX_LAYERS") {
+                if let Ok(m) = max_layers.parse::<usize>() {
+                    if bi >= m {
+                        break;
+                    }
+                }
+            }
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots)?;
         }
         // Инкремент kv_len — после ВСЕХ attention слоёв.
