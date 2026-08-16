@@ -41,11 +41,11 @@ fn cuda_fa2_paged_qwen35_dims() -> Result<()> {
         page,
         None,
     )?;
-    let q_ref = q.unsqueeze(2)?; // [1, n_head, 1, hd]
+    let q_ref = q.unsqueeze(1)?; // [1, 1, n_head, hd] = (b, seq, heads, hd)
     let k_ref = k_seq.unsqueeze(0)?;
     let v_ref = v_seq.unsqueeze(0)?;
     let out_ref = candle_flash_attn::flash_attn(&q_ref, &k_ref, &v_ref, scale as f32, true)?;
-    let out_ref = out_ref.squeeze(2)?;
+    let out_ref = out_ref.squeeze(1)?;
     let diff = (&out_paged.to_dtype(DType::F32)? - &out_ref.to_dtype(DType::F32)?)?
         .abs()?
         .max_all()?
