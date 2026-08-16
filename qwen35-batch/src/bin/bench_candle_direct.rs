@@ -25,7 +25,9 @@ fn main() -> Result<()> {
 
     // Warmup
     {
-        let mut scheduler = BatchScheduler::new(&mut adapter, 1, 248046, 248320);
+        let eos = adapter.eos();
+        let vocab = adapter.vocab_size();
+        let mut scheduler = BatchScheduler::new(&mut adapter, 1, eos, vocab);
         scheduler.submit(vec![9707; 16], 8);
         while scheduler.step()? != qwen35_batch::scheduler::StepOutcome::Idle {}
         scheduler.model_mut().reset_slot(0)?;
@@ -71,7 +73,9 @@ fn main() -> Result<()> {
         if let Device::Cuda(c) = &device {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
         }
-        let mut scheduler = BatchScheduler::new(&mut adapter, 1, 248046, 248320);
+        let eos = adapter.eos();
+        let vocab = adapter.vocab_size();
+        let mut scheduler = BatchScheduler::new(&mut adapter, 1, eos, vocab);
         scheduler.submit(vec![9707; 32], 128);
         scheduler.step()?; // prefill
         let t0 = Instant::now();
@@ -99,7 +103,9 @@ fn main() -> Result<()> {
         if let Device::Cuda(c) = &device {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
         }
-        let mut scheduler = BatchScheduler::new(&mut adapter, 4, 248046, 248320);
+        let eos = adapter.eos();
+        let vocab = adapter.vocab_size();
+        let mut scheduler = BatchScheduler::new(&mut adapter, 4, eos, vocab);
         for _ in 0..4 {
             scheduler.submit(vec![9707; 32], 128);
         }

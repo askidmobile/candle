@@ -197,8 +197,8 @@ pub struct PagedKvPool {
 impl PagedKvPool {
     pub fn new(dev: &Device, num_blocks: usize, n_kv: usize, hd: usize) -> Result<Self> {
         let shape = (num_blocks, PAGE_SIZE, n_kv, hd);
-        let k_pool = Tensor::zeros(shape, DType::F16, dev)?;
-        let v_pool = Tensor::zeros(shape, DType::F16, dev)?;
+        let k_pool = unsafe { dev.alloc_uninit(shape, DType::F16)? };
+        let v_pool = unsafe { dev.alloc_uninit(shape, DType::F16)? };
         Ok(Self { k_pool, v_pool })
     }
 
