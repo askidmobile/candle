@@ -1366,7 +1366,7 @@ impl CudaStorage {
             dtype: self.dtype,
         })
     }
-}
+
     pub fn wrap_cuda_slice<T: CudaDType>(slice: CudaSlice<T>, device: CudaDevice) -> CudaStorage {
         T::wrap_cuda_slice(slice, device)
     }
