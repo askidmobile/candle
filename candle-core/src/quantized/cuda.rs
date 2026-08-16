@@ -144,7 +144,7 @@ fn quantize_q8_1(
 
         let mut builder = func.builder();
         builder.arg(&src_chunk);
-        builder.arg(&dst_chunk);
+        builder.arg(&mut dst_chunk);
         barg!(builder, k as i32, kx_padded as i32);
         unsafe { builder.launch(cfg) }.w()?;
 
