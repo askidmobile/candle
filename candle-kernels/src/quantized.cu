@@ -3701,6 +3701,7 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     return d * sumi;
 }
 
+static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
     const block_q4_0 * bq4_0 = (const block_q4_0 *) vbq;
