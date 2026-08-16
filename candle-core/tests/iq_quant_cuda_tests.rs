@@ -619,6 +619,77 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     Ok(())
 }
 
+/// Кастомные ядра с raw u64-pointer аргументами (cumsum/increment стиль) в графе.
+#[test]
+fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
+    use candle_core::cuda_backend::cudarc;
+    use cudarc::driver::{result as cres, sys as csys, LaunchConfig, PushKernelArg};
+    let device = Device::new_cuda(0)?;
+    let cuda_dev = device.as_cuda_device()?;
+    let stream = cuda_dev.cuda_stream();
+
+    let kv_len = cuda_dev.alloc_zeros::<u32>(4)?;
+    let slots = cuda_dev.alloc_zeros::<u32>(4)?;
+    let out_t = Tensor::zeros(5, DType::U32, &device)?;
+
+    let func = cuda_dev.get_or_load_func(
+        "cumsum_seqlens_from_kvlen",
+        &candle_core::cuda_backend::kernels::QUANTIZED,
+    )?;
+    // Prime eager.
+    let out_ptr = {
+        let (st, layout) = out_t.storage_and_layout();
+        let cuda = match &*st {
+            candle_core::Storage::Cuda(c) => c,
+            _ => candle_core::bail!("not cuda"),
+        };
+        let slice = cuda.as_cuda_slice::<u32>()?;
+        let (p, _g) = cudarc::driver::DevicePtr::device_ptr(&slice.slice(layout.start_offset()..), slice.stream());
+        p
+    };
+    {
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut b = func.builder();
+        b.arg(&kv_len);
+        b.arg(&slots);
+        b.arg(&out_ptr);
+        b.arg(&4i32);
+        unsafe { b.launch(cfg) }.map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+    }
+    stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+
+    unsafe {
+        cres::stream::begin_capture(
+            stream.cu_stream(),
+            csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
+    {
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 };
+        let mut b = func.builder();
+        b.arg(&kv_len);
+        b.arg(&slots);
+        b.arg(&out_ptr);
+        b.arg(&4i32);
+        unsafe { b.launch(cfg) }.map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+    }
+    let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+        .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?;
+    assert!(!cu_graph.is_null());
+    let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+    let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "instantiate: {res:?}");
+    let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch: {res:?}");
+    stream.synchronize().map_err(|e| candle_core::Error::Msg(format!("sync2: {e}")))?;
+    unsafe {
+        csys::cuGraphExecDestroy(exec);
+        csys::cuGraphDestroy(cu_graph);
+    }
+    Ok(())
+}
+
 /// То же, но с PTX quantized ядром + cuBLAS matmul внутри захвата.
 #[test]
 fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
