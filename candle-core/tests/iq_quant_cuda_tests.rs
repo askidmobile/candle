@@ -611,10 +611,17 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     let mut exec: csys::CUgraphExec = std::ptr::null_mut();
     unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
     assert!(!exec.is_null(), "instantiate failed");
-    unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch1: {res:?}");
     stream
         .synchronize()
-        .map_err(|e| candle_core::Error::Msg(format!("sync: {e}")))?;
+        .map_err(|e| candle_core::Error::Msg(format!("sync1: {e}")))?;
+    // Второй launch того же exec — модельный сценарий делает N replay подряд.
+    let res = unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) };
+    assert_eq!(res, csys::CUresult::CUDA_SUCCESS, "launch2: {res:?}");
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync2: {e}")))?;
     let y0 = y.to_vec1::<f32>()?;
     assert!(y0.iter().all(|&v| v == 2.0), "graph replay wrong: {:?}", &y0[..4]);
     unsafe {
