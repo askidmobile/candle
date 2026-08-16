@@ -942,6 +942,12 @@ impl Qwen35BatchAdapter {
             let stream = cuda_dev.cuda_stream();
             let capture_result = (|| -> Result<DecodeGraphState> {
                 use cudarc::driver::{result as cres, sys as csys};
+                // ВНИМАНИЕ: память, выделенная ВНУТРИ захвата, принадлежит graph pool —
+                // её адреса валидны только внутри graph launch. Внешний D2H по ним →
+                // illegal address. Поэтому выход копируем во ВНЕШНИЙ (default pool,
+                // выделен ДО захвата) буфер D2D-нодой внутри графа.
+                let ids_eager = Tensor::from_vec(tokens.to_vec(), (b, 1usize), &self.device)?;
+                let logits_out = Tensor::zeros((b, 1usize, self.vocab), DType::F32, &self.device)?;
                 unsafe {
                     cres::stream::begin_capture(
                         stream.cu_stream(),
@@ -955,11 +961,16 @@ impl Qwen35BatchAdapter {
                 let (logits_t, hidden_t) = match forward_result {
                     Ok(v) => v,
                     Err(e) => {
-                        // Обязательно завершаем захват, иначе stream остаётся в capture mode.
                         let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
                         return Err(anyhow!("graphed forward (capture): {e}"));
                     }
                 };
+                // D2D копия внутри графа: graph-pool → внешний буфер.
+                if let Err(e) = logits_out.slice_set(&logits_t, 0, 0) {
+                    let _ = unsafe { cres::stream::end_capture(stream.cu_stream()) };
+                    return Err(anyhow!("logits_out copy: {e}"));
+                }
+                drop(logits_t);
                 let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
                     .map_err(|e| anyhow!("end_capture: {e}"))?;
                 if cu_graph.is_null() {
@@ -985,7 +996,7 @@ impl Qwen35BatchAdapter {
                     b,
                     slots: slots.to_vec(),
                     ids_t: ids_eager.clone(),
-                    logits_t,
+                    logits_t: logits_out,
                     hidden_t,
                 })
             })();
