@@ -31,8 +31,8 @@ fn main() -> Result<()> {
         scheduler.model_mut().reset_slot(0)?;
     }
 
-    // Prefill 512 & 2048 (B=1)
-    for p_len in [512, 2048] {
+    // Prefill 512 (B=1)
+    for p_len in [512] {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(c) = &device {
             let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
