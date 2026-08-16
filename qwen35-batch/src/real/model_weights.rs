@@ -6314,6 +6314,9 @@ impl ModelWeights {
             .reshape((b_sz, 1usize, self.hidden_size()))?;
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
+            if crate::scheduler::trace_on() {
+                eprintln!("[graphed-step] block {bi} start");
+            }
             // Бисекция захвата: QWEN36_GRAPH_MAX_LAYERS=N обрезает слои (только для отладки,
             // математика сломана — не для продакшена).
             if let Ok(max_layers) = std::env::var("QWEN36_GRAPH_MAX_LAYERS") {
@@ -6324,6 +6327,9 @@ impl ModelWeights {
                 }
             }
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots)?;
+            if crate::scheduler::trace_on() {
+                eprintln!("[graphed-step] block {bi} end");
+            }
         }
         // Инкремент kv_len — после ВСЕХ attention слоёв.
         ctx.launch_increment(b_sz)?;
