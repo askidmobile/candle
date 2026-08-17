@@ -363,8 +363,19 @@ pub fn dispatch_delta_rule_prefill(
     let gated = unsafe { dev.alloc::<f32>(t_len * value_dim)? };
 
     let p = *params;
+    let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
+    let sync_t = |dev: &CudaDevice| -> std::time::Instant {
+        if gprof2 {
+            let _ = dev.cuda_stream().synchronize();
+        }
+        std::time::Instant::now()
+    };
+    let mut t_p1 = 0f64;
+    let mut t_p2 = 0f64;
+    let mut t_p3 = 0f64;
 
     // P1: conv1d по всей последовательности.
+    let t_start = sync_t(dev);
     {
         let func = dev.get_or_load_func("delta_conv1d_prefill", &candle_kernels::DELTA_RULE)?;
         let cfg = LaunchConfig {
