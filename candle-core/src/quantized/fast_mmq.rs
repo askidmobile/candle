@@ -1,14 +1,14 @@
-//! CUDA fast path for GGUF matmul (fallback stub when libmoe.a is not compiled).
+//! CUDA fast path для плотного prefill: Tensor-Core MMA MMQ (llama.cpp mul_mat_q).
+//! Активен при m > 8 (batch/seq). Для m <= 8 используется MMVQ (fast_mmvq/dequantize_matmul_vec).
 
 use super::cuda::QCudaStorage;
 use crate::{CudaStorage, Result, Shape};
 
 pub fn try_fwd(
-    _qstorage: &QCudaStorage,
-    _self_shape: &Shape,
-    _rhs: &CudaStorage,
-    _rhs_l: &crate::Layout,
+    qstorage: &QCudaStorage,
+    self_shape: &Shape,
+    rhs: &CudaStorage,
+    rhs_l: &crate::Layout,
 ) -> Result<Option<(CudaStorage, Shape)>> {
-    // Falls back to dequantize_matmul_vec / dequantize_matmul in quantized/cuda.rs (PTX runtime)
-    Ok(None)
+    qstorage.mul_mat_q_mma(self_shape, rhs, rhs_l)
 }

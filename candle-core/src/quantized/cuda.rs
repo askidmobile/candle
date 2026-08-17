@@ -1391,6 +1391,137 @@ impl QCudaStorage {
         }
     }
 
+    /// Tensor-Core MMA MMQ (llama.cpp mul_mat_q) для плотного prefill (m>8).
+    /// Возвращает None, если dtype/форма не поддержаны — caller фолбэчится.
+    pub fn mul_mat_q_mma(
+        &self,
+        self_shape: &crate::Shape,
+        storage: &CudaStorage,
+        layout: &crate::Layout,
+    ) -> Result<Option<(CudaStorage, crate::Shape)>> {
+        use crate::backend::BackendStorage;
+        // dtype → (тэг ядра, mma tile_x_k, quant-обёртка)
+        let (tag, tile_x_k, quant_kernel): (&str, usize, &str) = match self.dtype {
+            GgmlDType::Q2K => ("q2_k", 100, "candle_mmq_quant_d2s6"),
+            GgmlDType::Q3K => ("q3_k", 84, "candle_mmq_quant_d4"),
+            GgmlDType::Q4K => ("q4_k", 76, "candle_mmq_quant_ds4"),
+            GgmlDType::Q5K => ("q5_k", 76, "candle_mmq_quant_ds4"),
+            GgmlDType::Q6K => ("q6_k", 76, "candle_mmq_quant_d4"),
+            GgmlDType::Q4_0 => ("q4_0", 76, "candle_mmq_quant_ds4"),
+            GgmlDType::Q8_0 => ("q8_0", 76, "candle_mmq_quant_d4"),
+            _ => return Ok(None),
+        };
+        let (n, k) = self_shape.dims2()?;
+        let (b, m, k2) = match layout.shape().dims() {
+            [b, m, k2] => (*b, *m, *k2),
+            [m, k2] => (1, *m, *k2),
+            _ => return Ok(None),
+        };
+        if k2 != k {
+            return Ok(None);
+        }
+        let m_total = b * m;
+        const MMQ_Y: usize = 128;
+        const MMQ_NWARPS: usize = 8;
+        const BLOCK_Q8_1_MMQ: usize = 144;
+        // need_check=false требует nrows_x % MMQ_Y == 0; decode (m<=8) идёт через MMVQ.
+        if n % MMQ_Y != 0 || m_total < 9 {
+            return Ok(None);
+        }
+        let dev = &self.device;
+        let rhs = storage.as_cuda_slice::<f32>()?;
+        let rhs = match layout.contiguous_offsets() {
+            Some((o1, o2)) => rhs.slice(o1..o2),
+            None => return Ok(None),
+        };
+
+        // mmq_x: наибольший из {128,64,32} с shared-mem <= optin лимита.
+        let pad_to = |a: usize, al: usize| ((a + al - 1) / al) * al;
+        let nbs_for = |mmq_x: usize| {
+            let nbs_ids = mmq_x * 4;
+            let nbs_x = MMQ_Y * tile_x_k * 4;
+            let nbs_y = pad_to(mmq_x * BLOCK_Q8_1_MMQ, MMQ_NWARPS * WARP_SIZE * 4);
+            nbs_ids + nbs_x + nbs_y
+        };
+        let smpbo = 100 * 1024; // optin shared-mem лимит (sm_86 ~99KB, берём с запасом)
+        let mmq_x = [128usize, 64, 32]
+            .into_iter()
+            .find(|&x| nbs_for(x) <= smpbo)
+            .unwrap_or(32);
+        let nbs = nbs_for(mmq_x);
+
+        // 1) Квантизация активаций в q8_1_mmq.
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let blocks_per_row = k_padded / 32; // QK8_1 = 32
+        let y_bytes = m_total * blocks_per_row * BLOCK_Q8_1_MMQ;
+        let y_mmq = unsafe { dev.alloc::<u8>(y_bytes)? };
+        let qfunc = dev.get_or_load_func(quant_kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
+        let qcfg = cudarc::driver::LaunchConfig {
+            grid_dim: (m_total as u32, ceil_div(k_padded, 512) as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        {
+            let mut qb = qfunc.builder();
+            qb.arg(&rhs);
+            qb.arg(&y_mmq);
+            barg!(
+                qb,
+                /* ne00 */ k as i64,
+                /* s01  */ k as i64,
+                /* ne0  */ k_padded as i64,
+                /* ne1  */ m_total as i32
+            );
+            unsafe { qb.launch(qcfg) }.w()?;
+        }
+
+        // 2) MMQ Tensor-Core GEMM: dst = weight[n,k] @ act[k,m] → [m,n].
+        let kernel_name = format!("candle_mmq_{tag}_x{mmq_x}");
+        let func = dev.get_or_load_func(&kernel_name, &candle_kernels::CANDLE_MMQ_DENSE)?;
+        if nbs > 48 * 1024 {
+            func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                nbs as i32,
+            )
+            .map_err(|e| crate::Error::Msg(format!("mmq set_attribute: {e:?}")))?;
+        }
+        let dst = unsafe { dev.alloc::<f32>(n * m_total)? };
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (
+                ceil_div(n, MMQ_Y) as u32,
+                ceil_div(m_total, mmq_x) as u32,
+                1,
+            ),
+            block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+            shared_mem_bytes: nbs as u32,
+        };
+        {
+            let mut mb = func.builder();
+            mb.arg(&self.data.inner);
+            mb.arg(&y_mmq);
+            mb.arg(&dst);
+            barg!(
+                mb,
+                /* ncols_x      */ k as i32,
+                /* nrows_x      */ n as i32,
+                /* ncols_dst    */ m_total as i32,
+                /* stride_row_x */ k as i32,
+                /* ncols_y      */ m_total as i32,
+                /* stride_col_dst */ n as i32,
+                /* ncols_max    */ m_total as i32
+            );
+            unsafe { mb.launch(cfg) }.w()?;
+        }
+
+        let mut out_shape = layout.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(n);
+        Ok(Some((
+            CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+            out_shape.into(),
+        )))
+    }
+
     pub fn data(&self) -> Result<Vec<u8>> {
         let mut out = vec![0u8; self.data.len];
         self.device
