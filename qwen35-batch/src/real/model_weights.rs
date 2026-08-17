@@ -6379,17 +6379,10 @@ impl ModelWeights {
             .reshape((b_sz, 1usize, self.hidden_size()))?;
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
-            if crate::scheduler::trace_on() {
-                use std::io::Write;
-                eprintln!("[graphed-step] block {bi} start");
-                let _ = std::io::stderr().flush();
-            }
-            layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots)?;
-            if crate::scheduler::trace_on() {
-                use std::io::Write;
-                eprintln!("[graphed-step] block {bi} end");
-                let _ = std::io::stderr().flush();
-            }
+            layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
+                eprintln!("[graphed-step] ERROR in block {bi} ({:?}): {e:?}", block.device());
+                e
+            })?;
         }
         // Инкремент kv_len — после ВСЕХ attention слоёв.
         ctx.launch_increment(b_sz)?;
