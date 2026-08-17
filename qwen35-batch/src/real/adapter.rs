@@ -25,6 +25,8 @@ use crate::real::model_profile::ModelProfile;
 use crate::real::model_weights::{
     BatchedStateCheckpoint, ModelWeights, StateSnapshot, DECODE_BATCH_CAPACITY,
 };
+#[cfg(feature = "cuda")]
+use crate::real::model_weights::GRAPH_MIN_FREE_BYTES;
 use crate::real::mtp::Qwen35Mtp;
 use crate::real::multimodal::{GridThw, PositionPlan};
 use crate::real::vision::Qwen35Vision;
@@ -224,15 +226,17 @@ impl Qwen35BatchAdapter {
             if !want {
                 false
             } else if let Device::Cuda(c) = &device {
-                // Графы требуют +VRAM (graph pool + CUDA embedding).
-                // При < 1.2 GiB запаса после загрузки — отключаем: на 27B
-                // (11.0 GiB весов на 12GB) лишние ~0.5 GiB уходят в sysmem и
-                // душат decode сильнее, чем экономия на launch overhead.
+                // Графы требуют +VRAM (graph pool + CUDA embedding). При нехватке
+                // запаса после загрузки — отключаем: на 27B (11.0 GiB весов на
+                // 12GB) лишние ~0.5 GiB уходят в sysmem и душат decode сильнее,
+                // чем экономия на launch overhead. Порог общий с гейтом
+                // эмбеддинга — см. GRAPH_MIN_FREE_BYTES в model_weights.rs.
                 let free = c.cuda_stream().context().mem_get_info().map(|(f, _)| f).unwrap_or(0);
-                if free < 200 * 1024 * 1024 {
+                if free < GRAPH_MIN_FREE_BYTES {
                     log::info!(
-                        "[graphs] disabled: VRAM headroom {:.0} MiB < 200 MiB",
-                        free as f64 / 1048576.0
+                        "[graphs] disabled: VRAM headroom {:.0} MiB < {} MiB",
+                        free as f64 / 1048576.0,
+                        GRAPH_MIN_FREE_BYTES / 1048576
                     );
                     false
                 } else {

@@ -1147,9 +1147,14 @@ fn mmq_mma_matches_reference() -> Result<()> {
         let max = diff.max_all()?.to_scalar::<f32>()?;
         let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
         println!("MMQ {dtype:?}: max_abs_diff={max:.6} scale={scale:.4}");
+        // MMQ квантует активации в q8_1, как и MMVQ, но аккумулирует иначе
+        // (int32 с f16-масштабами, раскладка D4/DS4/D2S6) — отсюда допуск
+        // шире, чем 2e-3 у MMVQ. Наблюдаемое отклонение 0.5-0.9% на всех семи
+        // типах; порог 1.5% даёт ~2x запаса и при этом ловит поломку ядра.
+        // Прежние 8% пропускали бы почти любую регрессию.
         assert!(
-            max < 0.08 * scale,
-            "MMQ {dtype:?} mismatch: max_abs_diff={max} vs scale={scale}"
+            max < 0.015 * scale,
+            "MMQ {dtype:?} mismatch: max_abs_diff={max} vs scale={scale} (tolerance 1.5%)"
         );
     }
     Ok(())

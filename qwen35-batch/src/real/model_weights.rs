@@ -1515,6 +1515,25 @@ struct DeltaNetCudaContext {
 /// ~B × n_v×head_v_dim² × 4 байт ≈ KB–MB per layer — пренебрежимо vs весов.
 pub(crate) const DECODE_BATCH_CAPACITY: u32 = 4;
 
+// ── Пороги свободной VRAM ────────────────────────────────────────────────────
+// Раньше эти числа жили в трёх местах и расходились: комментарий обещал 1.2 GiB,
+// код графов проверял 200 MiB, а гейт эмбеддинга закорачивался через
+// `|| force_graphs`. Держим их здесь, одним набором.
+
+/// Минимум свободной VRAM для дублирующего `token_embd` на GPU (~2.2 GiB на 27B).
+#[cfg(feature = "cuda")]
+pub(crate) const EMBED_MIN_FREE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Резерв поверх обычного минимума, когда запрошены CUDA-графы: захват держит
+/// собственный пул аллокаций (~0.5 GiB на 27B).
+#[cfg(feature = "cuda")]
+pub(crate) const GRAPH_POOL_RESERVE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Минимум свободной VRAM, при котором графы вообще включаются.
+/// Значение измерено на 27B — не менять без повторного замера.
+#[cfg(feature = "cuda")]
+pub(crate) const GRAPH_MIN_FREE_BYTES: usize = 200 * 1024 * 1024;
+
 /// Рантайм-capacity batched decode state. По умолчанию = DECODE_BATCH_CAPACITY;
 /// адаптер выставляет = num_slots до загрузки модели (экономия VRAM: state
 /// DeltaNet ~8MB/слой/слот — на 27B 4 слота = +400MB мёртвой памяти при 1 слоте).
@@ -4587,10 +4606,24 @@ impl ModelWeights {
                 let out_mm = QMatMul::from_qtensor(v)?;
                 #[cfg(feature = "cuda")]
                 let emb_mm = if device.is_cuda() {
-                    // Загружаем дублирующий token_embd на GPU если свободной VRAM > 1.0 GB или включены CUDA графы
+                    // Дублирующий token_embd на GPU — только при реальном запасе VRAM.
+                    // Запрошенные графы поднимают планку (им нужен свой пул), а НЕ
+                    // отменяют проверку: прежнее `|| force_graphs` закорачивало гейт
+                    // целиком, и на 27B эмбеддинг съедал VRAM, после чего графы всё
+                    // равно отключались по своему порогу — худшее из двух.
                     let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
                         let force_graphs = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
-                        cuda_dev.cuda_stream().context().mem_get_info().map(|(free, _)| free > 1024 * 1024 * 1024 || force_graphs).unwrap_or(false)
+                        let need = if force_graphs {
+                            EMBED_MIN_FREE_BYTES + GRAPH_POOL_RESERVE_BYTES
+                        } else {
+                            EMBED_MIN_FREE_BYTES
+                        };
+                        cuda_dev
+                            .cuda_stream()
+                            .context()
+                            .mem_get_info()
+                            .map(|(free, _)| free > need)
+                            .unwrap_or(false)
                     } else {
                         false
                     };
