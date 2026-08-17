@@ -6379,6 +6379,7 @@ impl ModelWeights {
             .reshape((b_sz, 1usize, self.hidden_size()))?;
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
+            eprintln!("[graphed-step] block {bi} start");
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
                 eprintln!("[graphed-step] ERROR in block {bi} ({:?}): {e:?}", block.device());
                 e
