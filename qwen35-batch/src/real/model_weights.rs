@@ -6370,6 +6370,8 @@ impl ModelWeights {
         // seqlens_k — до attention слоёв (kv_len ещё не инкрементирован).
         ctx.launch_cumsum(b_sz)?;
 
+        let prof = crate::scheduler::trace_on();
+        let t_emb = std::time::Instant::now();
         let emb = self
             .tok_embeddings_cuda
             .as_ref()
@@ -6377,18 +6379,31 @@ impl ModelWeights {
         let mut layer_in = emb
             .embedding(tokens)?
             .reshape((b_sz, 1usize, self.hidden_size()))?;
+        let emb_ms = t_emb.elapsed().as_secs_f64() * 1000.0;
 
+        let t_blocks = std::time::Instant::now();
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
                 eprintln!("[graphed-step] ERROR in block {bi}: {e:?}");
                 e
             })?;
         }
+        let blocks_ms = t_blocks.elapsed().as_secs_f64() * 1000.0;
         // Инкремент kv_len — после ВСЕХ attention слоёв.
         ctx.launch_increment(b_sz)?;
 
+        let t_head = std::time::Instant::now();
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
-        Ok((self.output.forward(&hidden)?, hidden))
+        let logits = self.output.forward(&hidden)?;
+        let head_ms = t_head.elapsed().as_secs_f64() * 1000.0;
+        if prof {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n % 64 == 0 {
+                eprintln!("[gprof] #{n} emb={emb_ms:.1}ms blocks={blocks_ms:.1}ms head={head_ms:.1}ms");
+            }
+        }
+        Ok((logits, hidden))
     }
 
     /// Ленивая инициализация paged pools + ctx (первый graph decode).
