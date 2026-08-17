@@ -1892,6 +1892,14 @@ impl DeltaNetLayer {
         #[cfg(feature = "cuda")]
         if let Some(ctx) = self.cuda_ctx_batched.as_mut() {
             ctx.params.batch_size = b as u32;
+            let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
+            let mut sync = || {
+                if gprof2 {
+                    let _ = ctx.dev.cuda_stream().synchronize();
+                }
+                std::time::Instant::now()
+            };
+            let t0 = sync();
             batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
                 &ctx.dev,
                 &ctx.layer_state,
@@ -1903,6 +1911,10 @@ impl DeltaNetLayer {
                 &alpha_t,
                 slots,
             )?);
+            let dr_ms = sync().duration_since(t0).as_secs_f64() * 1000.0;
+            if gprof2 {
+                eprintln!("[dstep] delta_rule={dr_ms:.2}ms");
+            }
         }
         #[cfg(feature = "cuda")]
         if let Some(out) = batched_out_cuda {

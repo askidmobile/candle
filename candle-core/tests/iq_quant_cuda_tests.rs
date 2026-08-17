@@ -973,12 +973,12 @@ fn mmvq_perf_dense() -> Result<()> {
         for _ in 0..5 {
             let _ = qmatmul.forward(&y)?;
         }
-        cuda.cuda_stream().synchronize()?;
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
         let t0 = Instant::now();
         for _ in 0..iters {
             let _ = qmatmul.forward(&y)?;
         }
-        cuda.cuda_stream().synchronize()?;
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
         let el = t0.elapsed().as_secs_f64() / iters as f64;
         let gbs = total as f64 / el / 1e9;
         println!(
