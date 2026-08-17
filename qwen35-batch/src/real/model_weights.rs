@@ -1025,29 +1025,57 @@ struct DenseMlp {
 impl Module for DenseMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         #[cfg(target_os = "macos")]
-        let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
-        #[cfg(target_os = "macos")]
-        let w3 = dispatch_q4k_matmul(&self.feed_forward_w3, self.feed_forward_w3_opt.as_ref(), xs)?;
-        #[cfg(not(target_os = "macos"))]
-        let (w1, w3) = {
-            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs).ok().flatten();
-            let w1 = self.feed_forward_w1.forward_with_prequant(xs, prequant.as_ref())?;
-            let w3 = self.feed_forward_w3.forward_with_prequant(xs, prequant.as_ref())?;
-            (w1, w3)
-        };
-        // T-275: fused silu_mul via direct MetalStorage path (один kernel вместо двух)
-        let silu_mul = w1.silu_mul_direct(&w3)?;
-        #[cfg(target_os = "macos")]
         {
-            dispatch_q4k_matmul(
+            let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
+            let w3 = dispatch_q4k_matmul(&self.feed_forward_w3, self.feed_forward_w3_opt.as_ref(), xs)?;
+            let silu_mul = w1.silu_mul_direct(&w3)?;
+            return dispatch_q4k_matmul(
                 &self.feed_forward_w2,
                 self.feed_forward_w2_opt.as_ref(),
                 &silu_mul,
-            )
+            );
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.feed_forward_w2.forward(&silu_mul)
+            let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs).ok().flatten();
+            let g2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2")
+                && xs.device().is_cuda();
+            let sync = || {
+                if g2 {
+                    if let Ok(c) = xs.device().as_cuda_device() {
+                        let _ = c.cuda_stream().synchronize();
+                    }
+                }
+                std::time::Instant::now()
+            };
+            let t0 = sync();
+            let w1 = self.feed_forward_w1.forward_with_prequant(xs, prequant.as_ref())?;
+            let w3 = self.feed_forward_w3.forward_with_prequant(xs, prequant.as_ref())?;
+            let t13 = sync();
+            let silu_mul = w1.silu_mul_direct(&w3)?;
+            let ts = sync();
+            let out = self.feed_forward_w2.forward(&silu_mul)?;
+            let t2 = sync();
+            if g2 {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static C: AtomicU64 = AtomicU64::new(0);
+                static S13: AtomicU64 = AtomicU64::new(0);
+                static SS: AtomicU64 = AtomicU64::new(0);
+                static S2: AtomicU64 = AtomicU64::new(0);
+                let n = C.fetch_add(1, Ordering::Relaxed) + 1;
+                S13.fetch_add(t13.duration_since(t0).as_micros() as u64, Ordering::Relaxed);
+                SS.fetch_add(ts.duration_since(t13).as_micros() as u64, Ordering::Relaxed);
+                S2.fetch_add(t2.duration_since(ts).as_micros() as u64, Ordering::Relaxed);
+                if n % 256 == 0 {
+                    eprintln!(
+                        "[ffnprof] n={n} w13_avg={:.2}ms silu_avg={:.3}ms w2_avg={:.2}ms",
+                        S13.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                        SS.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                        S2.load(Ordering::Relaxed) as f64 / n as f64 / 1000.0,
+                    );
+                }
+            }
+            Ok(out)
         }
     }
 }
