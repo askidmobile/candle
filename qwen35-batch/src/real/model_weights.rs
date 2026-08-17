@@ -2182,6 +2182,9 @@ impl DeltaNetLayer {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             if !disable_fused {
+                let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
+                let t0 = std::time::Instant::now();
+                if gprof2 { let _ = ctx.dev.cuda_stream().synchronize(); }
                 let gated_all = delta_rule_cuda::dispatch_delta_rule_prefill(
                     &ctx.dev,
                     &mut ctx.layer_state,
@@ -2191,6 +2194,10 @@ impl DeltaNetLayer {
                     &beta_t,
                     &alpha_t,
                 )?;
+                if gprof2 {
+                    let _ = ctx.dev.cuda_stream().synchronize();
+                    eprintln!("[pfstep] delta seq={:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+                }
                 return self.ssm_out.forward(&gated_all);
             }
             let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
