@@ -6418,7 +6418,14 @@ impl ModelWeights {
             if let Err(e) = r { eprintln!("[gprof] record ev1: {e:?}"); }
         }
 
-        for (bi, block) in self.blocks.iter_mut().enumerate() {
+        // QWEN36_GRAPH_BLOCKS=N — perf-бисект: ограничить число блоков в графе
+        // (логиты мусорные, но replay-time валидно).
+        static BLOCK_LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let limit = *BLOCK_LIMIT.get_or_init(|| {
+            std::env::var("QWEN36_GRAPH_BLOCKS").ok().and_then(|v| v.parse().ok())
+        });
+        let n_take = limit.unwrap_or(usize::MAX);
+        for (bi, block) in self.blocks.iter_mut().take(n_take).enumerate() {
             if let Some(bevs) = self.gprof_block_events.as_ref() {
                 let stream = ctx.dev.cuda_stream().cu_stream();
                 let _ = unsafe { cudarc::driver::result::event::record(bevs[bi], stream) };
