@@ -1515,6 +1515,20 @@ struct DeltaNetCudaContext {
 /// ~B × n_v×head_v_dim² × 4 байт ≈ KB–MB per layer — пренебрежимо vs весов.
 pub(crate) const DECODE_BATCH_CAPACITY: u32 = 4;
 
+/// Рантайм-capacity batched decode state. По умолчанию = DECODE_BATCH_CAPACITY;
+/// адаптер выставляет = num_slots до загрузки модели (экономия VRAM: state
+/// DeltaNet ~8MB/слой/слот — на 27B 4 слота = +400MB мёртвой памяти при 1 слоте).
+static DECODE_CAPACITY_RT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DECODE_BATCH_CAPACITY);
+
+pub(crate) fn decode_capacity() -> u32 {
+    DECODE_CAPACITY_RT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_decode_capacity(n: u32) {
+    DECODE_CAPACITY_RT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Metal GPU batched-контекст DeltaNet (Phase 3 true batched decode).
 /// Pipelines + temp — shared (Arc) через все слои (один compile/аллокация);
 /// per-layer state — batched persistent буферы (leading B, capacity_b).
@@ -4740,7 +4754,7 @@ impl ModelWeights {
                 q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
                 rms_norm_eps: rms_norm_eps as f32,
                 heads_per_kv: (n_v_heads / n_k_heads) as u32,
-                batch_size: DECODE_BATCH_CAPACITY,
+                batch_size: decode_capacity(),
             };
             match metal::delta_rule_batched_metal::compile_delta_rule_batched_pipelines(metal_device)
             {
@@ -4748,13 +4762,13 @@ impl ModelWeights {
                     match metal::delta_rule_batched_metal::create_temp_buffers_batched(
                         metal_device,
                         &p,
-                        DECODE_BATCH_CAPACITY,
+                        decode_capacity(),
                     ) {
                         Ok(temp) => {
                             log::info!(
                                 "[{}] Metal delta_rule BATCHED: pipelines compiled, capacity_b={}",
                                 tag,
-                                DECODE_BATCH_CAPACITY
+                                decode_capacity()
                             );
                             Some((Arc::new(pipelines), Arc::new(temp), p))
                         }
@@ -4820,18 +4834,18 @@ impl ModelWeights {
                 q_scale: 1.0 / (head_k_dim_delta as f32).sqrt(),
                 rms_norm_eps: rms_norm_eps as f32,
                 heads_per_kv: (n_v_heads / n_k_heads) as u32,
-                batch_size: DECODE_BATCH_CAPACITY,
+                batch_size: decode_capacity(),
             };
             match delta_rule_batched_cuda::create_temp_buffers_batched(
                 cuda_dev,
                 &p,
-                DECODE_BATCH_CAPACITY,
+                decode_capacity(),
             ) {
                 Ok(temp) => {
                     log::info!(
                         "[{}] CUDA delta_rule BATCHED: temp created, capacity_b={}",
                         tag,
-                        DECODE_BATCH_CAPACITY
+                        decode_capacity()
                     );
                     Some((cuda_dev.clone(), Arc::new(temp), p))
                 }
@@ -5008,7 +5022,7 @@ impl ModelWeights {
 
                 // Per-slot CPU state для batched decode fallback (без batched GPU ctx).
                 // Всегда аллоцируем — память пренебрежимо мала vs весов.
-                let cpu_state_batched = (0..DECODE_BATCH_CAPACITY as usize)
+                let cpu_state_batched = (0..decode_capacity() as usize)
                     .map(|_| DeltaNetState::new(conv_kernel, conv_channels, n_v_heads, head_v_dim))
                     .collect::<Vec<_>>();
 
@@ -5111,7 +5125,7 @@ impl ModelWeights {
                         match metal::delta_rule_batched_metal::create_layer_metal_state_batched(
                             metal_device,
                             bp,
-                            DECODE_BATCH_CAPACITY,
+                            decode_capacity(),
                             &conv_kernel_weights,
                             &dt_bias,
                             &ssm_a,
@@ -5142,7 +5156,7 @@ impl ModelWeights {
                         match delta_rule_batched_cuda::create_layer_cuda_state_batched(
                             bcuda_dev,
                             bp,
-                            DECODE_BATCH_CAPACITY,
+                            decode_capacity(),
                             &conv_kernel_weights,
                             &dt_bias,
                             &ssm_a,
@@ -5300,9 +5314,9 @@ impl ModelWeights {
                     kv_cache_len: 0,
                     max_cache_len: context_length,
                     attn_window,
-                    kv_cache_batched: (0..DECODE_BATCH_CAPACITY as usize).map(|_| None).collect(),
+                    kv_cache_batched: (0..decode_capacity() as usize).map(|_| None).collect(),
                     use_q8_f16_kv_cache,
-                    kv_cache_len_batched: vec![0; DECODE_BATCH_CAPACITY as usize],
+                    kv_cache_len_batched: vec![0; decode_capacity() as usize],
                     kv_cache_cap_batched: 0,
                     #[cfg(feature = "cuda")]
                     paged_pool: None,
@@ -5591,10 +5605,10 @@ impl ModelWeights {
                 snap.blocks.len(), self.blocks.len()
             );
         }
-        if slot >= DECODE_BATCH_CAPACITY as usize {
+        if slot >= decode_capacity() as usize {
             candle_core::bail!(
                 "seed_slot_batched: slot {slot} >= capacity {}",
-                DECODE_BATCH_CAPACITY
+                decode_capacity()
             );
         }
 
@@ -5683,8 +5697,8 @@ impl ModelWeights {
         device: &Device,
         slot: usize,
     ) -> Result<BatchedStateCheckpoint> {
-        if slot >= DECODE_BATCH_CAPACITY as usize {
-            candle_core::bail!("checkpoint slot {slot} >= capacity {DECODE_BATCH_CAPACITY}");
+        if slot >= decode_capacity() as usize {
+            candle_core::bail!("checkpoint slot {slot} >= capacity {}", decode_capacity());
         }
         let mut blocks = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
@@ -5738,7 +5752,7 @@ impl ModelWeights {
         checkpoint: &BatchedStateCheckpoint,
     ) -> Result<()> {
         if checkpoint.model_nonce != self.instance_nonce
-            || checkpoint.slot >= DECODE_BATCH_CAPACITY as usize
+            || checkpoint.slot >= decode_capacity() as usize
             || checkpoint.blocks.len() != self.blocks.len()
         {
             candle_core::bail!("batched checkpoint is incompatible with model");
@@ -6502,7 +6516,7 @@ impl ModelWeights {
         let mut model_attn_window: Option<usize> = None;
         let mut dims: Option<(usize, usize)> = None; // (n_kv, hd)
         let mut num_attn_layers = 0usize;
-        let mut capacity_b = DECODE_BATCH_CAPACITY as usize;
+        let mut capacity_b = decode_capacity() as usize;
         for block in self.blocks.iter() {
             if let HybridLayerType::Attention(a) = &block.layer {
                 model_attn_window = Some(a.attn_window);

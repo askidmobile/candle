@@ -139,6 +139,8 @@ impl Qwen35BatchAdapter {
                 "num_slots {num_slots} exceeds decode capacity {DECODE_BATCH_CAPACITY}"
             ));
         }
+        // Batched state ровно под num_slots (DeltaNet ~8MB/слой/слот на 27B).
+        crate::real::model_weights::set_decode_capacity(num_slots as u32);
         #[cfg(feature = "cuda")]
         if let Device::Cuda(cuda_dev) = &device {
             static RETAIN_ONCE: std::sync::Once = std::sync::Once::new();
