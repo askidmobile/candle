@@ -405,6 +405,7 @@ impl Qwen35MoeBlock {
         let device = xs.device();
         let cuda_dev = device.as_cuda_device()?;
 
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 1. router logits"); let _ = std::io::stderr().flush(); }
         // Router на GPU.
         let logits = self
             .router
@@ -412,6 +413,7 @@ impl Qwen35MoeBlock {
             .forward(xs)?
             .to_dtype(DType::F32)?
             .contiguous()?;
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 2. softmax topk"); let _ = std::io::stderr().flush(); }
         let (ids_t, w_t) = gpu_softmax_topk(
             cuda_dev,
             &logits,
@@ -420,22 +422,29 @@ impl Qwen35MoeBlock {
             self.router.norm_topk_prob,
         )?;
 
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 3. x3 prep"); let _ = std::io::stderr().flush(); }
         // Shared input [tokens, 1, n_embd]. Indexed kernels reuse each token row
         // across top-k routes; materializing [tokens, k, n_embd] wastes 8x memory.
         let x3 = xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?;
 
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 4. dual gate+up"); let _ = std::io::stderr().flush(); }
         // gate+up одним dual GEMM.
         let (gate, up) =
             self.routed
                 .gate
                 .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 5. act silu*up"); let _ = std::io::stderr().flush(); }
         let act = gate.silu()?.mul(&up)?.contiguous()?;
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 6. down"); let _ = std::io::stderr().flush(); }
         let down = self.routed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
 
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 7. weighted sum"); let _ = std::io::stderr().flush(); }
         // Взвешивание GPU-весами + редукция по topk.
         let w = w_t.unsqueeze(candle_core::D::Minus1)?; // [tokens, topk, 1]
         let routed = down.broadcast_mul(&w)?.sum(candle_core::D::Minus2)?;
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 8. shared expert"); let _ = std::io::stderr().flush(); }
         let shared = self.shared.forward(xs)?;
+        if crate::scheduler::trace_on() { eprintln!("[ptx-moe] 9. combine"); let _ = std::io::stderr().flush(); }
         routed.broadcast_add(&shared)
     }
 
