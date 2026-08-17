@@ -3524,18 +3524,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int mmq_x, bool need_check>
-#if defined(GGML_USE_HIP)
-#if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
-#endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
-#else
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
-#else
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
-#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-#endif // defined(GGML_USE_HIP)
-static __global__ void mul_mat_q(
+static __device__ __forceinline__ void mul_mat_q_impl(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
