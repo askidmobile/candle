@@ -4779,7 +4779,7 @@ impl ModelWeights {
                     Some((cuda_dev.clone(), Arc::new(temp), p))
                 }
                 Err(e) => {
-                    log::warn!(
+                    eprintln!(
                         "[{}] CUDA delta_rule BATCHED: temp error: {}. batched decode disabled.",
                         tag, e
                     );
@@ -5098,7 +5098,7 @@ impl ModelWeights {
                                 params: *bp,
                             }),
                             Err(e) => {
-                                log::warn!(
+                                eprintln!(
                                     "[{}] CUDA delta_rule batched layer {}: state error: {}",
                                     tag, layer_idx, e
                                 );
