@@ -108,6 +108,9 @@ objc2 = { version = "0.6.3" }
 objc2-metal = { version = "0.3.1", features = ["MTLAllocation", "MTLResidencySet", "MTLDevice", "MTLBuffer", "MTLResource"] }
 objc2-foundation = { version = "0.3.1" }
 
+[profile.release]
+debug = 1
+
 [profile.release-with-debug]
 inherits = "release"
 debug = true
