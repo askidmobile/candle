@@ -929,6 +929,19 @@ impl Qwen35BatchAdapter {
                 .model
                 .forward_decode_batch_graphed(&ids_eager, slots)
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
+            // Второй eager прогон: теплый (без PTX JIT первого запуска) — для измерений.
+            if self.model.gprof_events.is_some() {
+                {
+                    let ctx = self.model.paged_ctx.as_mut().unwrap();
+                    for &s in slots {
+                        ctx.kv_len_host[s as usize] += 1;
+                    }
+                }
+                let _ = self
+                    .model
+                    .forward_decode_batch_graphed(&ids_eager, slots)
+                    .map_err(|e| anyhow!("graphed forward (eager prime 2): {e}"))?;
+            }
             // GPU-сегменты eager-prime: та же последовательность ядер, что в графе.
             if let Some(ev) = self.model.gprof_events.as_ref() {
                 cuda_dev.cuda_stream().synchronize()?;
