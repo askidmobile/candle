@@ -3845,7 +3845,7 @@ impl HybridBlock {
     }
 
     /// Является ли этот блок DeltaNet слоем?
-    fn is_deltanet(&self) -> bool {
+    pub(crate) fn is_deltanet(&self) -> bool {
         matches!(self.layer, HybridLayerType::DeltaNet(_))
     }
 
