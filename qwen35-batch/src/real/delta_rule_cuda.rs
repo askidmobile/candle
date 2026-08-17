@@ -387,8 +387,10 @@ pub fn dispatch_delta_rule_prefill(
         b.arg(&t_u32);
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
+    if gprof2 { t_p1 = sync_t(dev).duration_since(t_start).as_secs_f64() * 1000.0; }
 
     // P2: L2 norm + expand + scale.
+    let t_p2_start = sync_t(dev);
     {
         let func = dev.get_or_load_func("delta_l2_norm_prefill", &candle_kernels::DELTA_RULE)?;
         let cfg = LaunchConfig {
@@ -405,9 +407,11 @@ pub fn dispatch_delta_rule_prefill(
         b.arg(&t_u32);
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
+    if gprof2 { t_p2 = sync_t(dev).duration_since(t_p2_start).as_secs_f64() * 1000.0; }
 
     // P3: рекуррентный delta rule, state в регистрах (warp-per-column).
     // grid = (n_v, hd/4), block = (32, 4).
+    let t_p3_start = sync_t(dev);
     {
         let func = dev.get_or_load_func("delta_rule_prefill", &candle_kernels::DELTA_RULE)?;
         let cfg = LaunchConfig {
@@ -427,8 +431,10 @@ pub fn dispatch_delta_rule_prefill(
         b.arg(&t_u32);
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
     }
+    if gprof2 { t_p3 = sync_t(dev).duration_since(t_p3_start).as_secs_f64() * 1000.0; }
 
     // P4: group RMS norm + SiLU gate.
+    let t_p4_start = sync_t(dev);
     {
         let func = dev.get_or_load_func("delta_norm_gate_prefill", &candle_kernels::DELTA_RULE)?;
         let cfg = LaunchConfig {
@@ -444,6 +450,10 @@ pub fn dispatch_delta_rule_prefill(
         b.arg(&p);
         b.arg(&t_u32);
         unsafe { b.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+    if gprof2 {
+        let t_p4 = sync_t(dev).duration_since(t_p4_start).as_secs_f64() * 1000.0;
+        eprintln!("[pfphases] T={t_len} p1={t_p1:.1} p2={t_p2:.1} p3={t_p3:.1} p4={t_p4:.1}");
     }
 
     // Persistent conv_state ← последние (conv_k-1) СЫРЫХ входов.
