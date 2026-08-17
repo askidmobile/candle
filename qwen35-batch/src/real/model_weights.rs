@@ -6367,16 +6367,20 @@ impl ModelWeights {
         if seq_len != 1 || slots.len() != b_sz {
             candle_core::bail!("invalid graphed decode dimensions");
         }
+        eprintln!("[graphed-step] 1. launch_cumsum");
         // seqlens_k — до attention слоёв (kv_len ещё не инкрементирован).
         ctx.launch_cumsum(b_sz)?;
 
+        eprintln!("[graphed-step] 2. get emb");
         let emb = self
             .tok_embeddings_cuda
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("no CUDA embedding".into()))?;
-        let mut layer_in = emb
-            .embedding(tokens)?
-            .reshape((b_sz, 1usize, self.hidden_size()))?;
+        eprintln!("[graphed-step] 3. emb.embedding");
+        let emb_t = emb.embedding(tokens)?;
+        eprintln!("[graphed-step] 4. emb reshape");
+        let mut layer_in = emb_t.reshape((b_sz, 1usize, self.hidden_size()))?;
+        eprintln!("[graphed-step] 5. entering blocks");
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             eprintln!("[graphed-step] block {bi} start");
