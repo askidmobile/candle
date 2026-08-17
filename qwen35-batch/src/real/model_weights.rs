@@ -6495,7 +6495,8 @@ impl ModelWeights {
             let mut evs = [std::ptr::null_mut(); 4];
             let mut ok = true;
             for e in evs.iter_mut() {
-                let res = unsafe { csys::cuEventCreate(e, 0) };
+                // CU_EVENT_RECORD_EXTERNAL (0x1) — обязателен для событий внутри graph capture.
+                let res = unsafe { csys::cuEventCreate(e, 1) };
                 if res != csys::CUresult::CUDA_SUCCESS {
                     ok = false;
                 }
