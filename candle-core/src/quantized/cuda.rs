@@ -1452,7 +1452,7 @@ impl QCudaStorage {
 
         // 1) Квантизация активаций в q8_1_mmq.
         let k_padded = pad(k, MATRIX_ROW_PADDING);
-        let blocks_per_row = k_padded / 32; // QK8_1 = 32
+        let blocks_per_row = k_padded / 128; // block_q8_1_mmq держит 4*QK8_1 = 128 значений
         let y_bytes = m_total * blocks_per_row * BLOCK_Q8_1_MMQ;
         let y_mmq = unsafe { dev.alloc::<u8>(y_bytes)? };
         let qfunc = dev.get_or_load_func(quant_kernel, &candle_kernels::CANDLE_MMQ_DENSE)?;
@@ -1476,6 +1476,8 @@ impl QCudaStorage {
         }
 
         // 2) MMQ Tensor-Core GEMM: dst = weight[n,k] @ act[k,m] → [m,n].
+        // stride_row_x в блоках кванта (block_size = qk: 256 для K-quants, 32 для legacy).
+        let stride_row_x = k / self.dtype.block_size();
         let kernel_name = format!("candle_mmq_{tag}_x{mmq_x}");
         let func = dev.get_or_load_func(&kernel_name, &candle_kernels::CANDLE_MMQ_DENSE)?;
         if nbs > 48 * 1024 {
@@ -1486,12 +1488,12 @@ impl QCudaStorage {
             .map_err(|e| crate::Error::Msg(format!("mmq set_attribute: {e:?}")))?;
         }
         let dst = unsafe { dev.alloc::<f32>(n * m_total)? };
+        // stream-k ветка ядра: grid.x = число тайлов (nty*ntx), grid.y/z=1.
+        // Каждый блок ведёт один output-тайл по всему k (fixup не нужен).
+        let ntx = ceil_div(m_total, mmq_x);
+        let nty = ceil_div(n, MMQ_Y);
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (
-                ceil_div(n, MMQ_Y) as u32,
-                ceil_div(m_total, mmq_x) as u32,
-                1,
-            ),
+            grid_dim: ((nty * ntx) as u32, 1, 1),
             block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
             shared_mem_bytes: nbs as u32,
         };
@@ -1505,7 +1507,7 @@ impl QCudaStorage {
                 /* ncols_x      */ k as i32,
                 /* nrows_x      */ n as i32,
                 /* ncols_dst    */ m_total as i32,
-                /* stride_row_x */ k as i32,
+                /* stride_row_x */ stride_row_x as i32,
                 /* ncols_y      */ m_total as i32,
                 /* stride_col_dst */ n as i32,
                 /* ncols_max    */ m_total as i32
