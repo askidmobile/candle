@@ -211,6 +211,13 @@ impl Qwen35BatchAdapter {
         let model =
             ModelWeights::from_gguf(ct, mmap, &device).map_err(|e| anyhow!("load weights: {e}"))?;
 
+        // После загрузки весов пул держит reserved-страницы от upload staging.
+        // Trim → commit возвращается к фактическим весам (важно для 27B на 12GB).
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &device {
+            let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+        }
+
         #[cfg(feature = "cuda")]
         let graphs_on = {
             let want = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
@@ -222,9 +229,9 @@ impl Qwen35BatchAdapter {
                 // (11.0 GiB весов на 12GB) лишние ~0.5 GiB уходят в sysmem и
                 // душат decode сильнее, чем экономия на launch overhead.
                 let free = c.cuda_stream().context().mem_get_info().map(|(f, _)| f).unwrap_or(0);
-                if free < 1280 * 1024 * 1024 {
+                if free < 200 * 1024 * 1024 {
                     log::info!(
-                        "[graphs] disabled: VRAM headroom {:.0} MiB < 1280 MiB",
+                        "[graphs] disabled: VRAM headroom {:.0} MiB < 200 MiB",
                         free as f64 / 1048576.0
                     );
                     false
