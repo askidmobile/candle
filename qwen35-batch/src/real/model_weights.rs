@@ -3934,7 +3934,11 @@ impl HybridBlock {
         if crate::scheduler::trace_on() { eprintln!("[fdbp] 4. ffn_norm"); let _ = std::io::stderr().flush(); }
         let normed = self.ffn_norm.forward(&x)?;
         if crate::scheduler::trace_on() { eprintln!("[fdbp] 5. ffn"); let _ = std::io::stderr().flush(); }
-        let ffn_out = self.ff.forward_decode_batch(&normed)?;
+        let ffn_out = if std::env::var("QWEN36_GRAPH_SKIP_FFN").as_deref() == Ok("1") {
+            normed
+        } else {
+            self.ff.forward_decode_batch(&normed)?
+        };
         let x = (ffn_out + residual)?;
         if crate::scheduler::trace_on() { eprintln!("[fdbp] 6. done"); let _ = std::io::stderr().flush(); }
         Ok(x)
