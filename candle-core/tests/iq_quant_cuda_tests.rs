@@ -1110,3 +1110,46 @@ fn mmvq_perf_dense() -> Result<()> {
     }
     Ok(())
 }
+
+/// Числовая сверка MMQ Tensor-Core prefill против dequant-эталона.
+/// Оба используют ОДНИ и те же квантованные веса → изолирует корректность MMQ-ядра.
+#[test]
+#[ignore]
+fn mmq_mma_matches_reference() -> Result<()> {
+    use candle_core::quantized::{QMatMul, QTensor};
+    let device = Device::new_cuda(0)?;
+    let (n, k, m) = (512usize, 768usize, 64usize); // n % 128 == 0, m_total=64 > 8 → MMQ
+
+    for &dtype in &[
+        GgmlDType::Q4K,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q4_0,
+        GgmlDType::Q8_0,
+    ] {
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).sin()).collect();
+        let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+        let w_t = Tensor::from_vec(w, (n, k), &device)?;
+        let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
+
+        let qt = QTensor::quantize_onto(&w_t, dtype, &device)?;
+        let qmm = QMatMul::from_qtensor(qt.clone())?;
+        let got = qmm.forward(&x_t)?; // m=64 → MMQ Tensor-Core путь
+
+        // Эталон: dequant тех же весов + f32 matmul.
+        let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+        let want = x_t.matmul(&w_deq.t()?.contiguous()?)?; // [1,m,n]
+
+        let diff = (&got - &want)?.abs()?;
+        let max = diff.max_all()?.to_scalar::<f32>()?;
+        let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+        println!("MMQ {dtype:?}: max_abs_diff={max:.6} scale={scale:.4}");
+        assert!(
+            max < 0.08 * scale,
+            "MMQ {dtype:?} mismatch: max_abs_diff={max} vs scale={scale}"
+        );
+    }
+    Ok(())
+}
