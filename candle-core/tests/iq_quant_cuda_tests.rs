@@ -963,6 +963,18 @@ fn mmvq_perf_dense() -> Result<()> {
         iters: usize,
     ) -> Result<()> {
         let row_bytes = k / T::BLCK_SIZE * std::mem::size_of::<T>();
+        bench_raw(cuda, device, dtype, n_rows, k, row_bytes, iters)
+    }
+
+    fn bench_raw(
+        cuda: &candle_core::CudaDevice,
+        device: &Device,
+        dtype: GgmlDType,
+        n_rows: usize,
+        k: usize,
+        row_bytes: usize,
+        iters: usize,
+    ) -> Result<()> {
         let total = n_rows * row_bytes;
         let raw = vec![0x5Au8; total];
         let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, dtype)?;
@@ -989,11 +1001,29 @@ fn mmvq_perf_dense() -> Result<()> {
         Ok(())
     }
 
+    fn bench_iq(
+        cuda: &candle_core::CudaDevice,
+        device: &Device,
+        dtype: GgmlDType,
+        n_rows: usize,
+        k: usize,
+        iters: usize,
+    ) -> Result<()> {
+        let row_bytes = k / dtype.block_size() * dtype.type_size();
+        bench_raw(cuda, device, dtype, n_rows, k, row_bytes, iters)
+    }
+
     for &(n, k) in shapes {
         bench_quant::<BlockQ2K>(&cuda, &device, GgmlDType::Q2K, n, k, 50)?;
         bench_quant::<BlockQ3K>(&cuda, &device, GgmlDType::Q3K, n, k, 50)?;
         bench_quant::<BlockQ4K>(&cuda, &device, GgmlDType::Q4K, n, k, 50)?;
         bench_quant::<BlockQ5K>(&cuda, &device, GgmlDType::Q5K, n, k, 50)?;
+        bench_iq(&cuda, &device, GgmlDType::IQ2XXS, n, k, 50)?;
+        bench_iq(&cuda, &device, GgmlDType::IQ2XS, n, k, 50)?;
+        bench_iq(&cuda, &device, GgmlDType::IQ2S, n, k, 50)?;
+        bench_iq(&cuda, &device, GgmlDType::IQ3XXS, n, k, 50)?;
+        bench_iq(&cuda, &device, GgmlDType::IQ3S, n, k, 50)?;
+        bench_iq(&cuda, &device, GgmlDType::IQ4XS, n, k, 50)?;
     }
     Ok(())
 }
