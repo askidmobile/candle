@@ -947,11 +947,26 @@ fn mmvq_perf_dense() -> Result<()> {
         _ => unreachable!(),
     };
 
+    // QWEN36_PERF_FILL_GB=N — занять N ГБ VRAM перед созданием весов
+    // (эмуляция размещения весов 27B после 10GB аллокаций).
+    let _fill: Vec<cudarc::driver::CudaSlice<u8>> =
+        if let Ok(v) = std::env::var("QWEN36_PERF_FILL_GB") {
+            let gb: usize = v.parse().unwrap_or(0);
+            let mut keep = Vec::new();
+            for _ in 0..gb {
+                let chunk = unsafe { cuda.alloc::<u8>(1024 * 1024 * 1024) }?;
+                keep.push(chunk);
+            }
+            keep
+        } else {
+            Vec::new()
+        };
+
     // 27B Q2_K_XL hot shapes: (n_rows, k)
     let shapes: &[(usize, usize)] = &[
-        (5120, 5120),   // delta qkv-ish / attn
-        (13824, 5120),  // ffn up/gate
-        (5120, 13824),  // ffn down
+        (5120, 5120),    // delta qkv-ish / attn
+        (17408, 5120),   // ffn up/gate (27B ffn=17408)
+        (5120, 17408),   // ffn down (27B)
     ];
 
     fn bench_quant<T: GgmlType + Send + Sync + 'static>(
@@ -1025,5 +1040,9 @@ fn mmvq_perf_dense() -> Result<()> {
         bench_iq(&cuda, &device, GgmlDType::IQ3S, n, k, 50)?;
         bench_iq(&cuda, &device, GgmlDType::IQ4XS, n, k, 50)?;
     }
+    // Sustained: та же форма повторно после всех dtype (drift/thermal check).
+    eprintln!("--- sustained re-run ---");
+    bench_quant::<BlockQ2K>(&cuda, &device, GgmlDType::Q2K, 17408, 5120, 500)?;
+    bench_quant::<BlockQ2K>(&cuda, &device, GgmlDType::Q2K, 5120, 17408, 500)?;
     Ok(())
 }
