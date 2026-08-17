@@ -4010,6 +4010,9 @@ pub struct ModelWeights {
     /// GPU-профайлер graphed decode: 4 CUDA events (start / после emb / после блоков / после head).
     #[cfg(feature = "cuda")]
     pub(crate) gprof_events: Option<[cudarc::driver::sys::CUevent; 4]>,
+    /// Per-block GPU events: [n_blocks+1] событий (QWEN36_GPROF=1).
+    #[cfg(feature = "cuda")]
+    pub(crate) gprof_block_events: Option<Vec<cudarc::driver::sys::CUevent>>,
 }
 
 impl ModelWeights {
@@ -5310,6 +5313,8 @@ impl ModelWeights {
             paged_ready: false,
             #[cfg(feature = "cuda")]
             gprof_events: None,
+            #[cfg(feature = "cuda")]
+            gprof_block_events: None,
         })
     }
 
@@ -6395,10 +6400,18 @@ impl ModelWeights {
         }
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
+            if let Some(bevs) = self.gprof_block_events.as_ref() {
+                let stream = ctx.dev.cuda_stream().cu_stream();
+                let _ = unsafe { cudarc::driver::result::event::record(bevs[bi], stream) };
+            }
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
                 eprintln!("[graphed-step] ERROR in block {bi}: {e:?}");
                 e
             })?;
+        }
+        if let Some(bevs) = self.gprof_block_events.as_ref() {
+            let stream = ctx.dev.cuda_stream().cu_stream();
+            let _ = unsafe { cudarc::driver::result::event::record(bevs[self.blocks.len()], stream) };
         }
         // Инкремент kv_len — после ВСЕХ attention слоёв.
         ctx.launch_increment(b_sz)?;
@@ -6507,7 +6520,20 @@ impl ModelWeights {
             }
             if ok {
                 self.gprof_events = Some(evs);
-                eprintln!("[gprof] events created");
+                let mut bevs = Vec::with_capacity(self.blocks.len() + 1);
+                let mut bok = true;
+                for _ in 0..=self.blocks.len() {
+                    let mut e = std::ptr::null_mut();
+                    if unsafe { csys::cuEventCreate(&mut e, 1) } != csys::CUresult::CUDA_SUCCESS {
+                        bok = false;
+                        break;
+                    }
+                    bevs.push(e);
+                }
+                if bok {
+                    self.gprof_block_events = Some(bevs);
+                }
+                eprintln!("[gprof] events created (blocks={})", self.gprof_block_events.is_some());
             }
         }
         Ok(())

@@ -946,6 +946,26 @@ impl Qwen35BatchAdapter {
                     eprintln!("[gGPU-prime] elapsed failed");
                 }
             }
+            if let Some(bevs) = self.model.gprof_block_events.as_ref() {
+                cuda_dev.cuda_stream().synchronize()?;
+                use cudarc::driver::result as cres;
+                let n = bevs.len();
+                let mut times: Vec<(usize, f32)> = Vec::with_capacity(n.saturating_sub(1));
+                let mut dsum = 0f32;
+                let mut dcount = 0usize;
+                let mut asum = 0f32;
+                let mut acount = 0usize;
+                for i in 0..n.saturating_sub(1) {
+                    if let Ok(t) = unsafe { cres::event::elapsed(bevs[i], bevs[i + 1]) } {
+                        times.push((i, t));
+                        let is_delta = self.model.blocks[i].is_deltanet();
+                        if is_delta { dsum += t; dcount += 1; } else { asum += t; acount += 1; }
+                    }
+                }
+                times.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let top: Vec<String> = times.iter().take(8).map(|(i, t)| format!("b{i}={t:.2}")).collect();
+                eprintln!("[gGPU-blocks] delta_sum={dsum:.1}ms/{dcount} attn_sum={asum:.1}ms/{acount} top: {}", top.join(" "));
+            }
             // host mirror kv_len после инкремента
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
