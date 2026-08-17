@@ -1399,7 +1399,6 @@ impl QCudaStorage {
         storage: &CudaStorage,
         layout: &crate::Layout,
     ) -> Result<Option<(CudaStorage, crate::Shape)>> {
-        use crate::backend::BackendStorage;
         // dtype → (тэг ядра, mma tile_x_k, quant-обёртка)
         let (tag, tile_x_k, quant_kernel): (&str, usize, &str) = match self.dtype {
             GgmlDType::Q2K => ("q2_k", 100, "candle_mmq_quant_d2s6"),
