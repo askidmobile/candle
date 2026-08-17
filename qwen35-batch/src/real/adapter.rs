@@ -646,6 +646,12 @@ impl BatchModel for Qwen35BatchAdapter {
                     if self.decode_graph.is_some() {
                         self.decode_graph = None;
                     }
+                    // Prefill оставил в пуле пиковые страницы интермедиатов
+                    // (512-token chunk buffers). Trim при первом decode после
+                    // prefill — иначе retained slack добивает VRAM на 27B.
+                    if let Device::Cuda(c) = &self.device {
+                        let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
+                    }
                 }
             }
         }
