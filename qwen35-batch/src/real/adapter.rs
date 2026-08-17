@@ -929,6 +929,23 @@ impl Qwen35BatchAdapter {
                 .model
                 .forward_decode_batch_graphed(&ids_eager, slots)
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
+            // GPU-сегменты eager-prime: та же последовательность ядер, что в графе.
+            if let Some(ev) = self.model.gprof_events.as_ref() {
+                cuda_dev.cuda_stream().synchronize()?;
+                use cudarc::driver::result as cres;
+                if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (
+                    unsafe { cres::event::elapsed(ev[0], ev[1]) },
+                    unsafe { cres::event::elapsed(ev[1], ev[2]) },
+                    unsafe { cres::event::elapsed(ev[2], ev[3]) },
+                    unsafe { cres::event::elapsed(ev[0], ev[3]) },
+                ) {
+                    eprintln!(
+                        "[gGPU-prime] emb={e0:.2}ms blocks={e1:.2}ms head={e2:.2}ms total={e3:.2}ms"
+                    );
+                } else {
+                    eprintln!("[gGPU-prime] elapsed failed");
+                }
+            }
             // host mirror kv_len после инкремента
             {
                 let ctx = self.model.paged_ctx.as_mut().unwrap();
