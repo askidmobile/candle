@@ -6378,7 +6378,8 @@ impl ModelWeights {
         // GPU-сегменты через CUDA events (работают и в graph capture — попадают в граф).
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
-            unsafe { cudarc::driver::result::event::record(ev[0], stream) }.ok();
+            let r = unsafe { cudarc::driver::result::event::record(ev[0], stream) };
+            if let Err(e) = r { eprintln!("[gprof] record ev0: {e:?}"); }
         }
         let emb = self
             .tok_embeddings_cuda
@@ -6389,7 +6390,8 @@ impl ModelWeights {
             .reshape((b_sz, 1usize, self.hidden_size()))?;
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
-            unsafe { cudarc::driver::result::event::record(ev[1], stream) }.ok();
+            let r = unsafe { cudarc::driver::result::event::record(ev[1], stream) };
+            if let Err(e) = r { eprintln!("[gprof] record ev1: {e:?}"); }
         }
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
@@ -6402,14 +6404,16 @@ impl ModelWeights {
         ctx.launch_increment(b_sz)?;
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
-            unsafe { cudarc::driver::result::event::record(ev[2], stream) }.ok();
+            let r = unsafe { cudarc::driver::result::event::record(ev[2], stream) };
+            if let Err(e) = r { eprintln!("[gprof] record ev2: {e:?}"); }
         }
 
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
         let logits = self.output.forward(&hidden)?;
         if let Some(ev) = self.gprof_events.as_ref() {
             let stream = ctx.dev.cuda_stream().cu_stream();
-            unsafe { cudarc::driver::result::event::record(ev[3], stream) }.ok();
+            let r = unsafe { cudarc::driver::result::event::record(ev[3], stream) };
+            if let Err(e) = r { eprintln!("[gprof] record ev3: {e:?}"); }
         }
         Ok((logits, hidden))
     }
