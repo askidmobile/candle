@@ -359,8 +359,6 @@ impl Qwen35MoeBlock {
         let (batch, seq_len, n_embd) = xs.dims3()?;
         let xs_2d = xs.reshape(((), n_embd))?;
 
-        eprintln!("[moe-forward] backend={:?} dev={:?}", self.backend, xs.device());
-
         #[cfg(feature = "cuda")]
         if matches!(self.backend, MoeBackend::Ptx) && xs.device().is_cuda() {
             let combined = self.forward_ptx_cuda(&xs_2d)?;
@@ -403,7 +401,6 @@ impl Qwen35MoeBlock {
         let device = xs.device();
         let cuda_dev = device.as_cuda_device()?;
 
-        eprintln!("[ptx-moe] 1. router logits");
         // Router на GPU.
         let logits = self
             .router
@@ -411,7 +408,6 @@ impl Qwen35MoeBlock {
             .forward(xs)?
             .to_dtype(DType::F32)?
             .contiguous()?;
-        eprintln!("[ptx-moe] 2. softmax topk");
         let (ids_t, w_t) = gpu_softmax_topk(
             cuda_dev,
             &logits,
@@ -420,29 +416,22 @@ impl Qwen35MoeBlock {
             self.router.norm_topk_prob,
         )?;
 
-        eprintln!("[ptx-moe] 3. x3 prep");
         // Shared input [tokens, 1, n_embd]. Indexed kernels reuse each token row
         // across top-k routes; materializing [tokens, k, n_embd] wastes 8x memory.
         let x3 = xs.to_dtype(DType::F32)?.unsqueeze(1)?.contiguous()?;
 
-        eprintln!("[ptx-moe] 4. dual gate+up");
         // gate+up одним dual GEMM.
         let (gate, up) =
             self.routed
                 .gate
                 .indexed_moe_forward_dual_cuda(&self.routed.up, &x3, &ids_t)?;
-        eprintln!("[ptx-moe] 5. act silu*up");
         let act = gate.silu()?.mul(&up)?.contiguous()?;
-        eprintln!("[ptx-moe] 6. down");
         let down = self.routed.down.indexed_moe_forward_cuda(&act, &ids_t)?; // [tokens, topk, n_embd]
 
-        eprintln!("[ptx-moe] 7. weighted sum");
         // Взвешивание GPU-весами + редукция по topk.
         let w = w_t.unsqueeze(candle_core::D::Minus1)?; // [tokens, topk, 1]
         let routed = down.broadcast_mul(&w)?.sum(candle_core::D::Minus2)?;
-        eprintln!("[ptx-moe] 8. shared expert");
         let shared = self.shared.forward(xs)?;
-        eprintln!("[ptx-moe] 9. combine");
         routed.broadcast_add(&shared)
     }
 

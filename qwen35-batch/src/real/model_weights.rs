@@ -1024,7 +1024,6 @@ struct DenseMlp {
 
 impl Module for DenseMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        eprintln!("[dense-mlp] 1. prequant");
         #[cfg(target_os = "macos")]
         let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
         #[cfg(target_os = "macos")]
@@ -1032,15 +1031,12 @@ impl Module for DenseMlp {
         #[cfg(not(target_os = "macos"))]
         let (w1, w3) = {
             let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs).ok().flatten();
-            eprintln!("[dense-mlp] 2. w1/w3 matmul");
             let w1 = self.feed_forward_w1.forward_with_prequant(xs, prequant.as_ref())?;
             let w3 = self.feed_forward_w3.forward_with_prequant(xs, prequant.as_ref())?;
             (w1, w3)
         };
-        eprintln!("[dense-mlp] 3. silu_mul");
         // T-275: fused silu_mul via direct MetalStorage path (один kernel вместо двух)
         let silu_mul = w1.silu_mul_direct(&w3)?;
-        eprintln!("[dense-mlp] 4. w2 matmul");
         #[cfg(target_os = "macos")]
         {
             dispatch_q4k_matmul(
@@ -1051,9 +1047,7 @@ impl Module for DenseMlp {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let res = self.feed_forward_w2.forward(&silu_mul);
-            eprintln!("[dense-mlp] 5. done");
-            res
+            self.feed_forward_w2.forward(&silu_mul)
         }
     }
 }
@@ -1092,10 +1086,6 @@ impl FeedForward {
 
     /// Decode-batch forward — batched decode path.
     fn forward_decode_batch(&self, xs: &Tensor) -> Result<Tensor> {
-        if crate::scheduler::trace_on() {
-            eprintln!("[fdb-ffn] start type={}", match self { Self::Dense(_) => "Dense", Self::Moe(_) => "MoE" });
-            let _ = std::io::stderr().flush();
-        }
         match self {
             Self::Dense(mlp) => mlp.forward(xs),
             Self::Moe(moe) => moe.forward(xs, ForwardMode::DecodeBatch),
@@ -6377,25 +6367,20 @@ impl ModelWeights {
         if seq_len != 1 || slots.len() != b_sz {
             candle_core::bail!("invalid graphed decode dimensions");
         }
-        eprintln!("[graphed-step] 1. launch_cumsum");
         // seqlens_k — до attention слоёв (kv_len ещё не инкрементирован).
         ctx.launch_cumsum(b_sz)?;
 
-        eprintln!("[graphed-step] 2. get emb");
         let emb = self
             .tok_embeddings_cuda
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("no CUDA embedding".into()))?;
-        eprintln!("[graphed-step] 3. emb.embedding");
-        let emb_t = emb.embedding(tokens)?;
-        eprintln!("[graphed-step] 4. emb reshape");
-        let mut layer_in = emb_t.reshape((b_sz, 1usize, self.hidden_size()))?;
-        eprintln!("[graphed-step] 5. entering blocks");
+        let mut layer_in = emb
+            .embedding(tokens)?
+            .reshape((b_sz, 1usize, self.hidden_size()))?;
 
         for (bi, block) in self.blocks.iter_mut().enumerate() {
-            eprintln!("[graphed-step] block {bi} start");
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
-                eprintln!("[graphed-step] ERROR in block {bi} ({:?}): {e:?}", block.device());
+                eprintln!("[graphed-step] ERROR in block {bi}: {e:?}");
                 e
             })?;
         }

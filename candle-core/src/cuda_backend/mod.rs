@@ -1818,7 +1818,6 @@ impl BackendStorage for CudaStorage {
             let is_capturing = self.device.cuda_stream().capture_status()
                 == Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE);
             if is_capturing {
-                eprintln!("[to_cpu_storage during graph capture] trace:\n{:?}", std::backtrace::Backtrace::force_capture());
                 crate::bail!(
                     "to_cpu_storage during CUDA graph capture: host/device copies are not \
                      permitted while capturing"
