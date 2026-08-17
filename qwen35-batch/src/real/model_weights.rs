@@ -1086,6 +1086,10 @@ impl FeedForward {
 
     /// Decode-batch forward — batched decode path.
     fn forward_decode_batch(&self, xs: &Tensor) -> Result<Tensor> {
+        if crate::scheduler::trace_on() {
+            eprintln!("[fdb-ffn] start type={}", match self { Self::Dense(_) => "Dense", Self::Moe(_) => "MoE" });
+            let _ = std::io::stderr().flush();
+        }
         match self {
             Self::Dense(mlp) => mlp.forward(xs),
             Self::Moe(moe) => moe.forward(xs, ForwardMode::DecodeBatch),
