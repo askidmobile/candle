@@ -6495,7 +6495,7 @@ impl ModelWeights {
             let mut evs = [std::ptr::null_mut(); 4];
             let mut ok = true;
             for e in evs.iter_mut() {
-                let res = unsafe { csys::cuEventCreate(e, csys::CUevent_flags::CU_EVENT_DEFAULT) };
+                let res = unsafe { csys::cuEventCreate(e, 0) };
                 if res != csys::CUresult::CUDA_SUCCESS {
                     ok = false;
                 }
