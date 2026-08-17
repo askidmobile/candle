@@ -16,6 +16,15 @@ fn main() -> Result<()> {
             println!("cargo::rerun-if-changed={}", p.display());
         }
     }
+    // mmq_gguf/ (MMQ Tensor-Core для плотного prefill) — следим за .cu и .cuh.
+    if let Ok(rd) = std::fs::read_dir("src/mmq_gguf") {
+        for entry in rd {
+            let p = entry.unwrap().path();
+            if matches!(p.extension().and_then(|s| s.to_str()), Some("cu") | Some("cuh")) {
+                println!("cargo::rerun-if-changed={}", p.display());
+            }
+        }
+    }
 
     // Build for PTX.
     // Exclude the old reference MoE kernels under src/moe/ (they use the CUDA Runtime
