@@ -1134,7 +1134,7 @@ fn mmq_mma_matches_reference() -> Result<()> {
         let w_t = Tensor::from_vec(w, (n, k), &device)?;
         let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
 
-        let qt = std::sync::Arc::new(QTensor::quantize_onto(&w_t, dtype, &device)?);
+        let qt = std::sync::Arc::new(QTensor::quantize(&w_t, dtype)?);
         let qmm = QMatMul::from_arc(qt.clone())?;
         let got = qmm.forward(&x_t)?; // m=64 → MMQ Tensor-Core путь
 
