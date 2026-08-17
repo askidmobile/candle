@@ -1138,9 +1138,10 @@ fn mmq_mma_matches_reference() -> Result<()> {
         let qmm = QMatMul::from_arc(qt.clone())?;
         let got = qmm.forward(&x_t)?; // m=64 → MMQ Tensor-Core путь
 
-        // Эталон: dequant тех же весов + f32 matmul.
+        // Эталон: dequant тех же весов + f32 matmul (2D: [m,k] @ [k,n] → [m,n]).
         let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
-        let want = x_t.matmul(&w_deq.t()?.contiguous()?)?; // [1,m,n]
+        let x_2d = x_t.reshape((m, k))?;
+        let want = x_2d.matmul(&w_deq.t()?.contiguous()?)?.reshape((1, m, n))?;
 
         let diff = (&got - &want)?.abs()?;
         let max = diff.max_all()?.to_scalar::<f32>()?;
