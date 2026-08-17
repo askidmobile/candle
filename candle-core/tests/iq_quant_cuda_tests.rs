@@ -1044,5 +1044,69 @@ fn mmvq_perf_dense() -> Result<()> {
     eprintln!("--- sustained re-run ---");
     bench_quant::<BlockQ2K>(&cuda, &device, GgmlDType::Q2K, 17408, 5120, 500)?;
     bench_quant::<BlockQ2K>(&cuda, &device, GgmlDType::Q2K, 5120, 17408, 500)?;
+
+    // Graph-replay FFN-цепочки (w1+w3+silu+w2) ×48 — как в модели 27B.
+    // Если replay медленнее eager ×N — проблема в graph-контексте MMVQ.
+    {
+        use cudarc::driver::result as cres;
+        use cudarc::driver::sys as csys;
+        let n = 17408usize;
+        let k = 5120usize;
+        let row_bytes = k / 256 * std::mem::size_of::<BlockQ2K>();
+        let mk = |rows: usize| -> Result<Arc<QTensor>> {
+            let raw = vec![0x5Au8; rows * row_bytes];
+            let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, GgmlDType::Q2K)?;
+            Ok(Arc::new(QTensor::new(storage, (rows, k))?))
+        };
+        // 48 пар (w1: [n,k], w3: [n,k], w2: [k,n]) — 48 слоёв как в 27B.
+        let mut layers = Vec::new();
+        for _ in 0..48 {
+            let w1 = QMatMul::from_arc(mk(n)?)?;
+            let w3 = QMatMul::from_arc(mk(n)?)?;
+            let w2raw = vec![0x5Au8; k * (n / 256 * std::mem::size_of::<BlockQ2K>())];
+            let w2s = QStorage::from_data(std::borrow::Cow::Borrowed(&w2raw), &device, GgmlDType::Q2K)?;
+            let w2 = QMatMul::from_arc(Arc::new(QTensor::new(w2s, (k, n))?))?;
+            layers.push((w1, w3, w2));
+        }
+        let x = Tensor::zeros((1, 1, k), DType::F32, &device)?;
+        let run_chain = |x: &Tensor| -> Result<Tensor> {
+            let mut h = x.clone();
+            for (w1, w3, w2) in &layers {
+                let prequant = candle_core::quantized::QTensor::prequantize_q8_1(&h).ok().flatten();
+                let a = w1.forward_with_prequant(&h, prequant.as_ref())?;
+                let b = w3.forward_with_prequant(&h, prequant.as_ref())?;
+                let s = a.silu_mul_direct(&b)?;
+                h = w2.forward(&s)?;
+            }
+            Ok(h)
+        };
+        // eager
+        for _ in 0..3 { let _ = run_chain(&x)?; }
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        let t0 = Instant::now();
+        for _ in 0..5 { let _ = run_chain(&x)?; }
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        let eager_ms = t0.elapsed().as_secs_f64() * 1000.0 / 5.0;
+        println!("FFN-chain x48 EAGER: {eager_ms:.2}ms/step");
+        // graph capture + replay
+        let stream = cuda.cuda_stream();
+        unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
+            .map_err(candle_core::Error::wrap)?;
+        let out = run_chain(&x);
+        let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
+            .map_err(candle_core::Error::wrap)?;
+        out?;
+        let mut exec: csys::CUgraphExec = std::ptr::null_mut();
+        let res = unsafe { csys::cuGraphInstantiateWithFlags(&mut exec, cu_graph, 0) };
+        assert_eq!(res, csys::CUresult::CUDA_SUCCESS);
+        // warm
+        for _ in 0..3 { unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) }; }
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        let t0 = Instant::now();
+        for _ in 0..20 { unsafe { csys::cuGraphLaunch(exec, stream.cu_stream()) }; }
+        cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+        let graph_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
+        println!("FFN-chain x48 GRAPH-REPLAY: {graph_ms:.2}ms/step");
+    }
     Ok(())
 }
