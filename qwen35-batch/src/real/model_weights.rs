@@ -1024,6 +1024,7 @@ struct DenseMlp {
 
 impl Module for DenseMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        eprintln!("[dense-mlp] 1. prequant");
         #[cfg(target_os = "macos")]
         let w1 = dispatch_q4k_matmul(&self.feed_forward_w1, self.feed_forward_w1_opt.as_ref(), xs)?;
         #[cfg(target_os = "macos")]
@@ -1031,12 +1032,15 @@ impl Module for DenseMlp {
         #[cfg(not(target_os = "macos"))]
         let (w1, w3) = {
             let prequant = candle_core::quantized::QTensor::prequantize_q8_1(xs).ok().flatten();
+            eprintln!("[dense-mlp] 2. w1/w3 matmul");
             let w1 = self.feed_forward_w1.forward_with_prequant(xs, prequant.as_ref())?;
             let w3 = self.feed_forward_w3.forward_with_prequant(xs, prequant.as_ref())?;
             (w1, w3)
         };
+        eprintln!("[dense-mlp] 3. silu_mul");
         // T-275: fused silu_mul via direct MetalStorage path (один kernel вместо двух)
         let silu_mul = w1.silu_mul_direct(&w3)?;
+        eprintln!("[dense-mlp] 4. w2 matmul");
         #[cfg(target_os = "macos")]
         {
             dispatch_q4k_matmul(
@@ -1047,7 +1051,9 @@ impl Module for DenseMlp {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.feed_forward_w2.forward(&silu_mul)
+            let res = self.feed_forward_w2.forward(&silu_mul);
+            eprintln!("[dense-mlp] 5. done");
+            res
         }
     }
 }
