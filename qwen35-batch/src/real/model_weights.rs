@@ -6502,6 +6502,7 @@ impl ModelWeights {
             }
             if ok {
                 self.gprof_events = Some(evs);
+                eprintln!("[gprof] events created");
             }
         }
         Ok(())

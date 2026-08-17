@@ -1057,15 +1057,16 @@ impl Qwen35BatchAdapter {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 || n % 32 == 0 {
-                if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (
-                    unsafe { cres::event::elapsed(ev[0], ev[1]) },
-                    unsafe { cres::event::elapsed(ev[1], ev[2]) },
-                    unsafe { cres::event::elapsed(ev[2], ev[3]) },
-                    unsafe { cres::event::elapsed(ev[0], ev[3]) },
-                ) {
+                let e0 = unsafe { cres::event::elapsed(ev[0], ev[1]) };
+                let e1 = unsafe { cres::event::elapsed(ev[1], ev[2]) };
+                let e2 = unsafe { cres::event::elapsed(ev[2], ev[3]) };
+                let e3 = unsafe { cres::event::elapsed(ev[0], ev[3]) };
+                if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (e0, e1, e2, e3) {
                     eprintln!(
                         "[gGPU] #{n} emb={e0:.2}ms blocks={e1:.2}ms head={e2:.2}ms total={e3:.2}ms"
                     );
+                } else {
+                    eprintln!("[gGPU] #{n} elapsed err: {e0:?} {e1:?} {e2:?} {e3:?}");
                 }
             }
         }
