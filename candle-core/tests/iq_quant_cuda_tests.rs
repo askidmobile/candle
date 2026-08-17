@@ -928,3 +928,72 @@ fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
     }
     Ok(())
 }
+
+/// Decode MMVQ perf micro-benchmark: measures pure kernel bandwidth for
+/// dense-model hot shapes (27B Q2_K_XL): QMatMul [n,k] @ [1,1,k] f32, B=1.
+///
+/// Run: cargo test --features cuda --package candle-core --test iq_quant_cuda_tests \
+///   -- --ignored --exact mmvq_perf_dense --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn mmvq_perf_dense() -> Result<()> {
+    use candle_core::quantized::k_quants::*;
+    use candle_core::quantized::GgmlType;
+    use std::time::Instant;
+
+    let device = Device::new_cuda(0)?;
+    let cuda = match &device {
+        Device::Cuda(c) => c.clone(),
+        _ => unreachable!(),
+    };
+
+    // 27B Q2_K_XL hot shapes: (n_rows, k)
+    let shapes: &[(usize, usize)] = &[
+        (5120, 5120),   // delta qkv-ish / attn
+        (13824, 5120),  // ffn up/gate
+        (5120, 13824),  // ffn down
+    ];
+
+    fn bench_quant<T: GgmlType + Send + Sync + 'static>(
+        cuda: &candle_core::CudaDevice,
+        device: &Device,
+        dtype: GgmlDType,
+        n_rows: usize,
+        k: usize,
+        iters: usize,
+    ) -> Result<()> {
+        let row_bytes = k / T::BLCK_SIZE * std::mem::size_of::<T>();
+        let total = n_rows * row_bytes;
+        let raw = vec![0x5Au8; total];
+        let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, dtype)?;
+        let qt = Arc::new(QTensor::new(storage, (n_rows, k))?);
+        let qmatmul = QMatMul::from_arc(qt)?;
+        let y = Tensor::zeros((1, 1, k), DType::F32, device)?;
+        // warmup (JIT + caches)
+        for _ in 0..5 {
+            let _ = qmatmul.forward(&y)?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = qmatmul.forward(&y)?;
+        }
+        cuda.cuda_stream().synchronize()?;
+        let el = t0.elapsed().as_secs_f64() / iters as f64;
+        let gbs = total as f64 / el / 1e9;
+        println!(
+            "MMVQ {dtype:?} [{n_rows}x{k}] B=1: {:.3}ms {:.0} GB/s",
+            el * 1000.0,
+            gbs
+        );
+        Ok(())
+    }
+
+    for &(n, k) in shapes {
+        bench_quant::<BlockQ2K>(&cuda, &device, GgmlDType::Q2K, n, k, 50)?;
+        bench_quant::<BlockQ3K>(&cuda, &device, GgmlDType::Q3K, n, k, 50)?;
+        bench_quant::<BlockQ4K>(&cuda, &device, GgmlDType::Q4K, n, k, 50)?;
+        bench_quant::<BlockQ5K>(&cuda, &device, GgmlDType::Q5K, n, k, 50)?;
+    }
+    Ok(())
+}
