@@ -4589,8 +4589,7 @@ impl ModelWeights {
                 let emb_mm = if device.is_cuda() {
                     // Загружаем дублирующий token_embd на GPU если свободной VRAM > 1.0 GB или включены CUDA графы
                     let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
-                        let force_graphs = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
-                        cuda_dev.cuda_stream().context().mem_get_info().map(|(free, _)| free > 1024 * 1024 * 1024 || force_graphs).unwrap_or(false)
+                        cuda_dev.cuda_stream().context().mem_get_info().map(|(free, _)| free > 1024 * 1024 * 1024).unwrap_or(false)
                     } else {
                         false
                     };
