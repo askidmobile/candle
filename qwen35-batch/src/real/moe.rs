@@ -359,6 +359,10 @@ impl Qwen35MoeBlock {
         let (batch, seq_len, n_embd) = xs.dims3()?;
         let xs_2d = xs.reshape(((), n_embd))?;
 
+        if crate::scheduler::trace_on() {
+            eprintln!("[moe-forward] backend={:?} dev={:?}", self.backend, xs.device());
+        }
+
         #[cfg(feature = "cuda")]
         if matches!(self.backend, MoeBackend::Ptx) && xs.device().is_cuda() {
             let combined = self.forward_ptx_cuda(&xs_2d)?;
