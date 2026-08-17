@@ -1046,11 +1046,28 @@ impl Qwen35BatchAdapter {
         state.launch().map_err(|e| anyhow!("graph launch: {e}"))?;
         // Диагностика: sync сразу после launch, чтобы async-ошибка графа
         // привязывалась к этому шагу, а не всплывала sticky на следующем.
-        if crate::scheduler::trace_on() {
+        if crate::scheduler::trace_on() || self.model.gprof_events.is_some() {
             cuda_dev
                 .cuda_stream()
                 .synchronize()
                 .map_err(|e| anyhow!("graph post-launch sync: {e}"))?;
+        }
+        if let Some(ev) = self.model.gprof_events.as_ref() {
+            use cudarc::driver::result as cres;
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 || n % 32 == 0 {
+                if let (Ok(e0), Ok(e1), Ok(e2), Ok(e3)) = (
+                    unsafe { cres::event::elapsed(ev[0], ev[1]) },
+                    unsafe { cres::event::elapsed(ev[1], ev[2]) },
+                    unsafe { cres::event::elapsed(ev[2], ev[3]) },
+                    unsafe { cres::event::elapsed(ev[0], ev[3]) },
+                ) {
+                    eprintln!(
+                        "[gGPU] #{n} emb={e0:.2}ms blocks={e1:.2}ms head={e2:.2}ms total={e3:.2}ms"
+                    );
+                }
+            }
         }
         {
             let ctx = self.model.paged_ctx.as_mut().unwrap();

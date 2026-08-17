@@ -4007,6 +4007,9 @@ pub struct ModelWeights {
     /// Признак, что хотя бы один decode уже подготовил paged pools у attention слоёв.
     #[cfg(feature = "cuda")]
     pub(crate) paged_ready: bool,
+    /// GPU-профайлер graphed decode: 4 CUDA events (start / после emb / после блоков / после head).
+    #[cfg(feature = "cuda")]
+    pub(crate) gprof_events: Option<[cudarc::driver::sys::CUevent; 4]>,
 }
 
 impl ModelWeights {
@@ -5305,6 +5308,8 @@ impl ModelWeights {
             paged_ctx: None,
             #[cfg(feature = "cuda")]
             paged_ready: false,
+            #[cfg(feature = "cuda")]
+            gprof_events: None,
         })
     }
 
@@ -6370,8 +6375,11 @@ impl ModelWeights {
         // seqlens_k — до attention слоёв (kv_len ещё не инкрементирован).
         ctx.launch_cumsum(b_sz)?;
 
-        let prof = crate::scheduler::trace_on();
-        let t_emb = std::time::Instant::now();
+        // GPU-сегменты через CUDA events (работают и в graph capture — попадают в граф).
+        if let Some(ev) = self.gprof_events.as_ref() {
+            let stream = ctx.dev.cuda_stream().cu_stream();
+            unsafe { cudarc::driver::result::event::record(ev[0], stream) }.ok();
+        }
         let emb = self
             .tok_embeddings_cuda
             .as_ref()
@@ -6379,29 +6387,29 @@ impl ModelWeights {
         let mut layer_in = emb
             .embedding(tokens)?
             .reshape((b_sz, 1usize, self.hidden_size()))?;
-        let emb_ms = t_emb.elapsed().as_secs_f64() * 1000.0;
+        if let Some(ev) = self.gprof_events.as_ref() {
+            let stream = ctx.dev.cuda_stream().cu_stream();
+            unsafe { cudarc::driver::result::event::record(ev[1], stream) }.ok();
+        }
 
-        let t_blocks = std::time::Instant::now();
         for (bi, block) in self.blocks.iter_mut().enumerate() {
             layer_in = block.forward_decode_batch_paged(&layer_in, ctx, slots).map_err(|e| {
                 eprintln!("[graphed-step] ERROR in block {bi}: {e:?}");
                 e
             })?;
         }
-        let blocks_ms = t_blocks.elapsed().as_secs_f64() * 1000.0;
         // Инкремент kv_len — после ВСЕХ attention слоёв.
         ctx.launch_increment(b_sz)?;
+        if let Some(ev) = self.gprof_events.as_ref() {
+            let stream = ctx.dev.cuda_stream().cu_stream();
+            unsafe { cudarc::driver::result::event::record(ev[2], stream) }.ok();
+        }
 
-        let t_head = std::time::Instant::now();
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
         let logits = self.output.forward(&hidden)?;
-        let head_ms = t_head.elapsed().as_secs_f64() * 1000.0;
-        if prof {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 || n % 64 == 0 {
-                eprintln!("[gprof] #{n} emb={emb_ms:.1}ms blocks={blocks_ms:.1}ms head={head_ms:.1}ms");
-            }
+        if let Some(ev) = self.gprof_events.as_ref() {
+            let stream = ctx.dev.cuda_stream().cu_stream();
+            unsafe { cudarc::driver::result::event::record(ev[3], stream) }.ok();
         }
         Ok((logits, hidden))
     }
@@ -6482,6 +6490,20 @@ impl ModelWeights {
             }
         }
         self.paged_ready = true;
+        if std::env::var("QWEN36_GPROF").as_deref() == Ok("1") {
+            use cudarc::driver::sys as csys;
+            let mut evs = [std::ptr::null_mut(); 4];
+            let mut ok = true;
+            for e in evs.iter_mut() {
+                let res = unsafe { csys::cuEventCreate(e, csys::CUevent_flags::CU_EVENT_DEFAULT) };
+                if res != csys::CUresult::CUDA_SUCCESS {
+                    ok = false;
+                }
+            }
+            if ok {
+                self.gprof_events = Some(evs);
+            }
+        }
         Ok(())
     }
 
