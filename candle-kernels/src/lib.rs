@@ -20,6 +20,8 @@ pub enum Id {
     /// Phase 3: device-only MoE routing + quantized expert kernels (PTX).
     MoeRouter,
     MoeQuantized,
+    /// Tensor-Core MMA MMQ (llama.cpp mul_mat_q) для плотного prefill — Qwen35-batching.
+    MmqDense,
     Quantized,
     Reduce,
     Sort,
@@ -27,7 +29,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 17] = [
+pub const ALL_IDS: [Id; 18] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -40,6 +42,7 @@ pub const ALL_IDS: [Id; 17] = [
     Id::Moe,
     Id::MoeRouter,
     Id::MoeQuantized,
+    Id::MmqDense,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -94,6 +97,7 @@ mdl!(INDEXING, Indexing);
 mdl!(MOE, Moe);
 mdl!(MOE_ROUTER, MoeRouter);
 mdl!(MOE_QUANTIZED, MoeQuantized);
+mdl!(CANDLE_MMQ_DENSE, MmqDense);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);
