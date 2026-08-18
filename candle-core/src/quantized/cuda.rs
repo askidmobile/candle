@@ -620,7 +620,6 @@ impl QCudaStorage {
             GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
             GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
             GgmlDType::IQ2XXS => "mul_mat_vec_iq2_xxs_q8_1_cuda",
-        GgmlDType::IQ1M => "mul_mat_vec_iq1_m_q8_1_cuda",
             GgmlDType::IQ1M => "mul_mat_vec_iq1_m_q8_1_cuda",
             GgmlDType::IQ2XS => "mul_mat_vec_iq2_xs_q8_1_cuda",
             GgmlDType::IQ2S => "mul_mat_vec_iq2_s_q8_1_cuda",
@@ -726,6 +725,7 @@ fn mul_mat_vec_via_q8_1(
         GgmlDType::IQ3XXS => "mul_mat_vec_iq3_xxs_q8_1_cuda",
         GgmlDType::IQ3S => "mul_mat_vec_iq3_s_q8_1_cuda",
         GgmlDType::IQ4XS => "mul_mat_vec_iq4_xs_q8_1_cuda",
+        GgmlDType::IQ1M => "mul_mat_vec_iq1_m_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let kernel_name = format!("{kernel_name}{b_size}");
