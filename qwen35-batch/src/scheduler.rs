@@ -83,11 +83,12 @@ pub fn prefill_chunk_size() -> usize {
     })
 }
 
-/// Ширина спекулятивного драфта K (env QWEN36_MTP_WIDTH, default 4, максимум 8 —
+/// Ширина спекулятивного драфта K (env QWEN36_MTP_WIDTH, default 3, максимум 8 —
 /// потолок mmvq b_size и verify temp-буферов). Тюнится по фактической
-/// принимаемости: verify — один multi-token forward на K позиций, но при
-/// отклонении раньше K-1 нужен второй forward (re-run принятого префикса),
-/// так что слишком большой K при низкой принимаемости тратит работу впустую.
+/// принимаемости: при m == K re-run принятого префикса не нужен (state уже
+/// консистентен), поэтому K чуть НИЖЕ типичной длины всплеска принимаемости
+/// выигрывает у большего K. Замер 27B IQ2_XXS (128 ток): K=3 → 26.6 tok/s,
+/// K=2 → 22.8, K=4 → 15.1 при baseline 18.6 — всплески упираются в ~3.
 #[inline]
 pub fn speculative_width() -> usize {
     static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -96,7 +97,7 @@ pub fn speculative_width() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(4)
+            .unwrap_or(3)
             .min(8)
     })
 }

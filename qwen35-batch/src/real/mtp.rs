@@ -263,7 +263,14 @@ impl Qwen35Mtp {
             let pre_head = mtp_hidden.i((.., 0, ..))?;
             let normalized = self.head_norm.forward(&pre_head)?;
             let logits = self.shared_head.forward(&normalized)?;
-            token = argmax(&logits.to_dtype(DType::F32)?.to_vec2()?[0]);
+            // GPU argmax + D2H 4 байта вместо полных логитов (600КБ + host-scan
+            // на каждый драфт-шаг). Тай-брейк на равных максимумах может отличаться
+            // от host-argmax — на драфт это не влияет (target верифицирует).
+            token = if logits.device().is_cpu() {
+                argmax(&logits.to_dtype(DType::F32)?.to_vec2()?[0])
+            } else {
+                logits.argmax(candle_core::D::Minus1)?.to_vec1::<u32>()?[0]
+            };
             out.push(token);
             hidden = pre_head;
         }
