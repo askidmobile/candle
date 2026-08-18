@@ -705,8 +705,16 @@ impl ModelProfile {
         let prefix = architecture.metadata_prefix();
 
         // 2. Required metadata for both architectures.
-        let block_count = md_u32(&metadata, &format!("{prefix}.block_count"), &mut errs)
+        let block_count_raw = md_u32(&metadata, &format!("{prefix}.block_count"), &mut errs)
             .unwrap_or(0);
+        // Qwen3.8+: block_count включает nextn/MTP-слои (blk.<last> с обычным
+        // qkv-сплитом и nextn.*-тензорами) — валидируем только транк, MTP-слой
+        // имеет свой контракт (mtp.rs). Симметрично build_model_common.
+        let nextn_layers = metadata
+            .get(&format!("{prefix}.nextn_predict_layers"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(0) as usize;
+        let block_count = block_count_raw.saturating_sub(nextn_layers);
         let hidden_size = md_u32(&metadata, &format!("{prefix}.embedding_length"), &mut errs)
             .unwrap_or(0);
         let context_length = md_u32(&metadata, &format!("{prefix}.context_length"), &mut errs)
