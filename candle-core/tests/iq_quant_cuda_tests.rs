@@ -367,17 +367,26 @@ fn assert_indexed_matches_dequantized(
                     .zip(input)
                     .map(|(w, x)| w * x)
                     .sum();
+                // Масштаб ошибки q8_1-квантования активаций - Σ|w·x|, НЕ
+                // |результат|: при сокращении в дот-продукте |expected| может
+                // быть на порядки меньше суммы модулей, и «относительная к
+                // результату» ошибка взрывается (batch=33: diff 0.56 на
+                // |expected|=10.8 при Σ|w·x| в сотни - штатное q8-округление).
+                // Настоящая поломка ядра (знак/скейл/индексация) ошибается на
+                // масштабе Σ|w·x| целиком - гейт 2e-3·Σ её ловит с запасом
+                // в сотни раз. Прежний 1e-4·|expected| был выставлен для
+                // f32-пути (77c4b711) и не обновлялся при переходе на q8_1
+                // (33550814) - сьют красный с того коммита.
+                let abs_scale: f32 = weights_cpu[expert][row]
+                    .iter()
+                    .zip(input)
+                    .map(|(w, x)| (w * x).abs())
+                    .sum();
                 let actual = output_cpu[b][t][row];
-                // 2e-3: indexed MoE с 33550814 квантует активации в q8_1
-                // (8 бит, scale на 32 элемента) - относительная ошибка ~1e-3.
-                // Прежний 1e-4 был выставлен для f32-пути (77c4b711) и не был
-                // обновлён при переходе - гейт красный с 33550814, что скрыло
-                // бы любую настоящую регрессию. Класс допуска тот же, что у
-                // MMVQ-тестов (1e8730f3).
-                let tolerance = 0.02 + expected.abs() * 2e-3;
+                let tolerance = 0.02 + abs_scale * 2e-3;
                 assert!(
                     (actual - expected).abs() <= tolerance,
-                    "indexed {:?} mismatch b={b} topk={t} row={row}: actual={actual} expected={expected} tolerance={tolerance}",
+                    "indexed {:?} mismatch b={b} topk={t} row={row}: actual={actual} expected={expected} tolerance={tolerance} abs_scale={abs_scale}",
                     weights.dtype()
                 );
             }
