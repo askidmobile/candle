@@ -1520,9 +1520,13 @@ pub(crate) const DECODE_BATCH_CAPACITY: u32 = 4;
 // код графов проверял 200 MiB, а гейт эмбеддинга закорачивался через
 // `|| force_graphs`. Держим их здесь, одним набором.
 
-/// Минимум свободной VRAM для дублирующего `token_embd` на GPU (~2.2 GiB на 27B).
+/// Рабочий набор prefill поверх весов (активации чанка, IQ-dequant транзиенты,
+/// retained mempool). Замерено на 27B IQ2_XXS: пик 12045 MiB при 10535 после
+/// загрузки, т.е. ~1.5 GiB. Дублирующий token_embd грузим, только если после
+/// него этот запас остаётся, иначе prefill выталкивает веса в системную RAM
+/// (WDDM) и decode падает с ~30 до ~7 tok/s.
 #[cfg(feature = "cuda")]
-pub(crate) const EMBED_MIN_FREE_BYTES: usize = 1024 * 1024 * 1024;
+pub(crate) const PREFILL_HEADROOM_BYTES: usize = 1536 * 1024 * 1024;
 
 /// Резерв поверх обычного минимума, когда запрошены CUDA-графы: захват держит
 /// собственный пул аллокаций (~0.5 GiB на 27B).
@@ -4613,11 +4617,24 @@ impl ModelWeights {
                     // равно отключались по своему порогу — худшее из двух.
                     let has_vram_headroom = if let Ok(cuda_dev) = device.as_cuda_device() {
                         let force_graphs = std::env::var("QWEN36_CUDA_GRAPHS").as_deref() == Ok("1");
-                        let need = if force_graphs {
-                            EMBED_MIN_FREE_BYTES + GRAPH_POOL_RESERVE_BYTES
-                        } else {
-                            EMBED_MIN_FREE_BYTES
-                        };
+                        // Фактический размер тензора из GGUF-заголовка (флэтовая
+                        // планка 1 GiB пропускала ~0.8 GiB эмбеддинг на 27B при
+                        // free 2.5 GiB — и модель переставала помещаться в prefill).
+                        let embed_bytes = ct
+                            .tensor_infos
+                            .get("token_embd.weight")
+                            .map(|ti| {
+                                ti.shape.elem_count() * ti.ggml_dtype.type_size()
+                                    / ti.ggml_dtype.block_size()
+                            })
+                            .unwrap_or(usize::MAX);
+                        let need = embed_bytes
+                            .saturating_add(PREFILL_HEADROOM_BYTES)
+                            .saturating_add(if force_graphs {
+                                GRAPH_POOL_RESERVE_BYTES
+                            } else {
+                                0
+                            });
                         cuda_dev
                             .cuda_stream()
                             .context()
