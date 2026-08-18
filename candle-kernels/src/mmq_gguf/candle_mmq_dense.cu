@@ -1,4 +1,8 @@
 // candle_mmq_dense.cu
+// ВНИМАНИЕ: cudaforge кэширует nvcc-компиляцию по mtime/содержимому самого
+// .cu — изменения в инклюдах (mmq_common.cuh/mmq_gguf.cuh) кэш НЕ сбрасывают,
+// даже при сработавшем rerun-if-changed. Меняешь .cuh — бампни этот файл.
+// cache-bust: 2026-08-18 real IQ grid tables in mmq_common.cuh
 // extern "C" __global__ обёртки над llama.cpp mul_mat_q (Tensor-Core MMA) для
 // плотного prefill. Вызываются из candle-core fast_mmq.rs через cudarc.
 // Включён в PTX-сборку (имя не совпадает с exclude "mmq_*.cu").
