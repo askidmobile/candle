@@ -491,15 +491,48 @@ pub fn dispatch_delta_rule_batched_seq(
     }
 
     // ── Kernel 3 seq: delta rule, внутренний цикл по K строкам ──
+    // Smem-вариант держит state головы [hd×hd] в динамическом shared memory:
+    // global-трафик state = 2 прохода на форвард вместо 6×K. 128×128 → 64КБ
+    // динамического smem — больше дефолтных 48КБ, нужен opt-in атрибут
+    // (ставится один раз; при отказе — фолбэк на global-вариант).
     {
-        let func = dev.get_or_load_func(
-            "delta_rule_kernel_batched_seq",
-            &candle_kernels::DELTA_RULE_BATCHED,
-        )?;
+        let smem_bytes = (params.head_v_dim * params.head_v_dim * 4) as u32;
+        static SMEM_SEQ_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_smem = *SMEM_SEQ_OK.get_or_init(|| {
+            let ok = match dev.get_or_load_func(
+                "delta_rule_kernel_batched_seq_smem",
+                &candle_kernels::DELTA_RULE_BATCHED,
+            ) {
+                Ok(func) if smem_bytes <= 48 * 1024 => {
+                    let _ = func;
+                    true
+                }
+                Ok(func) => func
+                    .set_attribute(
+                        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem_bytes as i32,
+                    )
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                log::warn!(
+                    "[delta-seq] smem-вариант недоступен ({} bytes) — global fallback",
+                    smem_bytes
+                );
+            }
+            ok
+        });
+        let (kernel_name, shared_mem) = if use_smem {
+            ("delta_rule_kernel_batched_seq_smem", smem_bytes)
+        } else {
+            ("delta_rule_kernel_batched_seq", 0)
+        };
+        let func = dev.get_or_load_func(kernel_name, &candle_kernels::DELTA_RULE_BATCHED)?;
         let cfg = LaunchConfig {
             grid_dim: (n_v, 1, 1),
             block_dim: (hvd, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: shared_mem,
         };
         let mut bb = func.builder();
         bb.arg(&temp.q);
