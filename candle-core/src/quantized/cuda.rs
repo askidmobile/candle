@@ -1408,6 +1408,14 @@ impl QCudaStorage {
             GgmlDType::Q6K => ("q6_k", 76, "candle_mmq_quant_d4"),
             GgmlDType::Q4_0 => ("q4_0", 76, "candle_mmq_quant_ds4"),
             GgmlDType::Q8_0 => ("q8_0", 76, "candle_mmq_quant_d4"),
+            // IQ: tile_x_k по mmq_get_mma_tile_x_k (iq2_xs/iq2_s -> Q3_K=84,
+            // прочие -> Q8_0=76), layout активаций у всех -> D4.
+            GgmlDType::IQ2XXS => ("iq2_xxs", 76, "candle_mmq_quant_d4"),
+            GgmlDType::IQ2XS => ("iq2_xs", 84, "candle_mmq_quant_d4"),
+            GgmlDType::IQ2S => ("iq2_s", 84, "candle_mmq_quant_d4"),
+            GgmlDType::IQ3XXS => ("iq3_xxs", 76, "candle_mmq_quant_d4"),
+            GgmlDType::IQ3S => ("iq3_s", 76, "candle_mmq_quant_d4"),
+            GgmlDType::IQ4XS => ("iq4_xs", 76, "candle_mmq_quant_d4"),
             _ => return Ok(None),
         };
         let (n, k) = self_shape.dims2()?;

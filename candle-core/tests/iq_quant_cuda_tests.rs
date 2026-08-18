@@ -1208,6 +1208,63 @@ fn mmq_mma_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// MMQ Tensor-Core для IQ-квантов против dequant-эталона.
+/// Веса — случайные raw-байты (реалистичные grid-индексы; см. урок
+/// constant-memory-divergent-lookup: константная заливка маскирует
+/// дата-зависимые пути), f16-масштаб d каждого блока санирован в 1.0
+/// (случайные байты дают NaN/Inf в d). Кванты и внутренние int-скейлы
+/// остаются случайными.
+#[test]
+fn mmq_mma_iq_matches_reference() -> Result<()> {
+    use candle_core::quantized::QMatMul;
+    let device = Device::new_cuda(0)?;
+    let (n, k, m) = (512usize, 768usize, 64usize); // n % 128 == 0, k % 256 == 0, m > 8 -> MMQ
+
+    for &dtype in &[
+        GgmlDType::IQ2XXS,
+        GgmlDType::IQ2XS,
+        GgmlDType::IQ2S,
+        GgmlDType::IQ3XXS,
+        GgmlDType::IQ3S,
+        GgmlDType::IQ4XS,
+    ] {
+        let block_bytes = dtype.type_size();
+        let row_blocks = k / dtype.block_size();
+        let total = n * row_blocks * block_bytes;
+        let mut raw: Vec<u8> = (0..total)
+            .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        // d (half, offset 0 каждого блока) := 1.0 (0x3C00 LE)
+        for b in 0..(n * row_blocks) {
+            raw[b * block_bytes] = 0x00;
+            raw[b * block_bytes + 1] = 0x3C;
+        }
+        let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, dtype)?;
+        let qt = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+        let qmm = QMatMul::from_arc(qt.clone())?;
+
+        let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+        let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
+        let got = qmm.forward(&x_t)?; // m=64 -> MMQ путь
+
+        let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+        let x_2d = x_t.reshape((m, k))?;
+        let want = x_2d.matmul(&w_deq.t()?.contiguous()?)?.reshape((1, m, n))?;
+
+        let diff = (&got - &want)?.abs()?;
+        let max = diff.max_all()?.to_scalar::<f32>()?;
+        let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+        println!("MMQ-IQ {dtype:?}: max_abs_diff={max:.6} scale={scale:.4}");
+        // Тот же класс, что K-quant MMQ (1.5%): IQ-тайлы деквантуются в q8
+        // без потерь (grid-значения — малые int), доп. ошибки нет.
+        assert!(
+            max < 0.015 * scale,
+            "MMQ-IQ {dtype:?} mismatch: max_abs_diff={max} vs scale={scale} (tolerance 1.5%)"
+        );
+    }
+    Ok(())
+}
+
 /// Холодный MMVQ decode-бенч: 16 разных весов по ~70 MB (4.5 GB total > L2 3MB)
 /// прогоняются round-robin → каждый вызов читает не из L2, как реальная модель.
 /// Проверка гипотезы: разрыв mmvq в модели vs микробенч = L2-cache locality.
