@@ -991,7 +991,17 @@ fn mmvq_perf_dense() -> Result<()> {
         iters: usize,
     ) -> Result<()> {
         let total = n_rows * row_bytes;
-        let raw = vec![0x5Au8; total];
+        // QWEN36_PERF_RANDOM=1: реалистичные байты весов. У IQ vec_dot
+        // grid-lookup идёт по байту веса: константный филл даёт один индекс
+        // на весь варп (broadcast из L1) и завышает скорость ядра в разы
+        // против реальных весов (в модели те же ядра шли в ~3x медленнее).
+        let raw: Vec<u8> = if std::env::var("QWEN36_PERF_RANDOM").as_deref() == Ok("1") {
+            (0..total)
+                .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
+                .collect()
+        } else {
+            vec![0x5Au8; total]
+        };
         let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, dtype)?;
         let qt = Arc::new(QTensor::new(storage, (n_rows, k))?);
         let qmatmul = QMatMul::from_arc(qt)?;
