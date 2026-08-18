@@ -140,6 +140,12 @@ fn main() -> Result<()> {
         }
     }
 
+    // QWEN36_FORCE_DMMV=1: dequantize+cuBLAS вместо MMQ/MMVQ — референс для
+    // A/B новых fused-путей (env-хука в candle-core нет, только setter).
+    if std::env::var("QWEN36_FORCE_DMMV").as_deref() == Ok("1") {
+        candle_core::quantized::cuda::set_force_dmmv(true);
+        eprintln!("[logits] FORCE_DMMV=1: dequantize+cuBLAS path");
+    }
     let device = Device::new_cuda(0).context("open CUDA device 0")?;
     let tokenizer = tokenizer::load_from_gguf_path(&model)?;
     let messages = match fixture.as_str() {
