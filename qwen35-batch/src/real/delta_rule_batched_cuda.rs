@@ -362,6 +362,190 @@ pub fn dispatch_delta_rule_batched(
     Ok(output)
 }
 
+/// Seq-вариант для MTP batched verify: K строк ОДНОГО слота одним набором из
+/// 4 launch'ей (как обычный batched-шаг). Рекуррентные ядра (conv, delta) крутят
+/// внутренний цикл по строкам — бит-эксактно K одиночным шагам; стейтлесс-ядра
+/// (l2norm, gate) получают grid.y=K. Требует temp capacity_b >= K.
+///
+/// Входы: qkv_t [K,1,channels], z_t [K,1,value_dim], beta/alpha [K,1,n_v].
+/// Выход: [K,1,value_dim] (zero-copy wrap temp.gated_output — потребить до
+/// следующего DeltaNet-диспатча).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_delta_rule_batched_seq(
+    dev: &CudaDevice,
+    state: &DeltaNetCudaStateBatched,
+    temp: &DeltaNetCudaTempBatched,
+    params: &DeltaParams,
+    qkv_t: &Tensor,
+    z_t: &Tensor,
+    beta_t: &Tensor,
+    alpha_t: &Tensor,
+    slot: u32,
+) -> Result<Tensor> {
+    let channels = params.channels as u32;
+    let n_v = params.n_v_heads as u32;
+    let hkd = params.head_k_dim as u32;
+    let hvd = params.head_v_dim as u32;
+    let value_dim = params.value_dim as usize;
+    let block_ch = 256u32;
+
+    let qkv_f = ensure_f32(qkv_t)?;
+    let z_f = ensure_f32(z_t)?;
+    let beta_f = ensure_f32(beta_t)?;
+    let alpha_f = ensure_f32(alpha_t)?;
+
+    let (k_rows, _s, _c) = qkv_f.dims3()?;
+    let (k_z, _s, _v) = z_f.dims3()?;
+    let (k_beta, _s, _h) = beta_f.dims3()?;
+    let (k_alpha, _s, _h) = alpha_f.dims3()?;
+    if k_z != k_rows || k_beta != k_rows || k_alpha != k_rows || k_rows == 0 {
+        candle_core::bail!(
+            "dispatch_delta_rule_batched_seq: row mismatch: qkv={k_rows} z={k_z} beta={k_beta} alpha={k_alpha}"
+        );
+    }
+    if k_rows as u32 > temp.capacity_b {
+        candle_core::bail!(
+            "dispatch_delta_rule_batched_seq: {k_rows} rows > temp capacity {}",
+            temp.capacity_b
+        );
+    }
+    if slot >= state.capacity_b {
+        candle_core::bail!(
+            "dispatch_delta_rule_batched_seq: slot {slot} >= state capacity {}",
+            state.capacity_b
+        );
+    }
+    let seq_rows = k_rows as u32;
+
+    let (qkv_st, qkv_lay) = qkv_f.storage_and_layout();
+    let (z_st, z_lay) = z_f.storage_and_layout();
+    let (beta_st, beta_lay) = beta_f.storage_and_layout();
+    let (alpha_st, alpha_lay) = alpha_f.storage_and_layout();
+    let qkv_v = cuda_slice_view(&qkv_st, qkv_lay.start_offset())?;
+    let z_v = cuda_slice_view(&z_st, z_lay.start_offset())?;
+    let beta_v = cuda_slice_view(&beta_st, beta_lay.start_offset())?;
+    let alpha_v = cuda_slice_view(&alpha_st, alpha_lay.start_offset())?;
+
+    let slot_ids = [slot];
+    let slot_ids_arc = {
+        let mut cache = temp.slot_ids_cache.lock().expect("slot_ids cache");
+        let stale = match &*cache {
+            Some((_, ids)) => ids.as_slice() != slot_ids,
+            None => true,
+        };
+        if stale {
+            *cache = Some((std::sync::Arc::new(dev.clone_htod(&slot_ids)?), slot_ids.to_vec()));
+        }
+        cache.as_ref().unwrap().0.clone()
+    };
+
+    let mut p = *params;
+    p.batch_size = seq_rows;
+
+    // ── Kernel 1 seq: conv1d prep, внутренний цикл по K строкам ──
+    {
+        let func = dev.get_or_load_func(
+            "delta_conv1d_prep_batched_seq",
+            &candle_kernels::DELTA_RULE_BATCHED,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (channels.div_ceil(block_ch), 1, 1),
+            block_dim: (block_ch, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = func.builder();
+        bb.arg(&qkv_v);
+        bb.arg(&beta_v);
+        bb.arg(&alpha_v);
+        bb.arg(&state.conv_weights);
+        bb.arg(&state.dt_bias);
+        bb.arg(&state.ssm_a);
+        bb.arg(&state.conv_state);
+        bb.arg(&temp.qkv_conv);
+        bb.arg(&temp.beta);
+        bb.arg(&temp.gate);
+        bb.arg(&p);
+        bb.arg(&*slot_ids_arc);
+        bb.arg(&seq_rows);
+        unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // ── Kernel 2: l2 norm (стейтлесс — batch-ось = строки) ──
+    {
+        let func = dev.get_or_load_func(
+            "delta_l2_norm_expand_batched",
+            &candle_kernels::DELTA_RULE_BATCHED,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v, seq_rows, 1),
+            block_dim: (hkd, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = func.builder();
+        bb.arg(&temp.qkv_conv);
+        bb.arg(&temp.q);
+        bb.arg(&temp.k);
+        bb.arg(&temp.v);
+        bb.arg(&p);
+        unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // ── Kernel 3 seq: delta rule, внутренний цикл по K строкам ──
+    {
+        let func = dev.get_or_load_func(
+            "delta_rule_kernel_batched_seq",
+            &candle_kernels::DELTA_RULE_BATCHED,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v, 1, 1),
+            block_dim: (hvd, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = func.builder();
+        bb.arg(&temp.q);
+        bb.arg(&temp.k);
+        bb.arg(&temp.v);
+        bb.arg(&temp.beta);
+        bb.arg(&temp.gate);
+        bb.arg(&state.ssm_state);
+        bb.arg(&temp.delta_output);
+        bb.arg(&p);
+        bb.arg(&*slot_ids_arc);
+        bb.arg(&seq_rows);
+        unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    // ── Kernel 4: norm+gate (стейтлесс — batch-ось = строки) ──
+    {
+        let func = dev.get_or_load_func(
+            "delta_norm_gate_kernel_batched",
+            &candle_kernels::DELTA_RULE_BATCHED,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_v, seq_rows, 1),
+            block_dim: (hvd, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut bb = func.builder();
+        bb.arg(&temp.delta_output);
+        bb.arg(&z_v);
+        bb.arg(&state.norm_weight);
+        bb.arg(&temp.gated_output);
+        bb.arg(&p);
+        unsafe { bb.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+    }
+
+    let gated_view = temp.gated_output.clone();
+    let storage = CudaStorage::wrap_cuda_slice(gated_view, dev.clone());
+    let output = Tensor::from_storage(
+        Storage::Cuda(storage),
+        (k_rows, 1, value_dim),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    Ok(output)
+}
+
 /// Cast в F32 contiguous (как single CUDA-путь).
 fn ensure_f32(t: &Tensor) -> Result<Tensor> {
     if t.dtype() == candle_core::DType::F32 {

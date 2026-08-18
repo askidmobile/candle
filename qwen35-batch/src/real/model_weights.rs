@@ -2000,26 +2000,24 @@ impl DeltaNetLayer {
             };
             let t0 = sync();
             if serial_rows {
-                let mut rows = Vec::with_capacity(b);
-                for i in 0..b {
-                    // CUDA dispatch учитывает start_offset narrow-view'ов; .copy()
-                    // нужен только выходу (zero-copy view общего scratch).
-                    rows.push(
-                        delta_rule_batched_cuda::dispatch_delta_rule_batched(
-                            &ctx.dev,
-                            &ctx.layer_state,
-                            &ctx.temp,
-                            &ctx.params,
-                            &qkv_t.narrow(0, i, 1)?,
-                            &z_t.narrow(0, i, 1)?,
-                            &beta_t.narrow(0, i, 1)?,
-                            &alpha_t.narrow(0, i, 1)?,
-                            &slots[i..i + 1],
-                        )?
-                        .copy()?,
+                // Все строки одного слота (MTP verify) — seq-ядра: один набор
+                // launch'ей, внутренний цикл по строкам, бит-эксактно K шагам.
+                if slots.windows(2).any(|w| w[0] != w[1]) {
+                    candle_core::bail!(
+                        "forward_decode_batch: смешанные дубликаты слотов не поддерживаются"
                     );
                 }
-                batched_out_cuda = Some(Tensor::cat(&rows, 0)?);
+                batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched_seq(
+                    &ctx.dev,
+                    &ctx.layer_state,
+                    &ctx.temp,
+                    &ctx.params,
+                    &qkv_t,
+                    &z_t,
+                    &beta_t,
+                    &alpha_t,
+                    slots[0],
+                )?);
             } else {
                 batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
                     &ctx.dev,
@@ -4960,16 +4958,19 @@ impl ModelWeights {
                 heads_per_kv: (n_v_heads / n_k_heads) as u32,
                 batch_size: decode_capacity(),
             };
+            // Temp capacity >= 8: MTP batched verify гоняет K строк одного слота
+            // через seq-ядра (K <= 8 — потолок mmvq b_size). Буферы маленькие
+            // (сотни КБ), state-буферы остаются ровно под decode_capacity.
             match delta_rule_batched_cuda::create_temp_buffers_batched(
                 cuda_dev,
                 &p,
-                decode_capacity(),
+                decode_capacity().max(8),
             ) {
                 Ok(temp) => {
                     log::info!(
                         "[{}] CUDA delta_rule BATCHED: temp created, capacity_b={}",
                         tag,
-                        decode_capacity()
+                        decode_capacity().max(8)
                     );
                     Some((cuda_dev.clone(), Arc::new(temp), p))
                 }
