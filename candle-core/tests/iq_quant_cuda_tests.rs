@@ -170,6 +170,11 @@ fn iq4xs_cuda_matmul() -> Result<()> {
     test_iq_matmul(GgmlDType::IQ4XS)
 }
 
+#[test]
+fn iq1m_matmul_dispatches_on_cuda() -> Result<()> {
+    test_iq_matmul(GgmlDType::IQ1M)
+}
+
 /// Verify that the dequantize kernel produces finite values for each IQ type.
 /// This isolates dequantize correctness from the matmul dispatch.
 ///
