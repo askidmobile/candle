@@ -1218,8 +1218,105 @@ fn mmq_mma_wide_batch_matches_reference() -> Result<()> {
     let device = Device::new_cuda(0)?;
     let (n, k) = (512usize, 768usize);
 
+    // Полная матрица: все MMQ-dtype на широком батче. Модельный A/B дал
+    // nRMSE 0.53 при зелёных Q4K/IQ2XXS - виновник в другом dtype или форме.
     for &m in &[512usize, 200] {
-        // K-quant: квантуем из float.
+        for &dtype in &[
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8_0,
+        ] {
+            let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).sin()).collect();
+            let w_t = Tensor::from_vec(w, (n, k), &device)?;
+            let qt = std::sync::Arc::new(QTensor::quantize(&w_t, dtype)?);
+            let qmm = QMatMul::from_arc(qt.clone())?;
+            let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+            let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
+            let got = qmm.forward(&x_t)?;
+            let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+            let want = x_t
+                .reshape((m, k))?
+                .matmul(&w_deq.t()?.contiguous()?)?
+                .reshape((1, m, n))?;
+            let max = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+            println!("MMQ-WIDE {dtype:?} m={m}: max_abs_diff={max:.6} scale={scale:.4}");
+            assert!(
+                max < 0.015 * scale,
+                "MMQ-WIDE {dtype:?} m={m}: max_abs_diff={max} vs scale={scale}"
+            );
+        }
+        for &dtype in &[
+            GgmlDType::IQ2XS,
+            GgmlDType::IQ2S,
+            GgmlDType::IQ3XXS,
+            GgmlDType::IQ3S,
+            GgmlDType::IQ4XS,
+        ] {
+            let block_bytes = dtype.type_size();
+            let row_blocks = k / dtype.block_size();
+            let total = n * row_blocks * block_bytes;
+            let mut raw: Vec<u8> = (0..total)
+                .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
+                .collect();
+            for b in 0..(n * row_blocks) {
+                raw[b * block_bytes] = 0x00;
+                raw[b * block_bytes + 1] = 0x3C;
+            }
+            let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, dtype)?;
+            let qt = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+            let qmm = QMatMul::from_arc(qt.clone())?;
+            let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.011).sin()).collect();
+            let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
+            let got = qmm.forward(&x_t)?;
+            let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+            let want = x_t
+                .reshape((m, k))?
+                .matmul(&w_deq.t()?.contiguous()?)?
+                .reshape((1, m, n))?;
+            let max = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+            println!("MMQ-WIDE {dtype:?} m={m}: max_abs_diff={max:.6} scale={scale:.4}");
+            assert!(
+                max < 0.015 * scale,
+                "MMQ-WIDE {dtype:?} m={m}: max_abs_diff={max} vs scale={scale}"
+            );
+        }
+        // Реальные формы 27B: FFN up/gate и down, iq2_xxs.
+        for &(nn, kk) in &[(17408usize, 5120usize), (5120, 17408)] {
+            let dtype = GgmlDType::IQ2XXS;
+            let block_bytes = dtype.type_size();
+            let row_blocks = kk / dtype.block_size();
+            let total = nn * row_blocks * block_bytes;
+            let mut raw: Vec<u8> = (0..total)
+                .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
+                .collect();
+            for b in 0..(nn * row_blocks) {
+                raw[b * block_bytes] = 0x00;
+                raw[b * block_bytes + 1] = 0x3C;
+            }
+            let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, dtype)?;
+            let qt = std::sync::Arc::new(QTensor::new(storage, (nn, kk))?);
+            let qmm = QMatMul::from_arc(qt.clone())?;
+            let x: Vec<f32> = (0..m * kk).map(|i| ((i as f32) * 0.007).cos()).collect();
+            let x_t = Tensor::from_vec(x, (1, m, kk), &device)?;
+            let got = qmm.forward(&x_t)?;
+            let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+            let want = x_t
+                .reshape((m, kk))?
+                .matmul(&w_deq.t()?.contiguous()?)?
+                .reshape((1, m, nn))?;
+            let max = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+            println!("MMQ-WIDE IQ2XXS [{nn}x{kk}] m={m}: max_abs_diff={max:.6} scale={scale:.4}");
+            assert!(
+                max < 0.015 * scale,
+                "MMQ-WIDE IQ2XXS [{nn}x{kk}] m={m}: max_abs_diff={max} vs scale={scale}"
+            );
+        }
+        // Q4K: квантуем из float.
         let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).sin()).collect();
         let w_t = Tensor::from_vec(w, (n, k), &device)?;
         let qt = std::sync::Arc::new(QTensor::quantize(&w_t, GgmlDType::Q4K)?);
