@@ -600,26 +600,49 @@ fn iq_indexed_moe_rejects_noncontiguous_input() -> Result<()> {
 /// потокобезопасен при параллельных тестах (cargo test default threads).
 static GRAPH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Minimal CUDA graph capture/replay sanity: fill kernel через graph, replay дважды.
+/// Замок с игнором poison: паника одного graph-теста не должна каскадом
+/// валить остальные PoisonError'ом (падал бы не виновник, а соседи по алфавиту).
+fn graph_lock() -> std::sync::MutexGuard<'static, ()> {
+    GRAPH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Minimal CUDA graph capture/replay sanity: умножение через graph, replay дважды.
 /// Изолирует механику cudarc begin/end_capture + launch от модели.
+/// Контракт продакшна (adapter.rs, fd68dd73): аллокации внутри захвата
+/// сбалансированы — промежуточный тензор дропается ДО end_capture, выход идёт
+/// D2D-нодой во внешний (pre-alloc) буфер. Несбалансированный alloc-нод делает
+/// граф одноразовым: второй cuGraphLaunch → CUDA_ERROR_INVALID_VALUE.
 #[test]
 fn cuda_graph_minimal_capture_replay() -> Result<()> {
-    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    let _guard = graph_lock();
     use candle_core::cuda_backend::cudarc;
     let device = Device::new_cuda(0)?;
     let cuda_dev = device.as_cuda_device()?;
     let stream = cuda_dev.cuda_stream();
 
-    // Eager: x = 1
-    let mut x = Tensor::ones((16,), DType::F32, &device)?;
-    let x0 = x.to_vec1::<f32>()?;
-    assert!(x0.iter().all(|&v| v == 1.0));
+    let x = Tensor::ones((16,), DType::F32, &device)?;
+    let out = Tensor::zeros((16,), DType::F32, &device)?; // внешний буфер (до захвата)
+    // Prime тех же ядер вне захвата; out = 1.0, чтобы отличить от результата графа.
+    {
+        let y = (x.clone() * 2.0)?;
+        drop(y);
+        out.slice_set(&x, 0, 0)?;
+    }
+    stream
+        .synchronize()
+        .map_err(|e| candle_core::Error::Msg(format!("sync0: {e}")))?;
 
-    // Capture: x = x * 2 (device op, capturable)
+    // Capture: y = x * 2 (alloc в graph pool) → D2D в out → drop(y) (free-нода).
     use cudarc::driver::{result as cres, sys as csys};
     unsafe { cres::stream::begin_capture(stream.cu_stream(), csys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED) }
         .map_err(|e| candle_core::Error::Msg(format!("begin_capture: {e}")))?;
-    let y = (x.clone() * 2.0)?;
+    {
+        let y = (x.clone() * 2.0)?;
+        out.slice_set(&y, 0, 0)?;
+        drop(y);
+    }
     let cu_graph = unsafe { cres::stream::end_capture(stream.cu_stream()) }
         .map_err(|e| candle_core::Error::Msg(format!("end_capture: {e}")))?;
     assert!(!cu_graph.is_null(), "end_capture returned null graph");
@@ -641,7 +664,7 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
     stream
         .synchronize()
         .map_err(|e| candle_core::Error::Msg(format!("sync2: {e}")))?;
-    let y0 = y.to_vec1::<f32>()?;
+    let y0 = out.to_vec1::<f32>()?;
     assert!(y0.iter().all(|&v| v == 2.0), "graph replay wrong: {:?}", &y0[..4]);
     unsafe {
         csys::cuGraphExecDestroy(exec);
@@ -653,7 +676,7 @@ fn cuda_graph_minimal_capture_replay() -> Result<()> {
 /// Граф с alloc+free узлами (промежуточный тензор дропнут внутри захвата).
 #[test]
 fn cuda_graph_alloc_free_balanced_double_launch() -> Result<()> {
-    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    let _guard = graph_lock();
     use candle_core::cuda_backend::cudarc;
     use cudarc::driver::{result as cres, sys as csys};
     let device = Device::new_cuda(0)?;
@@ -692,7 +715,7 @@ fn cuda_graph_alloc_free_balanced_double_launch() -> Result<()> {
 /// Граф БЕЗ alloc-узлов: запись в пред-аллоцированный буфер (WDDM проверка).
 #[test]
 fn cuda_graph_no_alloc_nodes_double_launch() -> Result<()> {
-    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    let _guard = graph_lock();
     use candle_core::cuda_backend::cudarc;
     use cudarc::driver::{result as cres, sys as csys};
     let device = Device::new_cuda(0)?;
@@ -732,7 +755,7 @@ fn cuda_graph_no_alloc_nodes_double_launch() -> Result<()> {
 /// Кастомные ядра с raw u64-pointer аргументами (cumsum/increment стиль) в графе.
 #[test]
 fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
-    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    let _guard = graph_lock();
     use candle_core::cuda_backend::cudarc;
     use cudarc::driver::{result as cres, sys as csys, LaunchConfig, PushKernelArg};
     let device = Device::new_cuda(0)?;
@@ -806,7 +829,7 @@ fn cuda_graph_raw_ptr_kernel_capture() -> Result<()> {
 /// Полный L=0 набор ядер модели в графе: embedding + rmsnorm + q8_1 + matvec + copy2d.
 #[test]
 fn cuda_graph_model_l0_stack_capture() -> Result<()> {
-    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    let _guard = graph_lock();
     use candle_core::cuda_backend::cudarc;
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use cudarc::driver::{result as cres, sys as csys};
@@ -882,7 +905,7 @@ fn cuda_graph_model_l0_stack_capture() -> Result<()> {
 /// То же, но с PTX quantized ядром + cuBLAS matmul внутри захвата.
 #[test]
 fn cuda_graph_quantized_and_cublas_capture() -> Result<()> {
-    let _guard = GRAPH_TEST_LOCK.lock().unwrap();
+    let _guard = graph_lock();
     use candle_core::cuda_backend::cudarc;
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     let device = Device::new_cuda(0)?;
