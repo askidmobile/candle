@@ -4431,7 +4431,21 @@ impl ModelWeights {
         let prefix: &str = if is_moe { "qwen35moe" } else { "qwen35" };
 
         // ── Qwen3.5/Qwen3.6MoE metadata (prefix-selected) ──
-        let block_count = md_get(&format!("{prefix}.block_count"))?.to_u32()? as usize;
+        let block_count_raw = md_get(&format!("{prefix}.block_count"))?.to_u32()? as usize;
+        // Qwen3.8+: block_count включает nextn/MTP-слои (blk.<last> с
+        // attn_q/k/v + ffn + nextn.*-тензорами; см. nextn_predict_layers).
+        // Транк модели — только обычные блоки; MTP-слой грузится отдельным
+        // рантаймом (mtp.rs), а llama.cpp его при инференсе пропускает.
+        let nextn_layers = md_get(&format!("{prefix}.nextn_predict_layers"))
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let block_count = block_count_raw - nextn_layers;
+        if nextn_layers > 0 {
+            log::info!(
+                "[{tag}] nextn_predict_layers={nextn_layers}: trunk {block_count} of {block_count_raw} blocks (MTP head present)"
+            );
+        }
         let embedding_length = md_get(&format!("{prefix}.embedding_length"))?.to_u32()? as usize;
         // feed_forward_length: dense only (unused but validated). MoE uses expert/shared lengths.
         let _feed_forward_length = md_get(&format!("{prefix}.feed_forward_length"))
