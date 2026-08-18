@@ -1,48 +1,4 @@
 // Kernels adapted from llama.cpp ggml-cuda.cu and ggml-cuda/getrows.cu
-static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
-
-    const block_iq1_m * bq1 = (const block_iq1_m *) vbq;
-
-    const int       qs_packed = get_int_from_uint8_aligned(reinterpret_cast<const uint8_t *>(bq1->qs), iqs);
-    const uint8_t * qs        = (const uint8_t *) &qs_packed;
-
-    int   sumi[2] = {0};
-    float sumf[2] = {0.0f};
-#pragma unroll
-    for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int qhl = bq1->qh[2*iqs + l0/4] >> (4 * ((l0/2) % 2));
-
-        const int grid = iq1s_grid_gpu[qs[l0/2] | ((qhl & 0x07) << 8)];
-
-        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
-        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
-
-        const int u0 = get_int_from_int8_aligned(bq8_1[iqs].qs, l0 + 0);
-        const int u1 = get_int_from_int8_aligned(bq8_1[iqs].qs, l0 + 1);
-
-        sumi[l0/4] = ggml_cuda_dp4a(grid0, u0, sumi[l0/4]);
-        sumi[l0/4] = ggml_cuda_dp4a(grid1, u1, sumi[l0/4]);
-
-        const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f*IQ1M_DELTA/0x08);
-        int sumy = 0;
-        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
-        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
-        sumf[l0/4] += delta*sumy;
-    }
-
-    const uint16_t * sc = (const uint16_t *) bq1->scales;
-
-    iq1m_scale_t scale;
-    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
-    const float d = __half2float(scale.f16) * __low2float(bq8_1[iqs].ds);
-
-    const int tmp = sc[iqs/2] >> (6*(iqs%2));
-    const int sc0 = 2*((tmp >> 0) & 0x07) + 1;
-    const int sc1 = 2*((tmp >> 3) & 0x07) + 1;
-    return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
-}
-
 // https://github.com/ggerganov/llama.cpp/blob/master/ggml-cuda.cu
 #include "cuda_fp16.h"
 #include "cuda_bf16.h"
@@ -418,6 +374,51 @@ typedef struct {
     int8_t  qs[QK8_0];      // quants
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0, "wrong q8_1 block size/padding");
+
+static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_iq1_m * bq1 = (const block_iq1_m *) vbq;
+
+    const int       qs_packed = get_int_from_uint8_aligned(reinterpret_cast<const uint8_t *>(bq1->qs), iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    int   sumi[2] = {0};
+    float sumf[2] = {0.0f};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int qhl = bq1->qh[2*iqs + l0/4] >> (4 * ((l0/2) % 2));
+
+        const int grid = iq1s_grid_gpu[qs[l0/2] | ((qhl & 0x07) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_from_int8_aligned(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_from_int8_aligned(bq8_1[iqs].qs, l0 + 1);
+
+        sumi[l0/4] = ggml_cuda_dp4a(grid0, u0, sumi[l0/4]);
+        sumi[l0/4] = ggml_cuda_dp4a(grid1, u1, sumi[l0/4]);
+
+        const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f*IQ1M_DELTA/0x08);
+        int sumy = 0;
+        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+        sumf[l0/4] += delta*sumy;
+    }
+
+    const uint16_t * sc = (const uint16_t *) bq1->scales;
+
+    iq1m_scale_t scale;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+    const float d = __half2float(scale.f16) * __low2float(bq8_1[iqs].ds);
+
+    const int tmp = sc[iqs/2] >> (6*(iqs%2));
+    const int sc0 = 2*((tmp >> 0) & 0x07) + 1;
+    const int sc1 = 2*((tmp >> 3) & 0x07) + 1;
+    return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+}
+
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 typedef void (*allocate_tiles_cuda_t)(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc);
