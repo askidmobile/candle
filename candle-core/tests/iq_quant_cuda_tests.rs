@@ -368,7 +368,13 @@ fn assert_indexed_matches_dequantized(
                     .map(|(w, x)| w * x)
                     .sum();
                 let actual = output_cpu[b][t][row];
-                let tolerance = 0.02 + expected.abs() * 1e-4;
+                // 2e-3: indexed MoE с 33550814 квантует активации в q8_1
+                // (8 бит, scale на 32 элемента) - относительная ошибка ~1e-3.
+                // Прежний 1e-4 был выставлен для f32-пути (77c4b711) и не был
+                // обновлён при переходе - гейт красный с 33550814, что скрыло
+                // бы любую настоящую регрессию. Класс допуска тот же, что у
+                // MMVQ-тестов (1e8730f3).
+                let tolerance = 0.02 + expected.abs() * 2e-3;
                 assert!(
                     (actual - expected).abs() <= tolerance,
                     "indexed {:?} mismatch b={b} topk={t} row={row}: actual={actual} expected={expected} tolerance={tolerance}",
