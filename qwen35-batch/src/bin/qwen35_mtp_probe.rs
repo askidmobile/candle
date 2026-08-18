@@ -10,7 +10,8 @@ use std::path::Path;
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let text = args.next().context("usage: qwen35_mtp_probe TEXT.gguf MTP.gguf PROMPT_IDS [MAX_NEW] [SLOTS]")?;
-    let mtp = args.next().context("missing MTP.gguf")?;
+    // "-" вместо пути = baseline без MTP (для A/B скорости тем же бинарём).
+    let mtp = args.next().context("missing MTP.gguf or -")?;
     let prompt = args.next().context("missing comma-separated prompt IDs")?;
     let max_new = args.next().as_deref().unwrap_or("8").parse::<usize>()?;
     let slots = args.next().as_deref().unwrap_or("1").parse::<usize>()?;
@@ -20,7 +21,9 @@ fn main() -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let device = Device::new_cuda(0)?;
     let mut adapter = Qwen35BatchAdapter::load(Path::new(&text), device, slots)?;
-    adapter.load_mtp(Path::new(&mtp))?;
+    if mtp != "-" {
+        adapter.load_mtp(Path::new(&mtp))?;
+    }
     let eos = adapter.eos();
     let vocab = adapter.vocab_size();
     let mut scheduler = BatchScheduler::new(adapter, slots, eos, vocab);
@@ -28,6 +31,11 @@ fn main() -> Result<()> {
         scheduler.submit(prompt.clone(), max_new);
     }
     let mut outputs = vec![Vec::new(); slots];
+    // Prefill отдельно от decode-тайминга: первый step делает prefill слотов.
+    for _ in 0..slots {
+        scheduler.step()?;
+    }
+    let started = std::time::Instant::now();
     loop {
         let finished = scheduler
             .slots_mut()
@@ -46,11 +54,16 @@ fn main() -> Result<()> {
             break;
         }
     }
+    let elapsed = started.elapsed().as_secs_f64();
+    let generated: usize = outputs.iter().map(Vec::len).sum();
     let metrics = (0..slots)
         .map(|slot| scheduler.speculative_metrics(slot).cloned())
         .collect::<Vec<_>>();
     println!("{}", json!({
         "schema_version": "qwen35-mtp-probe-v1",
+        "decode_seconds": elapsed,
+        "decode_tokens": generated,
+        "decode_tok_per_s": generated as f64 / elapsed.max(1e-9),
         "outputs": outputs,
         "metrics": metrics.iter().map(|metric| metric.as_ref().map(|value| json!({
             "enabled": value.enabled,
