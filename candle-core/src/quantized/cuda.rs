@@ -1372,7 +1372,13 @@ impl QCudaStorage {
             }
         }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            1
+            // 0, не 1: vec-ветка под FORCE_DMMV уходит в
+            // dequantize_mul_mat_vec_via_cublas, который деквантует ВЕСЬ вес в
+            // f32 без тайлинга — голова 27B [248320x5120] это 5.09 GB и OOM на
+            // 12GB. Tiled dequantize_matmul корректен и для m=1 (chunked
+            // dequant + cuBLAS gemv), диагностический путь остаётся честным
+            // dequant-референсом.
+            0
         } else if force_mmq() {
             // Эксперимент (шаг 2 perf-плана): MMQ вместо dmmv даже для m=1.
             0
