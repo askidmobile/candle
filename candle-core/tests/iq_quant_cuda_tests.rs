@@ -1159,3 +1159,55 @@ fn mmq_mma_matches_reference() -> Result<()> {
     }
     Ok(())
 }
+
+/// Холодный MMVQ decode-бенч: 16 разных весов по ~70 MB (4.5 GB total > L2 3MB)
+/// прогоняются round-robin → каждый вызов читает не из L2, как реальная модель.
+/// Проверка гипотезы: разрыв mmvq в модели vs микробенч = L2-cache locality.
+#[test]
+#[ignore]
+fn mmvq_perf_cold() -> Result<()> {
+    use std::time::Instant;
+    let device = Device::new_cuda(0)?;
+    let cuda = match &device {
+        Device::Cuda(c) => c.clone(),
+        _ => unreachable!(),
+    };
+
+    // 16 разных весов [17408, 5120] Q4_K (~70 MB каждый, 1.1 GB total > 3MB L2)
+    let n = 17408usize;
+    let k = 5120usize;
+    let row_bytes = k / 256 * std::mem::size_of::<candle_core::quantized::k_quants::BlockQ4K>();
+    let mut weights = Vec::new();
+    for i in 0..16 {
+        let raw = vec![(i as u8).wrapping_mul(37).wrapping_add(0x5A); n * row_bytes];
+        let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, GgmlDType::Q4K)?;
+        let qt = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+        weights.push(QMatMul::from_arc(qt)?);
+    }
+    let y = Tensor::zeros((1, 1, k), DType::F32, &device)?;
+
+    // Warmup
+    for w in &weights { let _ = w.forward(&y)?; }
+    cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+
+    // Round-robin: каждый вызов — другой вес (L2-cold как в реальной модели)
+    let t0 = Instant::now();
+    let iters = 200;
+    for it in 0..iters {
+        let _ = weights[it % weights.len()].forward(&y)?;
+    }
+    cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+    let el = t0.elapsed().as_secs_f64() / iters as f64;
+    let bytes = n * row_bytes;
+    println!("MMVQ-COLD Q4K [{n}x{k}] x16 round-robin: {:.3}ms {:.0} GB/s",
+        el * 1000.0, bytes as f64 / el / 1e9);
+
+    // Hot (тот же вес) для сравнения
+    let t0 = Instant::now();
+    for _ in 0..iters { let _ = weights[0].forward(&y)?; }
+    cuda.cuda_stream().synchronize().map_err(candle_core::Error::wrap)?;
+    let el_h = t0.elapsed().as_secs_f64() / iters as f64;
+    println!("MMVQ-HOT  Q4K [{n}x{k}] x1  hot:       {:.3}ms {:.0} GB/s",
+        el_h * 1000.0, bytes as f64 / el_h / 1e9);
+    Ok(())
+}
