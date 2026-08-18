@@ -1926,25 +1926,59 @@ impl DeltaNetLayer {
             (qkv_t, z_t, beta_t, alpha_t)
         };
 
+        // Повторяющиеся слоты в батче (MTP verify: K позиций ОДНОГО слота) —
+        // рекуррентный state требует последовательной обработки строк; параллельное
+        // batched-ядро по оси B дало бы гонку на slot-регионе. Строки прогоняются
+        // тем же ядром с batch_size=1 по порядку — бит-эксактно K одиночным шагам.
+        // Проекции выше уже сделаны батчем (веса читаются один раз на K строк).
+        let serial_rows = b > 1 && slots.iter().enumerate().any(|(i, s)| slots[..i].contains(s));
+
         // ── Metal batched path: 4 batched kernel'а на GPU (slot ось B) ──
         #[cfg(target_os = "macos")]
         let mut batched_out_metal: Option<Tensor> = None;
         #[cfg(target_os = "macos")]
         if let Some(ctx) = self.metal_ctx_batched.as_mut() {
             let metal_device = device.as_metal_device()?;
-            ctx.params.batch_size = b as u32;
-            batched_out_metal = Some(metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
-                metal_device,
-                &ctx.pipelines,
-                &ctx.layer_state,
-                &ctx.temp,
-                &ctx.params,
-                &qkv_t,
-                &z_t,
-                &beta_t,
-                &alpha_t,
-                slots,
-            )?);
+            if serial_rows {
+                ctx.params.batch_size = 1;
+                let mut rows = Vec::with_capacity(b);
+                for i in 0..b {
+                    // .copy() входов: metal dispatch читает буфер с offset 0,
+                    // narrow-view имеет ненулевой start_offset.
+                    // .copy() выхода: dispatch возвращает zero-copy view общего
+                    // scratch — следующая итерация его перезапишет.
+                    rows.push(
+                        metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
+                            metal_device,
+                            &ctx.pipelines,
+                            &ctx.layer_state,
+                            &ctx.temp,
+                            &ctx.params,
+                            &qkv_t.narrow(0, i, 1)?.copy()?,
+                            &z_t.narrow(0, i, 1)?.copy()?,
+                            &beta_t.narrow(0, i, 1)?.copy()?,
+                            &alpha_t.narrow(0, i, 1)?.copy()?,
+                            &slots[i..i + 1],
+                        )?
+                        .copy()?,
+                    );
+                }
+                batched_out_metal = Some(Tensor::cat(&rows, 0)?);
+            } else {
+                ctx.params.batch_size = b as u32;
+                batched_out_metal = Some(metal::delta_rule_batched_metal::dispatch_delta_rule_batched(
+                    metal_device,
+                    &ctx.pipelines,
+                    &ctx.layer_state,
+                    &ctx.temp,
+                    &ctx.params,
+                    &qkv_t,
+                    &z_t,
+                    &beta_t,
+                    &alpha_t,
+                    slots,
+                )?);
+            }
         }
         #[cfg(target_os = "macos")]
         if let Some(out) = batched_out_metal {
@@ -1956,7 +1990,7 @@ impl DeltaNetLayer {
         let mut batched_out_cuda: Option<Tensor> = None;
         #[cfg(feature = "cuda")]
         if let Some(ctx) = self.cuda_ctx_batched.as_mut() {
-            ctx.params.batch_size = b as u32;
+            ctx.params.batch_size = if serial_rows { 1 } else { b as u32 };
             let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
             let mut sync = || {
                 if gprof2 {
@@ -1965,17 +1999,40 @@ impl DeltaNetLayer {
                 std::time::Instant::now()
             };
             let t0 = sync();
-            batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
-                &ctx.dev,
-                &ctx.layer_state,
-                &ctx.temp,
-                &ctx.params,
-                &qkv_t,
-                &z_t,
-                &beta_t,
-                &alpha_t,
-                slots,
-            )?);
+            if serial_rows {
+                let mut rows = Vec::with_capacity(b);
+                for i in 0..b {
+                    // CUDA dispatch учитывает start_offset narrow-view'ов; .copy()
+                    // нужен только выходу (zero-copy view общего scratch).
+                    rows.push(
+                        delta_rule_batched_cuda::dispatch_delta_rule_batched(
+                            &ctx.dev,
+                            &ctx.layer_state,
+                            &ctx.temp,
+                            &ctx.params,
+                            &qkv_t.narrow(0, i, 1)?,
+                            &z_t.narrow(0, i, 1)?,
+                            &beta_t.narrow(0, i, 1)?,
+                            &alpha_t.narrow(0, i, 1)?,
+                            &slots[i..i + 1],
+                        )?
+                        .copy()?,
+                    );
+                }
+                batched_out_cuda = Some(Tensor::cat(&rows, 0)?);
+            } else {
+                batched_out_cuda = Some(delta_rule_batched_cuda::dispatch_delta_rule_batched(
+                    &ctx.dev,
+                    &ctx.layer_state,
+                    &ctx.temp,
+                    &ctx.params,
+                    &qkv_t,
+                    &z_t,
+                    &beta_t,
+                    &alpha_t,
+                    slots,
+                )?);
+            }
             let dr_ms = sync().duration_since(t0).as_secs_f64() * 1000.0;
             if gprof2 {
                 eprintln!("[dstep] delta_rule={dr_ms:.2}ms");
@@ -2001,6 +2058,9 @@ impl DeltaNetLayer {
         // Persistent state (conv_buf, ssm_state) индексируется по `slots[bidx]` —
         // корректно после сжатия батча (ранний EOS), как в GPU batched path.
         {
+            // CPU-цикл идёт по строкам последовательно — повторяющиеся слоты
+            // (serial_rows) корректны без специальной ветки.
+            let _ = serial_rows;
             let key_dim = self.key_dim;
             let value_dim = self.value_dim;
             let n_v_heads = self.n_v_heads;

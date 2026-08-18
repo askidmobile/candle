@@ -83,6 +83,23 @@ pub fn prefill_chunk_size() -> usize {
     })
 }
 
+/// Ширина спекулятивного драфта K (env QWEN36_MTP_WIDTH, default 4).
+/// Тюнится по фактической принимаемости: verify — один multi-token forward
+/// на K позиций, но при отклонении раньше K-1 нужен второй forward (re-run
+/// принятого префикса), так что слишком большой K при низкой принимаемости
+/// тратит GPU-работу впустую.
+#[inline]
+pub fn speculative_width() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("QWEN36_MTP_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4)
+    })
+}
+
 /// Диагностический trace шагов (QWEN36_TRACE=1) — для расследования зависаний
 /// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
 fn trace_value_on(value: &str) -> bool {
@@ -312,7 +329,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             return Ok(Some(SpeculativeFallback::Begin));
         }
 
-        let width = self.slots[slot].remaining_new_tokens().min(4);
+        let width = self.slots[slot].remaining_new_tokens().min(speculative_width());
         let draft = match self.model.speculative_draft(
             slot,
             self.slots[slot].current_token(),
@@ -329,33 +346,27 @@ impl<M: BatchModel> BatchScheduler<M> {
         };
         self.speculative[slot].drafted += draft.len();
 
-        let mut input = self.slots[slot].current_token();
-        let mut pos = self.slots[slot].next_pos();
-        let mut verified = Vec::with_capacity(draft.len());
-        let mut accepted = 0usize;
-        for draft_id in draft {
-            if should_stop(slot, self.slots[slot].generated_tokens()) {
+        // Batched verify: ОДИН multi-token target-forward на все K позиций.
+        // Inputs: current_token + драфт без последнего (draft[K-1] только
+        // сравнивается, как input он не подавался и в последовательной схеме).
+        let pos = self.slots[slot].next_pos();
+        let mut inputs = Vec::with_capacity(draft.len());
+        inputs.push(self.slots[slot].current_token());
+        inputs.extend_from_slice(&draft[..draft.len() - 1]);
+        let rows = match self.model.speculative_verify(slot, &inputs, pos) {
+            Ok(rows) if rows.len() == inputs.len() => rows,
+            _ => {
                 self.model.speculative_rollback(slot)?;
                 self.sampler.restore(slot, sampler_checkpoint)?;
-                return Ok(Some(SpeculativeFallback::Cancelled));
+                return Ok(Some(SpeculativeFallback::Commit));
             }
-            let logits = match self.model.decode_batch(&DecodeBatch {
-                items: vec![DecodeItem {
-                    slot_idx: slot,
-                    token: input,
-                    pos,
-                }],
-            }) {
-                Ok(mut rows) if rows.len() == 1 => rows.pop().unwrap(),
-                _ => {
-                    self.model.speculative_rollback(slot)?;
-                    self.sampler.restore(slot, sampler_checkpoint)?;
-                    return Ok(Some(SpeculativeFallback::Commit));
-                }
-            };
+        };
+        let mut verified = Vec::with_capacity(draft.len());
+        let mut accepted = 0usize;
+        for (logits, &draft_id) in rows.iter().zip(&draft) {
             let mut history = self.slots[slot].generated_tokens().to_vec();
             history.extend_from_slice(&verified);
-            let target = self.sampler.sample_indexed(slot, &history, &logits);
+            let target = self.sampler.sample_indexed(slot, &history, logits);
             verified.push(target);
             if target != draft_id {
                 break;
@@ -364,8 +375,12 @@ impl<M: BatchModel> BatchScheduler<M> {
             if target == self.eos {
                 break;
             }
-            input = target;
-            pos += 1;
+        }
+        // Выровнять target state: verify съел все K inputs, принято verified.len().
+        if self.model.speculative_accept(slot, verified.len()).is_err() {
+            self.model.speculative_rollback(slot)?;
+            self.sampler.restore(slot, sampler_checkpoint)?;
+            return Ok(Some(SpeculativeFallback::Commit));
         }
 
         if self.model.speculative_commit(slot).is_err() {

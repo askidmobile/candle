@@ -10,6 +10,7 @@ struct ParityMockModel {
     vocab: usize,
     states: Vec<u64>,
     checkpoints: Vec<Option<u64>>,
+    verify_inputs: Vec<Option<Vec<u32>>>,
     draft_enabled: bool,
     force_reject_step: Option<usize>,
     step_count: usize,
@@ -21,6 +22,7 @@ impl ParityMockModel {
             vocab,
             states: vec![0; slots],
             checkpoints: vec![None; slots],
+            verify_inputs: vec![None; slots],
             draft_enabled,
             force_reject_step: None,
             step_count: 0,
@@ -91,6 +93,33 @@ impl BatchModel for ParityMockModel {
         Ok(draft)
     }
 
+    fn speculative_verify(&mut self, slot: usize, inputs: &[u32], _pos: usize) -> Result<Vec<Vec<f32>>> {
+        // step_count двигается как при K decode-шагах — для force_reject_step.
+        self.step_count += inputs.len();
+        let mut out = Vec::with_capacity(inputs.len());
+        for &token in inputs {
+            self.states[slot] = mix(self.states[slot], token);
+            out.push(self.logits(token, self.states[slot]));
+        }
+        self.verify_inputs[slot] = Some(inputs.to_vec());
+        Ok(out)
+    }
+
+    fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
+        let inputs = self.verify_inputs[slot]
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("accept without verify"))?;
+        if consumed < inputs.len() {
+            let base = self.checkpoints[slot]
+                .ok_or_else(|| anyhow::anyhow!("no checkpoint"))?;
+            self.states[slot] = base;
+            for &token in &inputs[..consumed] {
+                self.states[slot] = mix(self.states[slot], token);
+            }
+        }
+        Ok(())
+    }
+
     fn speculative_commit(&mut self, slot: usize) -> Result<()> {
         self.checkpoints[slot] = None;
         Ok(())
@@ -100,12 +129,14 @@ impl BatchModel for ParityMockModel {
         if let Some(state) = self.checkpoints[slot].take() {
             self.states[slot] = state;
         }
+        self.verify_inputs[slot] = None;
         Ok(())
     }
 
     fn reset_slot(&mut self, slot: usize) -> Result<()> {
         self.states[slot] = 0;
         self.checkpoints[slot] = None;
+        self.verify_inputs[slot] = None;
         Ok(())
     }
 }

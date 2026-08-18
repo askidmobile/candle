@@ -31,6 +31,15 @@ use crate::real::mtp::Qwen35Mtp;
 use crate::real::multimodal::{GridThw, PositionPlan};
 use crate::real::vision::Qwen35Vision;
 
+/// Незавершённый batched verify: K inputs съедены multi-token forward'ом,
+/// hidden-строки всех K позиций ждут `speculative_accept` (выравнивание state
+/// + отбор строк 0..consumed для MTP commit).
+struct PendingVerify {
+    inputs: Vec<u32>,
+    pos: usize,
+    hidden: Tensor,
+}
+
 /// Адаптер реальной Qwen3.5-4B над `BatchModel` (true batched decode).
 struct InstalledMultimodal {
     token_ids: Vec<u32>,
@@ -126,6 +135,7 @@ pub struct Qwen35BatchAdapter {
     mtp: Option<Qwen35Mtp>,
     target_transactions: Vec<Option<BatchedStateCheckpoint>>,
     verified_target_hidden: Vec<Vec<Tensor>>,
+    verify_pending: Vec<Option<PendingVerify>>,
     transaction_snapshot_positions: Vec<Option<usize>>,
     multimodal: Vec<Option<InstalledMultimodal>>,
     rope_deltas: Vec<i64>,
@@ -263,6 +273,7 @@ impl Qwen35BatchAdapter {
             mtp: None,
             target_transactions: (0..num_slots).map(|_| None).collect(),
             verified_target_hidden: (0..num_slots).map(|_| Vec::new()).collect(),
+            verify_pending: (0..num_slots).map(|_| None).collect(),
             transaction_snapshot_positions: vec![None; num_slots],
             multimodal: (0..num_slots).map(|_| None).collect(),
             rope_deltas: vec![0; num_slots],
@@ -379,9 +390,25 @@ impl Qwen35BatchAdapter {
         for hidden in &mut self.verified_target_hidden {
             hidden.clear();
         }
+        for pending in &mut self.verify_pending {
+            *pending = None;
+        }
         for position in &mut self.transaction_snapshot_positions {
             *position = None;
         }
+    }
+
+    /// RoPE-позиции decode/verify: cache_pos + per-slot multimodal rope delta.
+    fn rope_positions_for(&self, slot: usize, start: usize, len: usize) -> Result<Vec<usize>> {
+        (start..start + len)
+            .map(|cache_position| {
+                let rope_position = i64::try_from(cache_position)?
+                    .checked_add(self.rope_deltas[slot])
+                    .ok_or_else(|| anyhow!("decode RoPE position overflow"))?;
+                usize::try_from(rope_position)
+                    .map_err(|_| anyhow!("negative decode RoPE position"))
+            })
+            .collect()
     }
 }
 
@@ -689,12 +716,6 @@ impl BatchModel for Qwen35BatchAdapter {
         {
             match self.decode_batch_graphed(b, &tokens, &rope_positions, &slots, &positions) {
                 Ok(Some(out)) => {
-                    for (batch_index, &slot) in slot_order.iter().enumerate() {
-                        if self.target_transactions[slot].is_some() {
-                            // Graphed path пропускает MTP (graph-pool hidden перезаписывается).
-                            let _ = batch_index;
-                        }
-                    }
                     for i in 0..b {
                         let sidx = slot_order[i];
                         if let Some(snap) = self.slot_snaps[sidx].as_mut() {
@@ -711,15 +732,12 @@ impl BatchModel for Qwen35BatchAdapter {
                 }
             }
         }
-        let (logits, hidden) = self
+        // Hidden decode_batch'а больше не нужен MTP: verify идёт через
+        // speculative_verify (multi-token), hidden собирает speculative_accept.
+        let logits = self
             .model
-            .forward_decode_batch_with_hidden(&ids, &positions, &rope_positions, &slots)
+            .forward_decode_batch(&ids, &positions, &rope_positions, &slots)
             .map_err(|e| anyhow!("decode_batch forward: {e}"))?;
-        for (batch_index, &slot) in slot_order.iter().enumerate() {
-            if self.target_transactions[slot].is_some() {
-                self.verified_target_hidden[slot].push(hidden.i(batch_index)?.unsqueeze(0)?);
-            }
-        }
         // One D2H transfer for [B, vocab], then split on host. Per-row to_vec1()
         // serialized four CUDA synchronizations/copies for B=4.
         let flat = logits
@@ -807,6 +825,96 @@ impl BatchModel for Qwen35BatchAdapter {
             .map_err(|error| anyhow!("MTP draft: {error}"))
     }
 
+    /// Один multi-token target-forward на K позиций одного слота. Батчевая ось
+    /// переиспользуется как ось позиций: slots=[slot;K], positions=pos..pos+K.
+    /// Attention batched decode обрабатывает строки по порядку (append по
+    /// cache_len), DeltaNet сериализует одинаковые слоты — те же decode-ядра,
+    /// что и K одиночных шагов, бит-эксактно.
+    fn speculative_verify(
+        &mut self,
+        slot: usize,
+        inputs: &[u32],
+        pos: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if self.target_transactions[slot].is_none() {
+            return Err(anyhow!("MTP transaction is not active for slot {slot}"));
+        }
+        if inputs.is_empty() {
+            return Err(anyhow!("speculative verify requires inputs"));
+        }
+        let k = inputs.len();
+        let cache_positions: Vec<usize> = (pos..pos + k).collect();
+        let rope_positions = self.rope_positions_for(slot, pos, k)?;
+        let ids = Tensor::from_vec(inputs.to_vec(), (k, 1usize), &self.device)?;
+        let slots = vec![slot as u32; k];
+        let (logits, hidden) = self
+            .model
+            .forward_decode_batch_with_hidden(&ids, &cache_positions, &rope_positions, &slots)
+            .map_err(|error| anyhow!("speculative verify forward: {error}"))?;
+        self.verify_pending[slot] = Some(PendingVerify {
+            inputs: inputs.to_vec(),
+            pos,
+            hidden,
+        });
+        let flat = logits
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .map_err(|error| anyhow!("speculative verify logits: {error}"))?;
+        let vocab = self.vocab_size();
+        if flat.len() != k * vocab {
+            return Err(anyhow!(
+                "speculative verify logits length {} != {k} * vocab {vocab}",
+                flat.len()
+            ));
+        }
+        Ok(flat.chunks_exact(vocab).map(<[f32]>::to_vec).collect())
+    }
+
+    /// Выровнять state после verify: при consumed < K DeltaNet-state ушёл вперёд
+    /// по отвергнутым inputs → откат к checkpoint'у транзакции + re-run принятого
+    /// префикса одним чанком (логиты не читаем — без D2H). Hidden-строки
+    /// 0..consumed уходят в verified_target_hidden для MTP commit.
+    fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
+        let pending = self.verify_pending[slot]
+            .take()
+            .ok_or_else(|| anyhow!("speculative accept without verify for slot {slot}"))?;
+        let k = pending.inputs.len();
+        if consumed > k {
+            return Err(anyhow!("speculative accept {consumed} exceeds verified {k}"));
+        }
+        if consumed < k {
+            let checkpoint = self.target_transactions[slot]
+                .as_ref()
+                .ok_or_else(|| anyhow!("MTP transaction is not active for slot {slot}"))?;
+            self.model
+                .restore_slot_batched(&self.device, checkpoint)
+                .map_err(|error| anyhow!("speculative accept restore: {error}"))?;
+            if consumed > 0 {
+                let cache_positions: Vec<usize> =
+                    (pending.pos..pending.pos + consumed).collect();
+                let rope_positions = self.rope_positions_for(slot, pending.pos, consumed)?;
+                let ids = Tensor::from_vec(
+                    pending.inputs[..consumed].to_vec(),
+                    (consumed, 1usize),
+                    &self.device,
+                )?;
+                let slots = vec![slot as u32; consumed];
+                let _ = self
+                    .model
+                    .forward_decode_batch(&ids, &cache_positions, &rope_positions, &slots)
+                    .map_err(|error| anyhow!("speculative accept re-run: {error}"))?;
+            }
+        }
+        for row in 0..consumed {
+            self.verified_target_hidden[slot].push(pending.hidden.i(row)?.unsqueeze(0)?);
+        }
+        if let Some(snap) = self.slot_snaps[slot].as_mut() {
+            snap.position = pending.pos + consumed;
+        }
+        Ok(())
+    }
+
     fn speculative_commit(&mut self, slot: usize) -> Result<()> {
         if self.target_transactions[slot].is_none() {
             return Err(anyhow!("MTP transaction is not active for slot {slot}"));
@@ -841,6 +949,7 @@ impl BatchModel for Qwen35BatchAdapter {
                 .map_err(|error| anyhow!("MTP rollback: {error}"))?;
         }
         self.verified_target_hidden[slot].clear();
+        self.verify_pending[slot] = None;
         self.transaction_snapshot_positions[slot] = None;
         Ok(())
     }
@@ -855,6 +964,7 @@ impl BatchModel for Qwen35BatchAdapter {
         self.rope_deltas[idx] = 0;
         self.target_transactions[idx] = None;
         self.verified_target_hidden[idx].clear();
+        self.verify_pending[idx] = None;
         self.transaction_snapshot_positions[idx] = None;
         if let Some(mtp) = self.mtp.as_mut() {
             mtp.reset_slot(idx)

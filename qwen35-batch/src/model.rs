@@ -199,6 +199,27 @@ pub trait BatchModel {
         anyhow::bail!("model does not support speculative transactions")
     }
 
+    /// Batched verify: consume `inputs` (K токенов, первый — current_token слота,
+    /// далее принятые драфт-токены) на позициях pos..pos+K ОДНИМ multi-token
+    /// forward'ом и вернуть логиты КАЖДОЙ позиции. Target state уходит вперёд на
+    /// K позиций; caller обязан затем вызвать `speculative_accept` (или rollback).
+    fn speculative_verify(
+        &mut self,
+        _slot: usize,
+        _inputs: &[u32],
+        _pos: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        anyhow::bail!("model does not support speculative transactions")
+    }
+
+    /// Выровнять target state после verify: оставить ровно `consumed` первых
+    /// inputs (при consumed < K — откат к checkpoint'у транзакции и re-run
+    /// принятого префикса одним чанком) и удержать hidden-строки 0..consumed
+    /// для MTP commit.
+    fn speculative_accept(&mut self, _slot: usize, _consumed: usize) -> Result<()> {
+        anyhow::bail!("model does not support speculative transactions")
+    }
+
     /// Align draft state to target-verified rows and release checkpoint.
     fn speculative_commit(&mut self, _slot: usize) -> Result<()> {
         anyhow::bail!("model does not support speculative transactions")
@@ -234,6 +255,12 @@ impl<T: BatchModel + ?Sized> BatchModel for &mut T {
     }
     fn speculative_draft(&mut self, slot: usize, token: u32, cp: usize, rp: usize, max_tok: usize) -> Result<Vec<u32>> {
         (**self).speculative_draft(slot, token, cp, rp, max_tok)
+    }
+    fn speculative_verify(&mut self, slot: usize, inputs: &[u32], pos: usize) -> Result<Vec<Vec<f32>>> {
+        (**self).speculative_verify(slot, inputs, pos)
+    }
+    fn speculative_accept(&mut self, slot: usize, consumed: usize) -> Result<()> {
+        (**self).speculative_accept(slot, consumed)
     }
     fn speculative_commit(&mut self, slot: usize) -> Result<()> {
         (**self).speculative_commit(slot)
