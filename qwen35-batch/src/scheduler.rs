@@ -113,6 +113,15 @@ pub fn trace_on() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN36_TRACE").map(|v| trace_value_on(&v)).unwrap_or(false))
 }
 
+/// Фазовый тайминг MTP-раунда (env QWEN36_MTP_TIMING=1) — per-round eprintln.
+#[inline]
+fn mtp_timing_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("QWEN36_MTP_TIMING").map(|v| trace_value_on(&v)).unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod trace_tests {
     use super::trace_value_on;
@@ -322,6 +331,10 @@ impl<M: BatchModel> BatchScheduler<M> {
         slot: usize,
         should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,
     ) -> Result<Option<SpeculativeFallback>> {
+        // Фазовый тайминг раунда (env QWEN36_MTP_TIMING=1) — host-bound decode
+        // требует знать, куда уходит время, прежде чем что-то оптимизировать.
+        let timing = mtp_timing_on();
+        let t_begin = Instant::now();
         self.speculative[slot].enabled = true;
         let sampler_checkpoint = self.sampler.checkpoint(slot);
         if self.model.speculative_begin(slot).is_err() {
@@ -329,6 +342,7 @@ impl<M: BatchModel> BatchScheduler<M> {
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(Some(SpeculativeFallback::Begin));
         }
+        let t_draft = Instant::now();
 
         let width = self.slots[slot].remaining_new_tokens().min(speculative_width());
         let draft = match self.model.speculative_draft(
@@ -354,6 +368,7 @@ impl<M: BatchModel> BatchScheduler<M> {
         let mut inputs = Vec::with_capacity(draft.len());
         inputs.push(self.slots[slot].current_token());
         inputs.extend_from_slice(&draft[..draft.len() - 1]);
+        let t_verify = Instant::now();
         let rows = match self.model.speculative_verify(slot, &inputs, pos) {
             Ok(rows) if rows.len() == inputs.len() => rows,
             _ => {
@@ -362,6 +377,7 @@ impl<M: BatchModel> BatchScheduler<M> {
                 return Ok(Some(SpeculativeFallback::Commit));
             }
         };
+        let t_sample = Instant::now();
         let mut verified = Vec::with_capacity(draft.len());
         let mut accepted = 0usize;
         for (logits, &draft_id) in rows.iter().zip(&draft) {
@@ -377,17 +393,32 @@ impl<M: BatchModel> BatchScheduler<M> {
                 break;
             }
         }
+        let t_accept = Instant::now();
         // Выровнять target state: verify съел все K inputs, принято verified.len().
         if self.model.speculative_accept(slot, verified.len()).is_err() {
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(Some(SpeculativeFallback::Commit));
         }
+        let t_commit = Instant::now();
 
         if self.model.speculative_commit(slot).is_err() {
             self.model.speculative_rollback(slot)?;
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(Some(SpeculativeFallback::Commit));
+        }
+        if timing {
+            eprintln!(
+                "[mtp] slot={slot} K={} m={} begin={:.1}ms draft={:.1}ms verify={:.1}ms sample={:.1}ms accept={:.1}ms commit={:.1}ms",
+                draft.len(),
+                verified.len(),
+                (t_draft - t_begin).as_secs_f64() * 1e3,
+                (t_verify - t_draft).as_secs_f64() * 1e3,
+                (t_sample - t_verify).as_secs_f64() * 1e3,
+                (t_accept - t_sample).as_secs_f64() * 1e3,
+                (t_commit - t_accept).as_secs_f64() * 1e3,
+                t_commit.elapsed().as_secs_f64() * 1e3,
+            );
         }
         self.speculative[slot].used = true;
         self.speculative[slot].accepted += accepted;
