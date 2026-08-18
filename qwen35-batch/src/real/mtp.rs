@@ -13,9 +13,9 @@ use super::{
     multimodal::MROPE_DIMENSION_SOURCES,
 };
 
-const HIDDEN: usize = 2560;
-const HEADS: usize = 16;
-const KV_HEADS: usize = 4;
+// hidden/heads/kv_heads — из MtpProfile (4B: 2560/16/4, Qwen3.8-27B: 5120/24/4).
+// HEAD_DIM/ROPE_DIM/ROPE_BASE — инварианты семейства qwen35, валидируются
+// в MtpProfile::read_and_validate.
 const HEAD_DIM: usize = 256;
 const ROPE_DIM: usize = 64;
 const ROPE_BASE: f64 = 10_000_000.0;
@@ -93,7 +93,7 @@ impl Qwen35Mtp {
                 .to_device(&device)?;
             Ok(RmsNorm::new(weight, rms_norm_eps))
         };
-        let prefix = "blk.32";
+        let prefix = format!("blk.{}", profile.mtp_block);
         let mut mtp = Self {
             profile,
             device: device.clone(),
@@ -208,13 +208,13 @@ impl Qwen35Mtp {
     ) -> Result<()> {
         self.check_slot(slot)?;
         let (_, seq, hidden) = embeddings.dims3()?;
-        if target_hidden.dims() != [1, seq, HIDDEN] || hidden != HIDDEN {
+        if target_hidden.dims() != [1, seq, self.profile.hidden_size] || hidden != self.profile.hidden_size {
             candle_core::bail!("MTP catch-up shape mismatch");
         }
         let previous = self.slots[slot]
             .pending_target_hidden
             .clone()
-            .unwrap_or(Tensor::zeros((1, HIDDEN), DType::F32, &self.device)?);
+            .unwrap_or(Tensor::zeros((1, self.profile.hidden_size), DType::F32, &self.device)?);
         let shifted = if seq == 1 {
             previous.unsqueeze(1)?
         } else {
@@ -279,7 +279,7 @@ impl Qwen35Mtp {
         rope_positions: Option<&[Vec<u32>; 3]>,
     ) -> Result<Tensor> {
         let (_, seq, hidden) = embeddings.dims3()?;
-        if target_hidden.dims() != [1, seq, hidden] || hidden != HIDDEN {
+        if target_hidden.dims() != [1, seq, hidden] || hidden != self.profile.hidden_size {
             candle_core::bail!("MTP input shape mismatch");
         }
         let e = self.enorm.forward(embeddings)?;
@@ -306,7 +306,7 @@ impl Qwen35Mtp {
         rope_positions: Option<&[Vec<u32>; 3]>,
     ) -> Result<Tensor> {
         let (_, seq, _) = xs.dims3()?;
-        let qg = self.q.forward(xs)?.reshape((1, seq, HEADS, HEAD_DIM * 2))?;
+        let qg = self.q.forward(xs)?.reshape((1, seq, self.profile.head_count, HEAD_DIM * 2))?;
         let q = qg
             .narrow(3, 0, HEAD_DIM)?
             .transpose(1, 2)?
@@ -318,21 +318,21 @@ impl Qwen35Mtp {
         let k = self
             .k
             .forward(xs)?
-            .reshape((1, seq, KV_HEADS, HEAD_DIM))?
+            .reshape((1, seq, self.profile.kv_head_count, HEAD_DIM))?
             .transpose(1, 2)?;
         let v = self
             .v
             .forward(xs)?
-            .reshape((1, seq, KV_HEADS, HEAD_DIM))?
+            .reshape((1, seq, self.profile.kv_head_count, HEAD_DIM))?
             .transpose(1, 2)?;
         let q = self
             .q_norm
             .forward(&q.flatten(0, 2)?)?
-            .reshape((1, HEADS, seq, HEAD_DIM))?;
+            .reshape((1, self.profile.head_count, seq, HEAD_DIM))?;
         let k = self
             .k_norm
             .forward(&k.flatten(0, 2)?)?
-            .reshape((1, KV_HEADS, seq, HEAD_DIM))?;
+            .reshape((1, self.profile.kv_head_count, seq, HEAD_DIM))?;
         let (cos, sin) = match rope_positions {
             Some(positions) => mrope_tables(positions, &self.device)?,
             None => rope_tables(start_pos, seq, &self.device)?,
@@ -359,17 +359,17 @@ impl Qwen35Mtp {
 
         let k = k_all.to_dtype(DType::F32)?.transpose(1, 2)?;
         let v = v_all.to_dtype(DType::F32)?.transpose(1, 2)?;
-        let repeats = HEADS / KV_HEADS;
+        let repeats = self.profile.head_count / self.profile.kv_head_count;
         let k = k
             .unsqueeze(2)?
-            .broadcast_as((1, KV_HEADS, repeats, total, HEAD_DIM))?
+            .broadcast_as((1, self.profile.kv_head_count, repeats, total, HEAD_DIM))?
             .contiguous()?
-            .reshape((1, HEADS, total, HEAD_DIM))?;
+            .reshape((1, self.profile.head_count, total, HEAD_DIM))?;
         let v = v
             .unsqueeze(2)?
-            .broadcast_as((1, KV_HEADS, repeats, total, HEAD_DIM))?
+            .broadcast_as((1, self.profile.kv_head_count, repeats, total, HEAD_DIM))?
             .contiguous()?
-            .reshape((1, HEADS, total, HEAD_DIM))?;
+            .reshape((1, self.profile.head_count, total, HEAD_DIM))?;
         let q_f32 = q.to_dtype(DType::F32)?.contiguous()?;
         let scores = (q_f32
             .matmul(&k.transpose(2, 3)?.contiguous()?)?
@@ -390,7 +390,7 @@ impl Qwen35Mtp {
         let mixed = probs.contiguous()?.matmul(&v.contiguous()?)?;
         let mixed = (mixed * candle_nn::ops::sigmoid(&gate)?)?
             .transpose(1, 2)?
-            .reshape((1, seq, HEADS * HEAD_DIM))?;
+            .reshape((1, seq, self.profile.head_count * HEAD_DIM))?;
         self.o.forward(&mixed)
     }
 

@@ -463,6 +463,9 @@ impl VisionProfile {
 /// Thin Qwen3.5 MTP component contract. Shared embedding/output remain in Text.
 #[derive(Debug, Clone)]
 pub struct MtpProfile {
+    /// Индекс MTP-блока (blk.{mtp_block}): у тонкого 4B-файла 32, у Qwen3.8
+    /// (MTP встроен в основной GGUF) — block_count-1 = 64.
+    pub mtp_block: usize,
     pub hidden_size: usize,
     pub context_length: usize,
     pub intermediate_size: usize,
@@ -506,23 +509,19 @@ impl MtpProfile {
             &mut errs,
         )
         .unwrap_or(0.0) as f64;
-        for (name, actual, expected) in [
-            ("block_count", blocks, 33),
-            ("nextn_predict_layers", nextn, 1),
-            ("hidden_size", hidden, 2560),
-            ("context_length", context, 262144),
-            ("intermediate_size", intermediate, 9216),
-            ("head_count", heads, 16),
-            ("kv_head_count", kv_heads, 4),
-            ("key_length", key_length, 256),
-            ("value_length", value_length, 256),
-        ] {
-            if actual != expected {
-                errs.push(format!("MTP {name}={actual}, expected {expected}"));
-            }
+        // Контракт параметрический: 4B-MTP - тонкий отдельный GGUF (33 блока,
+        // hidden 2560), Qwen3.8+ - MTP встроен в основной файл (blk.<last>).
+        // Всё выводится из метаданных + text-профиля, кроме инвариантов
+        // mtp.rs: head_dim=256, rope_dim=64, rope_base=1e7 (константы форварда).
+        if nextn != 1 {
+            errs.push(format!("MTP nextn_predict_layers={nextn}, expected 1"));
+        }
+        if key_length != 256 || value_length != 256 {
+            errs.push(format!(
+                "MTP head_dim {key_length}/{value_length}, mtp.rs supports only 256"
+            ));
         }
         if text.architecture != Architecture::DenseQwen35
-            || text.block_count != 32
             || text.hidden_size != hidden
             || text.context_length != context
             || text.feed_forward_length != intermediate
@@ -533,61 +532,80 @@ impl MtpProfile {
         {
             errs.push("MTP component is incompatible with shared Text profile".into());
         }
-        if tensors.len() != 15 {
-            errs.push(format!("MTP tensor count={}, expected 15", tensors.len()));
+        // Тонкий файл: text-транк block_count = blocks - nextn (33-1=32).
+        // Встроенный: text-профиль уже вычел nextn (см. model_profile block_count).
+        if text.block_count + nextn != blocks && text.block_count != blocks {
+            errs.push(format!(
+                "MTP block_count={blocks} inconsistent with text trunk {}",
+                text.block_count
+            ));
         }
-        let matrix = [GgmlDType::Q8_0];
+        let mtp_block = blocks - nextn;
+        let prefix = format!("blk.{mtp_block}");
+        let head_dim = key_length;
+        // Кванты матриц: 4B-MTP был Q8_0; у Qwen3.8 IQ4_XS/Q3_K. Разрешаем
+        // любой поддерживаемый CUDA-путём квант (гейт численности - teacher-forced).
+        let matrix = [
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q4_0,
+            GgmlDType::IQ2XXS,
+            GgmlDType::IQ2XS,
+            GgmlDType::IQ2S,
+            GgmlDType::IQ3XXS,
+            GgmlDType::IQ3S,
+            GgmlDType::IQ4XS,
+            GgmlDType::IQ1M,
+            GgmlDType::F16,
+        ];
         let norm = [GgmlDType::F32];
         for (name, shape) in [
-            ("blk.32.attn_k.weight", vec![1024, 2560]),
-            ("blk.32.attn_output.weight", vec![2560, 4096]),
-            ("blk.32.attn_q.weight", vec![8192, 2560]),
-            ("blk.32.attn_v.weight", vec![1024, 2560]),
-            ("blk.32.ffn_down.weight", vec![2560, 9216]),
-            ("blk.32.ffn_gate.weight", vec![9216, 2560]),
-            ("blk.32.ffn_up.weight", vec![9216, 2560]),
-            ("blk.32.nextn.eh_proj.weight", vec![2560, 5120]),
+            (format!("{prefix}.attn_q.weight"), vec![heads * head_dim * 2, hidden]),
+            (format!("{prefix}.attn_k.weight"), vec![kv_heads * head_dim, hidden]),
+            (format!("{prefix}.attn_v.weight"), vec![kv_heads * head_dim, hidden]),
+            (format!("{prefix}.attn_output.weight"), vec![hidden, heads * head_dim]),
+            (format!("{prefix}.ffn_gate.weight"), vec![intermediate, hidden]),
+            (format!("{prefix}.ffn_up.weight"), vec![intermediate, hidden]),
+            (format!("{prefix}.ffn_down.weight"), vec![hidden, intermediate]),
+            (format!("{prefix}.nextn.eh_proj.weight"), vec![hidden, 2 * hidden]),
         ] {
-            require_tensor_contract(&tensors, name, &shape, &matrix, &mut errs);
+            require_tensor_contract(&tensors, &name, &shape, &matrix, &mut errs);
         }
         for (name, shape) in [
-            ("blk.32.attn_k_norm.weight", vec![256]),
-            ("blk.32.attn_norm.weight", vec![2560]),
-            ("blk.32.attn_q_norm.weight", vec![256]),
-            ("blk.32.nextn.enorm.weight", vec![2560]),
-            ("blk.32.nextn.hnorm.weight", vec![2560]),
-            ("blk.32.nextn.shared_head_norm.weight", vec![2560]),
-            ("blk.32.post_attention_norm.weight", vec![2560]),
+            (format!("{prefix}.attn_norm.weight"), vec![hidden]),
+            (format!("{prefix}.post_attention_norm.weight"), vec![hidden]),
+            (format!("{prefix}.attn_q_norm.weight"), vec![head_dim]),
+            (format!("{prefix}.attn_k_norm.weight"), vec![head_dim]),
+            (format!("{prefix}.nextn.enorm.weight"), vec![hidden]),
+            (format!("{prefix}.nextn.hnorm.weight"), vec![hidden]),
+            (format!("{prefix}.nextn.shared_head_norm.weight"), vec![hidden]),
         ] {
-            require_tensor_contract(&tensors, name, &shape, &norm, &mut errs);
+            require_tensor_contract(&tensors, &name, &shape, &norm, &mut errs);
         }
-        let allowed: HashSet<&str> = [
-            "blk.32.attn_k.weight",
-            "blk.32.attn_output.weight",
-            "blk.32.attn_q.weight",
-            "blk.32.attn_v.weight",
-            "blk.32.ffn_down.weight",
-            "blk.32.ffn_gate.weight",
-            "blk.32.ffn_up.weight",
-            "blk.32.nextn.eh_proj.weight",
-            "blk.32.attn_k_norm.weight",
-            "blk.32.attn_norm.weight",
-            "blk.32.attn_q_norm.weight",
-            "blk.32.nextn.enorm.weight",
-            "blk.32.nextn.hnorm.weight",
-            "blk.32.nextn.shared_head_norm.weight",
-            "blk.32.post_attention_norm.weight",
-        ]
-        .into_iter()
-        .collect();
-        for name in tensors.keys() {
-            if !allowed.contains(name.as_str()) {
-                errs.push(format!("unexpected MTP tensor: {name}"));
-            }
+        // Для тонкого файла (только MTP-тензоры) запрещаем лишнее; встроенный
+        // основной GGUF содержит транк - проверка не применима.
+        let mtp_only: Vec<_> = tensors
+            .keys()
+            .filter(|name| name.starts_with(&format!("{prefix}.")))
+            .collect();
+        if tensors.len() == mtp_only.len() && tensors.len() != 15 {
+            errs.push(format!(
+                "thin MTP tensor count={}, expected 15",
+                tensors.len()
+            ));
         }
-        let quant_set = tensors.values().map(|info| info.ggml_dtype).collect();
+        let quant_set = tensors
+            .iter()
+            .filter(|(name, _)| name.starts_with(&format!("{prefix}.")))
+            .map(|(_, info)| info.ggml_dtype)
+            .collect();
         errs.into_result()?;
         Ok(Self {
+            mtp_block,
             hidden_size: hidden,
             context_length: context,
             intermediate_size: intermediate,

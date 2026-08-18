@@ -45,13 +45,22 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let text = args.next().context("missing TEXT.gguf")?;
     let mtp = args.next().context("missing MTP.gguf")?;
+    // Опциональный список слотов: на 27B/12GB четыре слота не помещаются.
+    let slots_list: Vec<usize> = args
+        .next()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![1, 4]);
     let prompts: Vec<(&str, Vec<u32>)> = vec![
         ("en", vec![9707, 11, 18727, 70345]),
         ("ru", vec![18727, 70345, 169753, 32868]),
     ];
     let mut results = Vec::new();
     for (label, prompt) in prompts {
-        for slots in [1usize, 4usize] {
+        for &slots in &slots_list {
             let baseline = run_probe(&text, None, prompt.clone(), 16, slots)?;
             let mtp_out = run_probe(&text, Some(&mtp), prompt.clone(), 16, slots)?;
             let bit_exact = baseline == mtp_out;
