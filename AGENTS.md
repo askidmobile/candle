@@ -72,6 +72,10 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 
 ### CUDA kernel gotchas (2026-08-11)
 
+- **__constant__ + дата-зависимые индексы = до 32x сериализации на варп (2026-08-18).** IQ grid-таблицы в quantized.cu были `__constant__`; constant-кэш вещает один адрес/такт. На реальных весах IQ mmvq падал в 4-19x (iq2_xxs 48 GB/s, iq2_s 13), фикс `5eb10d0d`: `static const __device__`. Итог: 27B IQ2_XXS decode 7.7→21.7 tok/s (0.95x llama), 35B MoE 10.7→67.9 (0.78x), prefill 35B 1.00x llama. LUT с рантайм-индексами — только global/shared, никогда `__constant__`.
+- **Перф-бенчи квантованных ядер — только с реалистичной заливкой весов.** Константный филл (0x5A) даёт всем лейнам один индекс таблицы → broadcast → бенч завышает IQ в 4-19x и цифры «hot=cold» врут. `QWEN36_PERF_RANDOM=1` в mmvq_perf_dense (`20d45b52`) воспроизводит модельные тайминги с точностью до процентов.
+- **Толеранс дот-продукта с q8_1-активациями — от Σ|w·x|, не от |результата|** (`87cf36da`): при сокращении в доте относительная к результату ошибка взрывается (наблюдали 5% на |res|=10.8 при штатном q8-округлении). Гейт iq_quant_cuda_tests запускать ТОЛЬКО через run_iq_tests_serial.bat (--test-threads=1): 5 cuda_graph_* тестов падают предсуществующе (см. отдельную задачу), MoE/mmvq — зелёные.
+
 - **Split-K flash-decode stays diagnostic-only.** First version had a cross-warp `m/l` race and corrupted generation at KV≥2048. Per-warp registers removed the race, but a 2025-state FA2 A/B still first diverges exactly at KV=2048 (nRMSE 0.01248, max abs 0.173) with no speed gain. FA2 is default; `QWEN36_ENABLE_SPLITK_DECODE=1` is explicit diagnostic opt-in.
 - **Проверка деградации текстом**: uniq-3gram НЕ ловит цифро-мусор («2222», «( ( (»). Всегда читать хвост генерации глазами на 3K+ токенов.
 - **Build trap**: новый `.cu` в candle-kernels без `rerun-if-changed` → ptx.rs не перегенерируется, kernel не найден. build.rs теперь следит за всеми `src/*.cu`.
