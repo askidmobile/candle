@@ -249,7 +249,13 @@ fn main() -> Result<()> {
             .unwrap_or(prediction);
         predicted.push(prediction);
         fed.push(token);
-        if token == adapter.eos() || step + 1 == steps {
+        // QWEN36_LOGITS_IGNORE_EOS=1 (только с forced.jsonl): не останавливаться
+        // на EOS. Greedy-цепочка референса упирается в EOS за несколько сотен
+        // шагов, а длинный teacher-forced гейт (8K) должен прогнать KV/state
+        // пути на всю глубину - референс тоже форсит сквозь EOS.
+        let ignore_eos = forced_tokens.is_some()
+            && std::env::var("QWEN36_LOGITS_IGNORE_EOS").as_deref() == Ok("1");
+        if (token == adapter.eos() && !ignore_eos) || step + 1 == steps {
             break;
         }
         let decode_started = Instant::now();
