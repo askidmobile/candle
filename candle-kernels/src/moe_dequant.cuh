@@ -20,7 +20,7 @@
 
 // ─── Block struct declarations (defined in quantized.cu, shared here) ─────────
 // These are duplicated from quantized.cu. If quantized.cu and moe_quantized.cu are
-// in the same PTX module, they share __constant__ tables. If separate modules,
+// in the same PTX module, they share __device__ tables. If separate modules,
 // moe_quantized.cu must define its own copies (see below).
 
 typedef struct {
@@ -54,9 +54,9 @@ typedef struct {
 
 // ─── Lookup tables (must match quantized.cu exactly) ──────────────────────────
 
-static __constant__ uint8_t moe_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+static const __device__ uint8_t moe_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
-static __constant__ uint8_t moe_ksigns_iq2xs[128] = {
+static const __device__ uint8_t moe_ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
@@ -67,7 +67,7 @@ static __constant__ uint8_t moe_ksigns_iq2xs[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-static __constant__ float moe_kvalues_iq4nl_f[16] = {
+static const __device__ float moe_kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
     1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
 };

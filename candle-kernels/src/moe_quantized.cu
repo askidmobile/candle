@@ -29,7 +29,7 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
 
 // ─── Grid lookup tables (must match quantized.cu exactly) ────────────────────
 
-static __constant__ uint64_t moe_iq2xxs_grid[256] = {
+static const __device__ uint64_t moe_iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
     0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
@@ -99,7 +99,7 @@ static __constant__ uint64_t moe_iq2xxs_grid[256] = {
 // IQ2_S grid and IQ3_XXS grid are large; for module isolation we define them here.
 // These must match quantized.cu exactly. See quantized.cu:569-861 for the full tables.
 // For brevity in this initial version, we reference them via extern — the host-side
-// code can pass device pointers to the same __constant__ arrays from the Quantized module.
+// code can pass device pointers to the same __device__ tables from the Quantized module.
 // This avoids duplicating ~8KB of constant data across PTX modules.
 
 // ─── SiLU helper ──────────────────────────────────────────────────────────────
