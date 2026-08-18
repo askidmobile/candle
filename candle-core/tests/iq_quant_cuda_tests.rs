@@ -1208,6 +1208,72 @@ fn mmq_mma_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// MMQ при m > mmq_x (несколько тайлов по X): юнит-тесты выше гоняли m=64
+/// (один тайл) и пропустили бы поломку tile-раскладки stream-k. A/B на модели
+/// (512-префилл 27B) дал nRMSE 0.53 против dequant-референса — этот тест
+/// бисектит: K-quant и IQ отдельно, m=512 (4 тайла x128) и m=200 (не кратно).
+#[test]
+fn mmq_mma_wide_batch_matches_reference() -> Result<()> {
+    use candle_core::quantized::{QMatMul, QTensor};
+    let device = Device::new_cuda(0)?;
+    let (n, k) = (512usize, 768usize);
+
+    for &m in &[512usize, 200] {
+        // K-quant: квантуем из float.
+        let w: Vec<f32> = (0..n * k).map(|i| ((i as f32) * 0.037).sin()).collect();
+        let w_t = Tensor::from_vec(w, (n, k), &device)?;
+        let qt = std::sync::Arc::new(QTensor::quantize(&w_t, GgmlDType::Q4K)?);
+        let qmm = QMatMul::from_arc(qt.clone())?;
+        let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+        let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
+        let got = qmm.forward(&x_t)?;
+        let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+        let want = x_t
+            .reshape((m, k))?
+            .matmul(&w_deq.t()?.contiguous()?)?
+            .reshape((1, m, n))?;
+        let max = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+        println!("MMQ-WIDE Q4K m={m}: max_abs_diff={max:.6} scale={scale:.4}");
+        assert!(
+            max < 0.015 * scale,
+            "MMQ-WIDE Q4K m={m}: max_abs_diff={max} vs scale={scale}"
+        );
+
+        // IQ: raw-случайные веса, d=1.0.
+        let dtype = GgmlDType::IQ2XXS;
+        let block_bytes = dtype.type_size();
+        let row_blocks = k / dtype.block_size();
+        let total = n * row_blocks * block_bytes;
+        let mut raw: Vec<u8> = (0..total)
+            .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        for b in 0..(n * row_blocks) {
+            raw[b * block_bytes] = 0x00;
+            raw[b * block_bytes + 1] = 0x3C;
+        }
+        let storage = QStorage::from_data(std::borrow::Cow::Borrowed(&raw), &device, dtype)?;
+        let qt = std::sync::Arc::new(QTensor::new(storage, (n, k))?);
+        let qmm = QMatMul::from_arc(qt.clone())?;
+        let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.011).sin()).collect();
+        let x_t = Tensor::from_vec(x, (1, m, k), &device)?;
+        let got = qmm.forward(&x_t)?;
+        let w_deq = qt.dequantize(&device)?.to_dtype(DType::F32)?;
+        let want = x_t
+            .reshape((m, k))?
+            .matmul(&w_deq.t()?.contiguous()?)?
+            .reshape((1, m, n))?;
+        let max = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+        println!("MMQ-WIDE IQ2XXS m={m}: max_abs_diff={max:.6} scale={scale:.4}");
+        assert!(
+            max < 0.015 * scale,
+            "MMQ-WIDE IQ2XXS m={m}: max_abs_diff={max} vs scale={scale}"
+        );
+    }
+    Ok(())
+}
+
 /// MMQ Tensor-Core для IQ-квантов против dequant-эталона.
 /// Веса — случайные raw-байты (реалистичные grid-индексы; см. урок
 /// constant-memory-divergent-lookup: константная заливка маскирует
