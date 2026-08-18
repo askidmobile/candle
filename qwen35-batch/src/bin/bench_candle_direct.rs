@@ -25,6 +25,12 @@ fn main() -> Result<()> {
     let num_slots = if is_large_model { 1 } else { 4 };
     let mut adapter = Qwen35BatchAdapter::load(Path::new(text), device.clone(), num_slots)?;
 
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(c) = &device {
+        let (used, reserved) = candle_core::cuda_backend::mem_pool::default_mempool_usage(c).unwrap_or((0, 0));
+        eprintln!("[mem] after load: pool used={}MiB reserved={}MiB", used/1024/1024, reserved/1024/1024);
+    }
+
     // Warmup
     {
         let eos = adapter.eos();
@@ -62,6 +68,11 @@ fn main() -> Result<()> {
         let el = t0.elapsed().as_secs_f64();
         let tps = p_len as f64 / el;
         println!("CANDLE pp{} B=1: {:.2} tok/s ({:.3}s)", p_len, tps, el);
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(c) = &device {
+            let (used, reserved) = candle_core::cuda_backend::mem_pool::default_mempool_usage(c).unwrap_or((0, 0));
+            eprintln!("[mem] after prefill: pool used={}MiB reserved={}MiB", used/1024/1024, reserved/1024/1024);
+        }
         adapter.reset_slot(0)?;
         #[cfg(feature = "cuda")]
         if let Device::Cuda(c) = &device {
