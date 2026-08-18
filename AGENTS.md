@@ -79,6 +79,9 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 
 - **Split-K flash-decode stays diagnostic-only.** First version had a cross-warp `m/l` race and corrupted generation at KV≥2048. Per-warp registers removed the race, but a 2025-state FA2 A/B still first diverges exactly at KV=2048 (nRMSE 0.01248, max abs 0.173) with no speed gain. FA2 is default; `QWEN36_ENABLE_SPLITK_DECODE=1` is explicit diagnostic opt-in.
 - **Проверка деградации текстом**: uniq-3gram НЕ ловит цифро-мусор («2222», «( ( (»). Всегда читать хвост генерации глазами на 3K+ токенов.
+- **Новый quant-dtype в CUDA = ТРИ whitelist'а**: `mod.rs::QStorage::from_data` (маршрут загрузки), `cuda.rs` (dequant f32/f16/rowslice + mmvq обычный и prequant — это РАЗНЫЕ match'и), `ggml_file.rs::qtensor_from_ggml` (сырые GGUF-байты). Пропустишь один — «not supported yet» с тремя разными формулировками (IQ1M ловил все три по очереди, 2026-08-19).
+- **Qwen3.8-27B (UD-IQ2_XXS)**: arch qwen35, 65 блоков = 64 trunk + `nextn_predict_layers=1` (blk.64 — полная MTP-голова: attn+ffn+nextn.*). Транк-вычитание в build_model_common и model_profile. UD-рецепт 3.8 жмёт ssm_beta/ssm_alpha в IQ1_M (96 тензоров [48x5120]) — поддержка добавлена (mmvq+dequant, MMQ не нужен: n%128!=0).
+- **cudaforge не видит изменений в .cuh-инклюдах** — кэш по самому .cu; меняешь заголовок, бампни .cu (см. комментарий в candle_mmq_dense.cu).
 - **Build trap**: новый `.cu` в candle-kernels без `rerun-if-changed` → ptx.rs не перегенерируется, kernel не найден. build.rs теперь следит за всеми `src/*.cu`.
 
 ### Tokenizer GGUF gotchas (2026-08-09)
