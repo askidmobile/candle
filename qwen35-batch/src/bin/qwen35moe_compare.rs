@@ -4,9 +4,37 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
-const GATE_STEPS: usize = 128;
-const GATE_FULL_STEPS: [usize; 5] = [16, 45, 50, 92, 111];
-const GATE_MAX_ARGMAX_DIVERGENCES: usize = 5;
+// Дефолты исторического 128-шагового гейта. Для длинных прогонов (8K)
+// переопределяются через QWEN36_GATE_STEPS / QWEN36_GATE_FULL_STEPS /
+// QWEN36_GATE_MAX_ARGMAX_DIVERGENCES — числовые пороги (cosine/nRMSE/max_abs/
+// margin) при этом НЕ трогаются: они per-step и от длины не зависят.
+const GATE_STEPS_DEFAULT: usize = 128;
+const GATE_FULL_STEPS_DEFAULT: [usize; 5] = [16, 45, 50, 92, 111];
+const GATE_MAX_ARGMAX_DIVERGENCES_DEFAULT: usize = 5;
+
+fn gate_steps() -> usize {
+    std::env::var("QWEN36_GATE_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GATE_STEPS_DEFAULT)
+}
+
+fn gate_full_steps() -> Vec<usize> {
+    match std::env::var("QWEN36_GATE_FULL_STEPS") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect(),
+        Err(_) => GATE_FULL_STEPS_DEFAULT.to_vec(),
+    }
+}
+
+fn gate_max_argmax_divergences() -> usize {
+    std::env::var("QWEN36_GATE_MAX_ARGMAX_DIVERGENCES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GATE_MAX_ARGMAX_DIVERGENCES_DEFAULT)
+}
 const GATE_MIN_COSINE: f64 = 0.997;
 const GATE_MAX_NRMSE: f64 = 0.07;
 const GATE_MAX_ABS: f64 = 1.3;
@@ -150,15 +178,16 @@ fn main() -> Result<()> {
             candidate.keys().collect::<Vec<_>>()
         )
     }
+    let gate_steps = gate_steps();
     if gate {
-        if reference.len() != GATE_STEPS || candidate.len() != GATE_STEPS {
+        if reference.len() != gate_steps || candidate.len() != gate_steps {
             bail!(
-                "gate needs exactly {GATE_STEPS} logits records, got reference={} candidate={}",
+                "gate needs exactly {gate_steps} logits records, got reference={} candidate={}",
                 reference.len(),
                 candidate.len()
             )
         }
-        for step in 0..GATE_STEPS {
+        for step in 0..gate_steps {
             if !reference.contains_key(&step) || !candidate.contains_key(&step) {
                 bail!("gate missing logits step {step}")
             }
@@ -169,9 +198,9 @@ fn main() -> Result<()> {
         let candidate_fed = candidate_tokens["fed_ids"]
             .as_array()
             .context("candidate tokens record missing fed_ids")?;
-        if reference_fed.len() != GATE_STEPS || candidate_fed.len() != GATE_STEPS {
+        if reference_fed.len() != gate_steps || candidate_fed.len() != gate_steps {
             bail!(
-                "gate needs exactly {GATE_STEPS} fed token ids, got reference={} candidate={}",
+                "gate needs exactly {gate_steps} fed token ids, got reference={} candidate={}",
                 reference_fed.len(),
                 candidate_fed.len()
             )
@@ -277,13 +306,15 @@ fn main() -> Result<()> {
             })
         );
     }
-    if gate && first_gate_failure.is_none() && argmax_divergences > GATE_MAX_ARGMAX_DIVERGENCES {
+    let max_argmax_divergences = gate_max_argmax_divergences();
+    if gate && first_gate_failure.is_none() && argmax_divergences > max_argmax_divergences {
         first_gate_failure = Some(format!(
-            "gate allows at most {GATE_MAX_ARGMAX_DIVERGENCES} low-margin argmax divergences, got {argmax_divergences}"
+            "gate allows at most {max_argmax_divergences} low-margin argmax divergences, got {argmax_divergences}"
         ));
     }
     if gate && first_gate_failure.is_none() {
-        let missing: Vec<_> = GATE_FULL_STEPS
+        let required_full_steps = gate_full_steps();
+        let missing: Vec<_> = required_full_steps
             .iter()
             .filter(|step| !full_vectors_compared.contains(step))
             .collect();
