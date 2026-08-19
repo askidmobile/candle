@@ -137,6 +137,13 @@ fn build_from_ggml_keys(metadata: &HashMap<String, gguf_file::Value>) -> Result<
         }
     }
     added_tokens_json.push(']');
+    if std::env::var_os("TOK_DEBUG").is_some() {
+        eprintln!("added_tokens count={}", added_count);
+        eprintln!("think present: {}", added_tokens_json.contains("<think>"));
+        if let Some(p) = added_tokens_json.find("248068") {
+            eprintln!("frag: {}", &added_tokens_json[p.saturating_sub(30)..(p+150).min(added_tokens_json.len())]);
+        }
+    }
 
     let tokenizer_json = format!(
         r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":{},"normalizer":null,"pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},"post_processor":null,"decoder":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},"model":{{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":true,"ignore_merges":false,"vocab":{},"merges":{}}}}}"#,
