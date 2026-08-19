@@ -210,6 +210,57 @@ pub fn build_chatml_text(messages: &[ChatMsg<'_>]) -> String {
     prompt
 }
 
+/// ChatML с секцией инструментов (официальный Qwen tool template) и ролью
+/// `tool` → user с обёрткой <tool_response>. Без tools побайтово равен
+/// `build_chatml_text` — регрессий у text-only клиентов нет.
+pub fn build_chatml_text_with_tools(
+    messages: &[ChatMsg<'_>],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let tools = tools.and_then(|t| t.as_array()).filter(|a| !a.is_empty());
+    let Some(tools) = tools else {
+        return build_chatml_text(messages);
+    };
+    let mut tool_defs = String::new();
+    for t in tools {
+        // OpenAI-формат: {"type":"function","function":{...}} — в <tools>
+        // кладётся сам объект function.
+        let f = t.get("function").unwrap_or(t);
+        tool_defs.push_str(&serde_json::to_string(f).unwrap_or_default());
+        tool_defs.push('\n');
+    }
+    let tools_section = format!(
+        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tool_defs}</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call>"
+    );
+    let mut prompt = String::with_capacity(2048 + tool_defs.len());
+    let mut system_done = false;
+    for msg in messages {
+        prompt.push_str("<|im_start|>");
+        if msg.role == "tool" {
+            prompt.push_str("user\n<tool_response>\n");
+            prompt.push_str(msg.content);
+            prompt.push_str("\n</tool_response>");
+        } else if msg.role == "system" && !system_done {
+            system_done = true;
+            prompt.push_str("system\n");
+            prompt.push_str(msg.content);
+            prompt.push_str(&tools_section);
+        } else {
+            prompt.push_str(msg.role);
+            prompt.push('\n');
+            prompt.push_str(msg.content);
+        }
+        prompt.push_str("<|im_end|>\n");
+    }
+    if !system_done {
+        // Нет system — вставляем tools-секцию первым сообщением.
+        let injected = format!("<|im_start|>system{}<|im_end|>\n", tools_section.trim_start());
+        prompt = injected + &prompt;
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
 /// Official ordered mixed-content ChatML. Text-only callers retain
 /// `build_chatml_text`, so existing scalar prompt bytes stay unchanged.
 pub fn build_chatml_multimodal(messages: &[MultimodalChatMsg<'_>]) -> Result<String> {
