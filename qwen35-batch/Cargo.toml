@@ -135,3 +135,8 @@ required-features = ["real-model", "cuda"]
 name = "qwen35moe_compare"
 path = "src/bin/qwen35moe_compare.rs"
 required-features = ["real-model"]
+
+[[bin]]
+name = "tok_encode_probe"
+path = "src/bin/tok_encode_probe.rs"
+required-features = ["real-model"]
