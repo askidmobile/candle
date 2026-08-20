@@ -20,13 +20,13 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
   - For `Test-Path`/file checks: use `powershell -NoProfile -Command "Test-Path 'C:\Program Files (x86)\...\file.bat'"` (single quotes inside double-quoted `-Command`).
   - For commands needing `(x86)` paths + `&&`: **use `cmd /c` instead of PowerShell**, OR run a `.bat` file that contains the `(x86)` `call` line (PowerShell never sees the path).
   - Avoid `&&` entirely inside PS; chain with `;` or separate commands.
-- **PATH for CUDA**: `set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin;...;%PATH%"` only inside a `.bat`. CUDA is v12.4 on yttri-win (NOT v13.2 — the env var auto-detect picks 13.2 if not overridden).
+- **PATH for CUDA**: `set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin;...;%PATH%"` only inside a `.bat`. Production toolkit on yttri-win is CUDA 13.2; set `CUDA_PATH` explicitly.
 - **MSVC for nvcc**: nvcc needs `cl.exe` in PATH. Must `call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64` before `cargo build/test --features cuda`. Without it: `nvcc fatal: Cannot find compiler 'cl.exe' in PATH`.
 - **Build candle with CUDA on yttri-win**: use a `.bat` that sets VsDevCmd + CUDA env then runs cargo. Pattern: `D:\Projects\yttri-build\run_iq_tests.bat`. Do NOT run bare `cargo test --features cuda` over SSH — it lacks MSVC env.
 - **No parent Cargo manifest.** Stray `D:\Projects\yttri-build\Cargo.toml` makes server dependency workspace inheritance fail; keep it renamed outside Cargo discovery.
 - **Run IQ CUDA tests**: `ssh yttri-win "cmd /c \"D:\\Projects\\yttri-build\\run_iq_tests.bat\""`. The bat does `cd /d D:\Projects\yttri-build\candle-fork-qwen35-batch && cargo test --features cuda --package candle-core --test iq_quant_cuda_tests`.
 - Repo on yttri-win: `D:\Projects\yttri-build\candle-fork-qwen35-batch` (separate from `candle-fork` which is the older copy).
-- **Build qwen36-server with CUDA**: `ssh -t yttri-win "cmd /c D:\Projects\yttri-build\build_cuda124.bat"` (28s incremental, foreground). The bat calls VsDevCmd + sets CUDA 12.4 PATH then `cargo build --release --features cuda` inside the qwen36-server dir. Do NOT build without `--features cuda` — the binary falls back to CPU device (see qwen36-server section).
+- **Build qwen36-server with CUDA**: build under `D:\Projects\yttri-inference` with VsDevCmd, explicit CUDA 13.2 `CUDA_PATH`, and `cargo build --release --features cuda`. Do NOT build without `--features cuda` — the binary falls back to CPU device.
 
 ## qwen36-server (Q2_K_XL inference) — launch + diagnostics
 
@@ -142,6 +142,7 @@ verbose entries promoted to wiki, one-line pointer left here. Precision test:
 
 ## Conventions
 
+- `llama.cpp` — только внешний донор знаний и независимый parity-reference. Никогда не добавлять его как Cargo/build/FFI/subprocess/runtime dependency `candle-fork`.
 - Respond in Russian (per Global Rule).
 - Do NOT add `Co-Authored-By` to commits unless explicitly told to (per Global Rule).
 - Commit co-author line only on explicit user request.

@@ -1,349 +1,572 @@
-//! Quantized Gemma 4 model implementation for GGUF.
+//! Quantized Gemma 4 text decoder for GGUF.
 //!
-//! Features:
-//! - GQA attention with Q/K RMS-Norm and optional V-norm
-//! - Per-layer token embeddings & projections (Gemma 4 architecture)
-//! - SwiGLU MLP
-//! - RMSNorm with (w + 1.0) scaling
-//! - Support for Q4_K_M, Q5_K_M, Q6_K, Q8_0 GGUF quants
+//! This is the GGUF/QTensor counterpart of `models::gemma4::text`.
+//! It implements mixed sliding/global attention, shared KV layers, per-layer
+//! embeddings, GELU gated MLPs, layer scaling, and final-logit softcapping.
 
 use std::sync::Arc;
 
 use crate::quantized_nn::RmsNorm;
-use candle::quantized::gguf_file;
-use candle::quantized::QTensor;
-use candle::D;
-use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Module};
+use candle::quantized::{gguf_file, QMatMul, QTensor};
+use candle::{DType, Device, Module, Result, Tensor, D};
 
-pub const MAX_SEQ_LEN: usize = 131072;
+#[derive(Clone, Debug)]
+struct QuantLinear(QMatMul);
 
-#[derive(Debug, Clone)]
-struct QMatMul {
-    inner: candle::quantized::QMatMul,
-}
+impl QuantLinear {
+    fn new(weight: QTensor) -> Result<Self> {
+        Ok(Self(QMatMul::from_qtensor(weight)?))
+    }
 
-impl QMatMul {
-    fn from_qtensor(qtensor: QTensor) -> Result<Self> {
-        let inner = candle::quantized::QMatMul::from_qtensor(qtensor)?;
-        Ok(Self { inner })
+    fn from_arc(weight: Arc<QTensor>) -> Result<Self> {
+        Ok(Self(QMatMul::from_arc(weight)?))
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.inner.forward(xs)
+        self.0.forward(xs)
+    }
+
+    fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
+        self.0.embedding(ids)
     }
 }
 
-#[derive(Debug, Clone)]
-struct Mlp {
-    feed_forward_gate: QMatMul,
-    feed_forward_up: QMatMul,
-    feed_forward_down: QMatMul,
+fn v_norm(v: &Tensor, eps: f64) -> Result<Tensor> {
+    let dtype = v.dtype();
+    let v = v.to_dtype(DType::F32)?;
+    let rms = (v.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?;
+    v.broadcast_div(&rms)?.to_dtype(dtype)
 }
 
-impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.feed_forward_gate.forward(xs)?;
-        let up = self.feed_forward_up.forward(xs)?;
-        let silu = candle_nn::ops::silu(&gate)?;
-        let gated = (silu * up)?;
-        self.feed_forward_down.forward(&gated)
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
 }
 
 impl RotaryEmbedding {
-    fn new(head_dim: usize, rope_frequency: f32, device: &Device) -> Result<Self> {
-        let theta: Vec<_> = (0..head_dim)
+    fn new(head_dim: usize, theta: f64, max_seq_len: usize, device: &Device) -> Result<Self> {
+        let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
-            .map(|i| 1f32 / rope_frequency.powf(i as f32 / head_dim as f32))
+            .map(|i| 1.0 / theta.powf(i as f64 / head_dim as f64) as f32)
             .collect();
-        let theta = Tensor::new(theta.as_slice(), device)?;
-        let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+        let half = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?;
+        let positions = Tensor::arange(0u32, max_seq_len as u32, device)?
             .to_dtype(DType::F32)?
-            .reshape((MAX_SEQ_LEN, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        let cos = idx_theta.cos()?;
-        let sin = idx_theta.sin()?;
-        Ok(Self { sin, cos })
+            .reshape((max_seq_len, 1))?;
+        let freqs = positions.matmul(&inv_freq)?;
+        Ok(Self {
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
+        })
     }
 
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        index_pos: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+    fn apply(&self, xs: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let seq_len = xs.dim(2)?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q_embed, k_embed))
+        candle_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
     }
 }
 
-#[derive(Debug, Clone)]
-struct LayerWeights {
-    attention_wq: QMatMul,
-    attention_wk: QMatMul,
-    attention_wv: QMatMul,
-    attention_wo: QMatMul,
+#[derive(Clone, Debug)]
+enum KvCache {
+    Full(candle_nn::kv_cache::KvCache),
+    Sliding(candle_nn::kv_cache::RotatingKvCache),
+}
 
-    attention_q_norm: RmsNorm,
-    attention_k_norm: RmsNorm,
+impl KvCache {
+    fn mask(&self, seq_len: usize, device: &Device, dtype: DType) -> Result<Option<Tensor>> {
+        match self {
+            Self::Full(cache) => {
+                if seq_len == 1 {
+                    Ok(None)
+                } else {
+                    Ok(Some(crate::utils::build_additive_causal_mask(
+                        seq_len,
+                        cache.current_seq_len(),
+                        None,
+                        device,
+                        dtype,
+                    )?))
+                }
+            }
+            Self::Sliding(cache) => cache
+                .attn_mask(seq_len, device)?
+                .map(|mask| additive_mask(&mask, dtype))
+                .transpose(),
+        }
+    }
 
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Full(cache) => cache.append(k, v),
+            Self::Sliding(cache) => cache.append(k, v),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Full(cache) => cache.reset(),
+            Self::Sliding(cache) => cache.reset(),
+        }
+    }
+}
+
+fn additive_mask(mask: &Tensor, dtype: DType) -> Result<Tensor> {
+    let mask = mask.unsqueeze(0)?.unsqueeze(0)?;
+    let zeros = Tensor::zeros(mask.shape(), dtype, mask.device())?;
+    let neg_inf = Tensor::new(f32::NEG_INFINITY, mask.device())?
+        .to_dtype(dtype)?
+        .broadcast_as(mask.shape())?;
+    mask.where_cond(&neg_inf, &zeros)
+}
+
+#[derive(Clone, Debug)]
+struct SharedAttention {
+    k: Tensor,
+    v: Tensor,
+    mask: Option<Tensor>,
+}
+
+#[derive(Clone, Debug)]
+struct Attention {
+    q_proj: QuantLinear,
+    k_proj: Option<QuantLinear>,
+    v_proj: Option<QuantLinear>,
+    o_proj: QuantLinear,
+    q_norm: RmsNorm,
+    k_norm: Option<RmsNorm>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary: RotaryEmbedding,
+    cache: Option<KvCache>,
+}
+
+impl Attention {
+    fn forward(
+        &mut self,
+        xs: &Tensor,
+        index_pos: usize,
+        shared: Option<&SharedAttention>,
+    ) -> Result<(Tensor, Option<SharedAttention>)> {
+        let (batch, seq_len, _) = xs.dims3()?;
+        let q = self
+            .q_proj
+            .forward(xs)?
+            .reshape((batch, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let q = self.rotary.apply(&q, index_pos)?;
+
+        let own_kv = match (&self.k_proj, &self.v_proj, &self.k_norm, &mut self.cache) {
+            (Some(k_proj), Some(v_proj), Some(k_norm), Some(cache)) => {
+                let k = k_proj
+                    .forward(xs)?
+                    .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+                    .transpose(1, 2)?;
+                let v = v_proj
+                    .forward(xs)?
+                    .reshape((batch, seq_len, self.num_kv_heads, self.head_dim))?
+                    .transpose(1, 2)?;
+                let k = k_norm.forward(&k.contiguous()?)?;
+                let k = self.rotary.apply(&k, index_pos)?;
+                let v = v_norm(&v, 1e-6)?;
+                let mask = cache.mask(seq_len, xs.device(), q.dtype())?;
+                let (k, v) = cache.append(&k, &v)?;
+                Some(SharedAttention { k, v, mask })
+            }
+            (None, None, None, None) => None,
+            _ => candle::bail!("incomplete Gemma 4 KV projection/cache configuration"),
+        };
+        let kv = own_kv.as_ref().or(shared).ok_or_else(|| {
+            candle::Error::Msg("Gemma 4 shared-KV layer has no source cache".into())
+        })?;
+
+        let repeats = self.num_heads / self.num_kv_heads;
+        let k = crate::utils::repeat_kv(kv.k.clone(), repeats)?.contiguous()?;
+        let v = crate::utils::repeat_kv(kv.v.clone(), repeats)?.contiguous()?;
+
+        // Gemma 4 metadata defines attention scale as 1.0, not 1/sqrt(head_dim).
+        let mut weights = q.matmul(&k.transpose(2, 3)?)?;
+        if let Some(mask) = &kv.mask {
+            weights = weights.broadcast_add(mask)?;
+        }
+        let weights = candle_nn::ops::softmax_last_dim(&weights)?;
+        let output = weights.matmul(&v)?.transpose(1, 2)?.reshape((
+            batch,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
+        Ok((self.o_proj.forward(&output)?, own_kv))
+    }
+
+    fn reset(&mut self) {
+        if let Some(cache) = &mut self.cache {
+            cache.reset();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Mlp {
+    gate: QuantLinear,
+    up: QuantLinear,
+    down: QuantLinear,
+}
+
+impl Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate.forward(xs)?.gelu()?;
+        self.down.forward(&(gate * self.up.forward(xs)?)?)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Layer {
+    attention: Attention,
     attention_norm: RmsNorm,
     post_attention_norm: RmsNorm,
     ffn_norm: RmsNorm,
     post_ffn_norm: RmsNorm,
-
     mlp: Mlp,
-
-    n_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-
-    // Per-layer projections (optional in smaller variants)
-    inp_gate: Option<QMatMul>,
-    proj: Option<QMatMul>,
-    post_norm: Option<RmsNorm>,
-    layer_output_scale: Option<Tensor>,
-
-    kv_cache: Option<(Tensor, Tensor)>,
+    per_layer_inp_gate: QuantLinear,
+    per_layer_proj: QuantLinear,
+    per_layer_post_norm: RmsNorm,
+    output_scale: Tensor,
+    shared_source: Option<usize>,
 }
 
-impl LayerWeights {
-    fn forward_attn(
-        &mut self,
-        x: &Tensor,
-        rotary: &RotaryEmbedding,
-        index_pos: usize,
-    ) -> Result<Tensor> {
-        let (b_sz, seq_len, _n_embd) = x.dims3()?;
-        let q = self.attention_wq.forward(x)?;
-        let k = self.attention_wk.forward(x)?;
-        let v = self.attention_wv.forward(x)?;
-
-        let q = q
-            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // RMS norm on Q and K
-        let q = self.attention_q_norm.forward(&q)?;
-        let k = self.attention_k_norm.forward(&k)?;
-
-        let (q, k) = rotary.apply_rotary_emb_qkv(&q, &k, index_pos)?;
-
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &k], 2)?;
-                let v = Tensor::cat(&[prev_v, &v], 2)?;
-                (k, v)
-            }
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
-
-        // GQA expansion if kv_heads < heads
-        let (k, v) = if self.n_head != self.n_kv_head {
-            let n_rep = self.n_head / self.n_kv_head;
-            (
-                k.repeat(&[1, n_rep, 1, 1])?,
-                v.repeat(&[1, n_rep, 1, 1])?,
-            )
-        } else {
-            (k, v)
-        };
-
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let out = att.matmul(&v)?;
-
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
-        self.attention_wo.forward(&out)
-    }
-
+impl Layer {
     fn forward(
         &mut self,
-        x: &Tensor,
-        rotary: &RotaryEmbedding,
+        xs: &Tensor,
+        per_layer_input: &Tensor,
         index_pos: usize,
-    ) -> Result<Tensor> {
-        let residual = x;
-        let normed = self.attention_norm.forward(x)?;
-        let attn_out = self.forward_attn(&normed, rotary, index_pos)?;
-        let attn_out = self.post_attention_norm.forward(&attn_out)?;
-        let x = (residual + attn_out)?;
+        shared: Option<&SharedAttention>,
+    ) -> Result<(Tensor, Option<SharedAttention>)> {
+        let residual = xs;
+        let normalized = self.attention_norm.forward(xs)?;
+        let (attention, own_kv) = self.attention.forward(&normalized, index_pos, shared)?;
+        let attention = self.post_attention_norm.forward(&attention)?;
+        let xs = (residual + attention)?;
 
-        let residual = &x;
-        let normed = self.ffn_norm.forward(&x)?;
-        let ffn_out = self.mlp.forward(&normed)?;
-        let ffn_out = self.post_ffn_norm.forward(&ffn_out)?;
-        let mut x = (residual + ffn_out)?;
+        let residual = &xs;
+        let ffn = self.ffn_norm.forward(&xs)?;
+        let ffn = self.mlp.forward(&ffn)?;
+        let ffn = self.post_ffn_norm.forward(&ffn)?;
+        let mut xs = (residual + ffn)?;
 
-        if let Some(scale) = &self.layer_output_scale {
-            x = x.broadcast_mul(scale)?;
-        }
-        Ok(x)
+        let residual = &xs;
+        let gate = self.per_layer_inp_gate.forward(&xs)?.gelu()?;
+        let per_layer = self.per_layer_proj.forward(&(gate * per_layer_input)?)?;
+        let per_layer = self.per_layer_post_norm.forward(&per_layer)?;
+        xs = (residual + per_layer)?;
+        xs = xs.broadcast_mul(&self.output_scale)?;
+        Ok((xs, own_kv))
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ModelWeights {
-    tok_embeddings: Embedding,
-    per_layer_embeddings: Option<QMatMul>,
-    per_layer_proj_norm: Option<RmsNorm>,
-    layers: Vec<LayerWeights>,
+    token_embedding: QuantLinear,
+    per_layer_token_embedding: QuantLinear,
+    per_layer_model_proj: QuantLinear,
+    per_layer_proj_norm: RmsNorm,
+    layers: Vec<Layer>,
     norm: RmsNorm,
-    output: QMatMul,
-    rotary: RotaryEmbedding,
-    device: Device,
+    output: QuantLinear,
+    hidden_size: usize,
+    per_layer_size: usize,
+    final_logit_softcap: Option<f64>,
 }
 
 impl ModelWeights {
-    pub fn from_gguf<R: std::io::Seek + std::io::Read>(
+    pub fn from_gguf<R: std::io::Read + std::io::Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let md = &ct.metadata;
-        let block_count = md
-            .get("gemma4.block_count")
-            .or_else(|| md.get("gemma3.block_count"))
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(28) as usize;
-        let head_count = md
-            .get("gemma4.attention.head_count")
-            .or_else(|| md.get("gemma3.attention.head_count"))
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(8) as usize;
-        let head_count_kv = md
-            .get("gemma4.attention.head_count_kv")
-            .or_else(|| md.get("gemma3.attention.head_count_kv"))
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(4) as usize;
-        let head_dim = md
-            .get("gemma4.attention.key_length")
-            .or_else(|| md.get("gemma3.attention.key_length"))
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(256) as usize;
-        let rms_norm_eps = md
-            .get("gemma4.attention.layer_norm_rms_epsilon")
-            .or_else(|| md.get("gemma3.attention.layer_norm_rms_epsilon"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1e-6) as f64;
-        let rope_freq = md
-            .get("gemma4.rope.freq_base")
-            .or_else(|| md.get("gemma3.rope.freq_base"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1_000_000.0);
-
-        let rotary = RotaryEmbedding::new(head_dim, rope_freq, device)?;
-
-        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
-        let tok_embeddings = Embedding::new(tok_embeddings_q.dequantize(device)?, tok_embeddings_q.shape().dims()[1]);
-
-        let per_layer_embeddings = ct
-            .tensor(reader, "per_layer_token_embd.weight", device)
-            .ok()
-            .and_then(|q| QMatMul::from_qtensor(q).ok());
-        let per_layer_proj_norm = ct
-            .tensor(reader, "per_layer_proj_norm.weight", device)
-            .ok()
-            .and_then(|q| RmsNorm::from_qtensor(q, rms_norm_eps).ok());
-
-        let norm = RmsNorm::from_qtensor(ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps)?;
-        let output = match ct.tensor(reader, "output.weight", device) {
-            Ok(t) => QMatMul::from_qtensor(t)?,
-            Err(_) => QMatMul::from_qtensor(tok_embeddings_q)?,
+        let arch = ct
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .map(String::as_str)
+            .unwrap_or("");
+        if arch != "gemma4" {
+            candle::bail!("quantized Gemma 4 loader expected architecture gemma4, got {arch:?}")
+        }
+        let get_u32 = |key: &str| -> Result<usize> {
+            Ok(ct
+                .metadata
+                .get(key)
+                .ok_or_else(|| candle::Error::Msg(format!("missing GGUF metadata {key}")))?
+                .to_u32()? as usize)
+        };
+        let get_f32 = |key: &str| -> Result<f32> {
+            ct.metadata
+                .get(key)
+                .ok_or_else(|| candle::Error::Msg(format!("missing GGUF metadata {key}")))?
+                .to_f32()
         };
 
-        let mut layers = Vec::with_capacity(block_count);
-        for i in 0..block_count {
-            let p = format!("blk.{i}");
-            let attention_wq = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q.weight"), device)?)?;
-            let attention_wk = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k.weight"), device)?)?;
-            let attention_wv = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_v.weight"), device)?)?;
-            let attention_wo = QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.attn_output.weight"), device)?)?;
+        let layer_count = get_u32("gemma4.block_count")?;
+        let context_length = get_u32("gemma4.context_length")?;
+        let hidden_size = get_u32("gemma4.embedding_length")?;
+        let num_heads = get_u32("gemma4.attention.head_count")?;
+        let num_kv_heads = get_u32("gemma4.attention.head_count_kv")?;
+        let global_head_dim = get_u32("gemma4.attention.key_length")?;
+        let sliding_head_dim = get_u32("gemma4.attention.key_length_swa")?;
+        let sliding_window = get_u32("gemma4.attention.sliding_window")?;
+        let shared_kv_layers = get_u32("gemma4.attention.shared_kv_layers")?;
+        let per_layer_size = get_u32("gemma4.embedding_length_per_layer_input")?;
+        let eps = get_f32("gemma4.attention.layer_norm_rms_epsilon")? as f64;
+        let global_theta = get_f32("gemma4.rope.freq_base")? as f64;
+        let sliding_theta = get_f32("gemma4.rope.freq_base_swa")? as f64;
+        let final_logit_softcap = ct
+            .metadata
+            .get("gemma4.final_logit_softcapping")
+            .and_then(|v| v.to_f32().ok())
+            .map(|v| v as f64);
+        let pattern = ct
+            .metadata
+            .get("gemma4.attention.sliding_window_pattern")
+            .ok_or_else(|| candle::Error::Msg("missing Gemma 4 sliding-window pattern".into()))?
+            .to_vec()?
+            .iter()
+            .map(gguf_file::Value::to_bool)
+            .collect::<Result<Vec<_>>>()?;
+        if pattern.len() != layer_count {
+            candle::bail!(
+                "Gemma 4 sliding-window pattern has {} entries, expected {layer_count}",
+                pattern.len()
+            )
+        }
+        let own_kv_layers = layer_count.checked_sub(shared_kv_layers).ok_or_else(|| {
+            candle::Error::Msg("Gemma 4 shared_kv_layers exceeds block_count".into())
+        })?;
+        let source_for = |sliding: bool| -> Result<usize> {
+            (0..own_kv_layers)
+                .rev()
+                .find(|&i| pattern[i] == sliding)
+                .ok_or_else(|| {
+                    candle::Error::Msg("Gemma 4 has no matching shared-KV source".into())
+                })
+        };
+        let sliding_source = source_for(true)?;
+        let global_source = source_for(false)?;
 
-            let attention_q_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.attn_q_norm.weight"), device)?, rms_norm_eps)?;
-            let attention_k_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.attn_k_norm.weight"), device)?, rms_norm_eps)?;
+        let global_rotary =
+            RotaryEmbedding::new(global_head_dim, global_theta, context_length, device)?;
+        let sliding_rotary =
+            RotaryEmbedding::new(sliding_head_dim, sliding_theta, context_length, device)?;
 
-            let attention_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.attn_norm.weight"), device)?, rms_norm_eps)?;
-            let post_attention_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.post_attention_norm.weight"), device)?, rms_norm_eps)?;
-            let ffn_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_norm.weight"), device)?, rms_norm_eps)?;
-            let post_ffn_norm = RmsNorm::from_qtensor(ct.tensor(reader, &format!("{p}.post_ffw_norm.weight"), device)?, rms_norm_eps)?;
+        let token_q = Arc::new(ct.tensor(reader, "token_embd.weight", device)?);
+        let token_embedding = QuantLinear::from_arc(token_q.clone())?;
+        let output = match ct.tensor(reader, "output.weight", device) {
+            Ok(weight) => QuantLinear::new(weight)?,
+            Err(_) => QuantLinear::from_arc(token_q)?,
+        };
+        let per_layer_token_embedding =
+            QuantLinear::new(ct.tensor(reader, "per_layer_token_embd.weight", device)?)?;
+        let per_layer_model_proj =
+            QuantLinear::new(ct.tensor(reader, "per_layer_model_proj.weight", device)?)?;
+        let per_layer_proj_norm = RmsNorm::from_qtensor(
+            ct.tensor(reader, "per_layer_proj_norm.weight", device)?,
+            eps,
+        )?;
+        let norm = RmsNorm::from_qtensor(ct.tensor(reader, "output_norm.weight", device)?, eps)?;
 
-            let mlp = Mlp {
-                feed_forward_gate: QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_gate.weight"), device)?)?,
-                feed_forward_up: QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_up.weight"), device)?)?,
-                feed_forward_down: QMatMul::from_qtensor(ct.tensor(reader, &format!("{p}.ffn_down.weight"), device)?)?,
+        let mut layers = Vec::with_capacity(layer_count);
+        for index in 0..layer_count {
+            let p = format!("blk.{index}");
+            let sliding = pattern[index];
+            let head_dim = if sliding {
+                sliding_head_dim
+            } else {
+                global_head_dim
             };
+            let owns_kv = index < own_kv_layers;
+            let k_proj = owns_kv
+                .then(|| ct.tensor(reader, &format!("{p}.attn_k.weight"), device))
+                .transpose()?
+                .map(QuantLinear::new)
+                .transpose()?;
+            let v_proj = owns_kv
+                .then(|| ct.tensor(reader, &format!("{p}.attn_v.weight"), device))
+                .transpose()?
+                .map(QuantLinear::new)
+                .transpose()?;
+            let k_norm = owns_kv
+                .then(|| ct.tensor(reader, &format!("{p}.attn_k_norm.weight"), device))
+                .transpose()?
+                .map(|weight| RmsNorm::from_qtensor(weight, eps))
+                .transpose()?;
+            let cache = owns_kv.then(|| {
+                if sliding {
+                    KvCache::Sliding(candle_nn::kv_cache::RotatingKvCache::new(2, sliding_window))
+                } else {
+                    // KvCache grows by this initial chunk; reserving full 131K here
+                    // allocates several GiB before first-token generation.
+                    KvCache::Full(candle_nn::kv_cache::KvCache::new(
+                        2,
+                        context_length.min(2048),
+                    ))
+                }
+            });
+            let shared_source = (!owns_kv).then_some(if sliding {
+                sliding_source
+            } else {
+                global_source
+            });
 
-            let inp_gate = ct.tensor(reader, &format!("{p}.inp_gate.weight"), device).ok().and_then(|q| QMatMul::from_qtensor(q).ok());
-            let proj = ct.tensor(reader, &format!("{p}.proj.weight"), device).ok().and_then(|q| QMatMul::from_qtensor(q).ok());
-            let post_norm = ct.tensor(reader, &format!("{p}.post_norm.weight"), device).ok().and_then(|q| RmsNorm::from_qtensor(q, rms_norm_eps).ok());
-            let layer_output_scale = ct.tensor(reader, &format!("{p}.layer_output_scale.weight"), device).ok().and_then(|q| q.dequantize(device).ok());
-
-            layers.push(LayerWeights {
-                attention_wq,
-                attention_wk,
-                attention_wv,
-                attention_wo,
-                attention_q_norm,
-                attention_k_norm,
-                attention_norm,
-                post_attention_norm,
-                ffn_norm,
-                post_ffn_norm,
-                mlp,
-                n_head: head_count,
-                n_kv_head: head_count_kv,
-                head_dim,
-                inp_gate,
-                proj,
-                post_norm,
-                layer_output_scale,
-                kv_cache: None,
+            layers.push(Layer {
+                attention: Attention {
+                    q_proj: QuantLinear::new(ct.tensor(
+                        reader,
+                        &format!("{p}.attn_q.weight"),
+                        device,
+                    )?)?,
+                    k_proj,
+                    v_proj,
+                    o_proj: QuantLinear::new(ct.tensor(
+                        reader,
+                        &format!("{p}.attn_output.weight"),
+                        device,
+                    )?)?,
+                    q_norm: RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{p}.attn_q_norm.weight"), device)?,
+                        eps,
+                    )?,
+                    k_norm,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rotary: if sliding {
+                        sliding_rotary.clone()
+                    } else {
+                        global_rotary.clone()
+                    },
+                    cache,
+                },
+                attention_norm: RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{p}.attn_norm.weight"), device)?,
+                    eps,
+                )?,
+                post_attention_norm: RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{p}.post_attention_norm.weight"), device)?,
+                    eps,
+                )?,
+                ffn_norm: RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{p}.ffn_norm.weight"), device)?,
+                    eps,
+                )?,
+                post_ffn_norm: RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{p}.post_ffw_norm.weight"), device)?,
+                    eps,
+                )?,
+                mlp: Mlp {
+                    gate: QuantLinear::new(ct.tensor(
+                        reader,
+                        &format!("{p}.ffn_gate.weight"),
+                        device,
+                    )?)?,
+                    up: QuantLinear::new(ct.tensor(
+                        reader,
+                        &format!("{p}.ffn_up.weight"),
+                        device,
+                    )?)?,
+                    down: QuantLinear::new(ct.tensor(
+                        reader,
+                        &format!("{p}.ffn_down.weight"),
+                        device,
+                    )?)?,
+                },
+                per_layer_inp_gate: QuantLinear::new(ct.tensor(
+                    reader,
+                    &format!("{p}.inp_gate.weight"),
+                    device,
+                )?)?,
+                per_layer_proj: QuantLinear::new(ct.tensor(
+                    reader,
+                    &format!("{p}.proj.weight"),
+                    device,
+                )?)?,
+                per_layer_post_norm: RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{p}.post_norm.weight"), device)?,
+                    eps,
+                )?,
+                output_scale: ct
+                    .tensor(reader, &format!("{p}.layer_output_scale.weight"), device)?
+                    .dequantize(device)?,
+                shared_source,
             });
         }
 
         Ok(Self {
-            tok_embeddings,
-            per_layer_embeddings,
+            token_embedding,
+            per_layer_token_embedding,
+            per_layer_model_proj,
             per_layer_proj_norm,
             layers,
             norm,
             output,
-            rotary,
-            device: device.clone(),
+            hidden_size,
+            per_layer_size,
+            final_logit_softcap,
         })
     }
 
-    pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        let (_b_sz, seq_len) = x.dims2()?;
-        let mut hidden = self.tok_embeddings.forward(x)?;
+    pub fn forward(&mut self, ids: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (batch, seq_len) = ids.dims2()?;
+        let mut xs = (self.token_embedding.embedding(ids)? * (self.hidden_size as f64).sqrt())?;
 
-        for layer in &mut self.layers {
-            hidden = layer.forward(&hidden, &self.rotary, index_pos)?;
+        let per_layer_tokens =
+            (self.per_layer_token_embedding.embedding(ids)? * (self.per_layer_size as f64).sqrt())?;
+        let projected =
+            (self.per_layer_model_proj.forward(&xs)? / (self.hidden_size as f64).sqrt())?;
+        let projected = self.per_layer_proj_norm.forward(&projected.reshape((
+            batch,
+            seq_len,
+            self.layers.len(),
+            self.per_layer_size,
+        ))?)?;
+        let per_layer = ((projected
+            + per_layer_tokens.reshape((
+                batch,
+                seq_len,
+                self.layers.len(),
+                self.per_layer_size,
+            ))?)?
+            / 2f64.sqrt())?;
+
+        let mut shared_kv: Vec<Option<SharedAttention>> = vec![None; self.layers.len()];
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            let layer_input = per_layer.narrow(2, index, 1)?.squeeze(2)?;
+            let shared = layer
+                .shared_source
+                .and_then(|source| shared_kv[source].as_ref());
+            let (next, own_kv) = layer.forward(&xs, &layer_input, index_pos, shared)?;
+            if own_kv.is_some() {
+                shared_kv[index] = own_kv;
+            }
+            xs = next;
         }
 
-        let hidden = self.norm.forward(&hidden)?;
-        let last_hidden = hidden.narrow(1, seq_len.saturating_sub(1), 1)?;
-        self.output.forward(&last_hidden.squeeze(1)?)
+        let xs = self.norm.forward(&xs)?;
+        let xs = xs.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
+        let logits = self.output.forward(&xs)?;
+        match self.final_logit_softcap {
+            Some(cap) => Ok(((logits / cap)?.tanh()? * cap)?),
+            None => Ok(logits),
+        }
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.attention.reset();
+        }
     }
 }

@@ -23,6 +23,7 @@ use candle_core::{
     DType, Device, IndexOp, Result, Tensor, D,
 };
 use candle_nn::{Module, RmsNorm};
+#[cfg(feature = "cuda")]
 use std::io::Write;
 #[cfg(target_os = "macos")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
@@ -1992,7 +1993,7 @@ impl DeltaNetLayer {
         if let Some(ctx) = self.cuda_ctx_batched.as_mut() {
             ctx.params.batch_size = if serial_rows { 1 } else { b as u32 };
             let gprof2 = std::env::var("QWEN36_GPROF").as_deref() == Ok("2");
-            let mut sync = || {
+            let sync = || {
                 if gprof2 {
                     let _ = ctx.dev.cuda_stream().synchronize();
                 }
@@ -4172,10 +4173,21 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let data: &[u8] = &mmap;
-        let max_gpu_layers: usize = std::env::var("QWEN36_GPU_LAYERS")
+        let gpu_only = std::env::var("GPU_ONLY")
+            .or_else(|_| std::env::var("QWEN36_GPU_ONLY"))
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if gpu_only && !device.is_cuda() {
+            candle_core::bail!("GPU_ONLY=1 requires CUDA device")
+        }
+        let max_gpu_layers: usize = std::env::var("GPU_LAYERS")
+            .or_else(|_| std::env::var("QWEN36_GPU_LAYERS"))
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(usize::MAX);
+        if gpu_only && max_gpu_layers < 999 {
+            candle_core::bail!("GPU_ONLY=1 conflicts with GPU_LAYERS={max_gpu_layers}")
+        }
         let load_heavy = |name: &str| -> Result<candle_core::quantized::QTensor> {
             // Если тензор принадлежит блоку `blk.N.*` и N >= max_gpu_layers,
             // загружаем его на CPU для предотвращения WDDM paging на 27B+.
@@ -4480,6 +4492,11 @@ impl ModelWeights {
             None => candle_core::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+        let gpu_only = std::env::var("GPU_ONLY")
+            .or_else(|_| std::env::var("QWEN36_GPU_ONLY"))
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         // Architecture dispatch: dense qwen35 vs MoE qwen35moe.
         let is_moe = matches!(
@@ -4677,6 +4694,7 @@ impl ModelWeights {
 
         // Output projection и token embedding (с защитой от переполнения VRAM)
         let output_res = load_heavy("output.weight");
+        #[allow(unused_variables)]
         let (output, tok_embeddings_cuda) = match output_res {
             Ok(v) => {
                 let out_mm = QMatMul::from_qtensor(v)?;
@@ -4716,7 +4734,7 @@ impl ModelWeights {
                     } else {
                         false
                     };
-                    if has_vram_headroom {
+                    if has_vram_headroom || gpu_only {
                         Some(QMatMul::from_qtensor(load_heavy("token_embd.weight")?)?)
                     } else {
                         log::info!("[{}] low VRAM headroom: keeping token_embd on CPU mmap (zero GPU overhead)", tag);
@@ -5469,7 +5487,7 @@ impl ModelWeights {
             })
             .count();
         #[cfg(not(target_os = "macos"))]
-        let mut n_metal = 0usize;
+        let n_metal = 0usize;
         log::info!(
             "[{}] Loaded {} layers ({} DeltaNet [{} Metal GPU] + {} Attention) in {:.0}ms",
             tag,

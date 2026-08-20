@@ -149,9 +149,25 @@ fn build_from_ggml_keys(metadata: &HashMap<String, gguf_file::Value>) -> Result<
     }
     added_tokens_json.push(']');
 
+    let tokenizer_model = metadata
+        .get("tokenizer.ggml.model")
+        .and_then(|value| value.to_string().ok())
+        .map(String::as_str)
+        .unwrap_or("gpt2");
+    let (pre_tokenizer, decoder) = if tokenizer_model == "gemma4" {
+        // Gemma 4 uses SPM-style BPE: raw UTF-8, spaces become U+2581,
+        // then merges run over the complete text (no GPT-2 byte mapping).
+        let metaspace =
+            r#"{"type":"Metaspace","replacement":"▁","prepend_scheme":"never","split":false}"#;
+        (metaspace, metaspace)
+    } else {
+        let byte_level =
+            r#"{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}"#;
+        (byte_level, byte_level)
+    };
     let tokenizer_json = format!(
-        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":{},"normalizer":null,"pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},"post_processor":null,"decoder":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},"model":{{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":true,"ignore_merges":false,"vocab":{},"merges":{}}}}}"#,
-        added_tokens_json, vocab_json, merges_json,
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":{},"normalizer":null,"pre_tokenizer":{},"post_processor":null,"decoder":{},"model":{{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":true,"ignore_merges":false,"vocab":{},"merges":{}}}}}"#,
+        added_tokens_json, pre_tokenizer, decoder, vocab_json, merges_json,
     );
 
     Tokenizer::from_bytes(tokenizer_json.as_bytes())
@@ -265,7 +281,10 @@ pub fn build_chatml_text_with_tools(
     }
     if !system_done {
         // Нет system — вставляем tools-секцию первым сообщением.
-        let injected = format!("<|im_start|>system{}<|im_end|>\n", tools_section.trim_start());
+        let injected = format!(
+            "<|im_start|>system{}<|im_end|>\n",
+            tools_section.trim_start()
+        );
         prompt = injected + &prompt;
     }
     prompt.push_str("<|im_start|>assistant\n");
@@ -469,7 +488,7 @@ mod tests {
             Value::Array(vec![
                 Value::String("a".to_string()),
                 Value::String("\u{120}\u{F0}\u{141}".to_string()), // " " + F0 9F
-                Value::String("\u{132}\u{B1}".to_string()),       // 90 B1
+                Value::String("\u{132}\u{B1}".to_string()),        // 90 B1
                 Value::String("<|im_end|>".to_string()),
             ]),
         );
