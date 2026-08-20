@@ -828,6 +828,36 @@ impl QuantizedEmbedding {
         })
     }
 
+    /// Пустой embedding без mmap. Используется на CUDA GPU_ONLY когда
+    /// tok_embeddings_cuda полностью покрывает lookup — оригинальный mmap
+    /// Arc drop'ается, освобождая ~full GGUF size в RAM.
+    /// forward() вернёт ошибку (не должен вызываться на этом пути).
+    #[cfg(feature = "cuda")]
+    fn empty(n_cols: usize) -> Self {
+        use std::sync::Arc;
+        // Windows: make_read_only на 0-byte anon mmap падает (code 87).
+        // 1-byte temp file — минимальный валидный read-only mmap.
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("yttri_empty_{}.bin", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp).expect("create temp");
+            use std::io::Write;
+            f.write_all(&[0u8]).expect("write temp");
+            f.sync_all().ok();
+        }
+        let f = std::fs::File::open(&tmp).expect("open temp");
+        let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&f) }.expect("mmap temp"));
+        Self {
+            mmap,
+            data_offset: 0,
+            data_len: 0,
+            ggml_dtype: candle_core::quantized::GgmlDType::Q8_0,
+            bytes_per_row: 0,
+            n_rows: 0,
+            n_cols,
+        }
+    }
+
     /// Embedding lookup: деквантизирует только нужные строки по token IDs.
     ///
     /// Вход: token_ids shape (batch, seq_len) на любом device.
@@ -5497,6 +5527,20 @@ impl ModelWeights {
             n_attention,
             load_start.elapsed().as_secs_f64() * 1000.0,
         );
+
+        // GPU_ONLY CUDA: ток-эмбеддинг полностью на GPU (tok_embeddings_cuda=Some).
+        // Освобождаем mmap Arc — иначе весь GGUF (6+ GB) остаётся в RAM как standby
+        // из-за QuantizedEmbedding::mmap. empty() вернёт ошибку в forward, но на
+        // этом пути forward не вызывается (emb берётся из tok_embeddings_cuda).
+        #[cfg(feature = "cuda")]
+        let tok_embeddings = if tok_embeddings_cuda.is_some() && device.is_cuda() && gpu_only {
+            log::info!("[{}] GPU_ONLY: dropping mmap token_embd (~{:.0} MB RAM freed)", tag, tok_embeddings.data_len as f64 / 1024.0 / 1024.0);
+            QuantizedEmbedding::empty(tok_embeddings.n_cols)
+        } else {
+            tok_embeddings
+        };
+        #[cfg(not(feature = "cuda"))]
+        let tok_embeddings = tok_embeddings;
 
         Ok(Self {
             tok_embeddings,
