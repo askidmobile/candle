@@ -10,22 +10,22 @@
 use std::sync::Arc;
 
 use crate::quantized_nn::RmsNorm;
-use candle_core::quantized::gguf_file;
-use candle_core::quantized::QTensor;
-use candle_core::D;
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use candle::quantized::gguf_file;
+use candle::quantized::QTensor;
+use candle::D;
+use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 131072;
 
 #[derive(Debug, Clone)]
 struct QMatMul {
-    inner: candle_core::quantized::QMatMul,
+    inner: candle::quantized::QMatMul,
 }
 
 impl QMatMul {
     fn from_qtensor(qtensor: QTensor) -> Result<Self> {
-        let inner = candle_core::quantized::QMatMul::from_qtensor(qtensor)?;
+        let inner = candle::quantized::QMatMul::from_qtensor(qtensor)?;
         Ok(Self { inner })
     }
 
