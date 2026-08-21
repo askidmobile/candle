@@ -42,13 +42,42 @@ fn v_norm(v: &Tensor, eps: f64) -> Result<Tensor> {
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    rotary_dim: usize,
+    head_dim: usize,
 }
 
 impl RotaryEmbedding {
-    fn new(head_dim: usize, theta: f64, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let inv_freq: Vec<f32> = (0..head_dim)
+    fn from_freqs(
+        freqs_tensor: &Tensor,
+        head_dim: usize,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let rotary_dim = freqs_tensor.elem_count();
+        let half = rotary_dim / 2;
+        let inv_freq = freqs_tensor.flatten_all()?.narrow(0, 0, half)?.reshape((1, half))?;
+        let positions = Tensor::arange(0u32, max_seq_len as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = positions.matmul(&inv_freq.to_device(device)?)?;
+        Ok(Self {
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
+            rotary_dim,
+            head_dim,
+        })
+    }
+
+    fn new_standard(
+        head_dim: usize,
+        rotary_dim: usize,
+        theta: f64,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let inv_freq: Vec<f32> = (0..rotary_dim)
             .step_by(2)
-            .map(|i| 1.0 / theta.powf(i as f64 / head_dim as f64) as f32)
+            .map(|i| 1.0 / theta.powf(i as f64 / rotary_dim as f64) as f32)
             .collect();
         let half = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?;
@@ -59,6 +88,8 @@ impl RotaryEmbedding {
         Ok(Self {
             sin: freqs.sin()?,
             cos: freqs.cos()?,
+            rotary_dim,
+            head_dim,
         })
     }
 
@@ -66,7 +97,16 @@ impl RotaryEmbedding {
         let seq_len = xs.dim(2)?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        candle_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
+
+        if self.rotary_dim == self.head_dim {
+            candle_nn::rotary_emb::rope(&xs.contiguous()?, &cos, &sin)
+        } else {
+            // Partial RoPE: вращаем только первые rotary_dim измерений
+            let xs_rot = xs.narrow(3, 0, self.rotary_dim)?.contiguous()?;
+            let xs_pass = xs.narrow(3, self.rotary_dim, self.head_dim - self.rotary_dim)?;
+            let xs_rotated = candle_nn::rotary_emb::rope(&xs_rot, &cos, &sin)?;
+            Tensor::cat(&[&xs_rotated, &xs_pass], 3)
+        }
     }
 }
 
@@ -358,10 +398,26 @@ impl ModelWeights {
         let sliding_source = source_for(true)?;
         let global_source = source_for(false)?;
 
-        let global_rotary =
-            RotaryEmbedding::new(global_head_dim, global_theta, context_length, device)?;
-        let sliding_rotary =
-            RotaryEmbedding::new(sliding_head_dim, sliding_theta, context_length, device)?;
+        let global_rotary = if let Ok(freqs_qt) = ct.tensor(reader, "rope_freqs.weight", device) {
+            let freqs_t = freqs_qt.dequantize(device)?;
+            RotaryEmbedding::from_freqs(&freqs_t, global_head_dim, context_length, device)?
+        } else {
+            // Fallback: 25% partial rotary for Gemma 4 full_attention
+            RotaryEmbedding::new_standard(
+                global_head_dim,
+                global_head_dim / 4,
+                global_theta,
+                context_length,
+                device,
+            )?
+        };
+        let sliding_rotary = RotaryEmbedding::new_standard(
+            sliding_head_dim,
+            sliding_head_dim,
+            sliding_theta,
+            context_length,
+            device,
+        )?;
 
         let token_q = Arc::new(ct.tensor(reader, "token_embd.weight", device)?);
         let token_embedding = QuantLinear::from_arc(token_q.clone())?;
