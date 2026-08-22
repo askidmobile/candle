@@ -2952,13 +2952,137 @@ pub(crate) struct GatedAttentionLayer {
     /// Pre-allocated ёмкость KV-кэша для batched path (== attn_window cap).
     /// Одно значение для всех слотов.
     kv_cache_cap_batched: usize,
+    /// Stage-2: инкрементальные f16-зеркала префикса per-slot. Плоский layout
+    /// [cap*row] f16, valid_tokens — сколько префикса уже отдеанвализировано.
+    /// Бюджет общий на модель (kv_mirror_budget); при исчерпании слот живёт на
+    /// shared scratch / f16_prefix (Stage-1 fallback).
+    kv_mirror: Vec<Option<KvMirror>>,
 
     /// Paged KV pool для CUDA-graph decode (опция, env QWEN36_CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
     paged_pool: Option<crate::real::paged_kv_cuda::PagedKvPool>,
 }
 
+/// Инкрементальное f16-зеркало KV-префикса одного слота (Stage-2, см. спеку
+/// candle-parity-m2 P1). Плоский layout [cap*n_kv*hd] → view без копии.
+#[derive(Debug, Clone)]
+struct KvMirror {
+    k: Tensor,
+    v: Tensor,
+    valid_tokens: usize,
+}
+
 impl GatedAttentionLayer {
+    /// Stage-2 (P1): f16-view префикса из инкрементального зеркала. None =
+    /// зеркало недоступно (не-CUDA / бюджет исчерпан / не влезает рост).
+    /// Top-up деквантирует ТОЛЬКО новые строки — обычный шаг добавляет 1 токен.
+    fn mirror_prefix(
+        &mut self,
+        slot: usize,
+        kv_len: usize,
+        device: &Device,
+        budget: &std::sync::atomic::AtomicI64,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        const CHUNK: usize = 4096;
+        if kv_len == 0 || !device.is_cuda() || slot >= self.kv_mirror.len() {
+            return Ok(None);
+        }
+        let row = self.n_kv_head * self.head_dim;
+        let mut m = self.kv_mirror[slot].take();
+        if m.is_none() {
+            // Ёмкость: точная из env (упреждающее выделение при загрузке)
+            // либо с запасом до границы 4096. Бюджет списывается элементами.
+            let cap_tok = match std::env::var("QWEN36_KV_MIRROR_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                Some(t) => t.min(self.attn_window),
+                None => ((kv_len + CHUNK - 1) / CHUNK * CHUNK).min(self.attn_window),
+            };
+            let cost = cap_tok as i64 * row as i64;
+            if budget.fetch_sub(cost, std::sync::atomic::Ordering::SeqCst) < cost {
+                budget.fetch_add(cost, std::sync::atomic::Ordering::SeqCst);
+                return Ok(None);
+            }
+            eprintln!(
+                "[kv] f16 mirror slot {slot}: cap {cap_tok} tokens ({:.0} MiB x2)",
+                (cap_tok * row * 2) as f32 * 2.0 / 1024.0 / 1024.0
+            );
+            m = Some(KvMirror {
+                k: Tensor::zeros(cap_tok * row, DType::F16, device)?,
+                v: Tensor::zeros(cap_tok * row, DType::F16, device)?,
+                valid_tokens: 0,
+            });
+        }
+        let Some(mm) = m.as_mut() else {
+            unreachable!()
+        };
+        // Рост кэша за ёмкость зеркала: удвоение в рамках бюджета.
+        let mut cap_tok = mm.k.elem_count() / row;
+        if kv_len > cap_tok {
+            let new_cap = ((kv_len + CHUNK - 1) / CHUNK * CHUNK)
+                .max(cap_tok * 2)
+                .min(self.attn_window);
+            if new_cap < kv_len || new_cap <= cap_tok {
+                self.kv_mirror[slot] = m;
+                return Ok(None);
+            }
+            let cost = (new_cap - cap_tok) as i64 * row as i64;
+            if budget.fetch_sub(cost, std::sync::atomic::Ordering::SeqCst) < cost {
+                budget.fetch_add(cost, std::sync::atomic::Ordering::SeqCst);
+                self.kv_mirror[slot] = m;
+                return Ok(None);
+            }
+            let nk = Tensor::zeros(new_cap * row, DType::F16, device)?;
+            let nv = Tensor::zeros(new_cap * row, DType::F16, device)?;
+            let old_elems = mm.valid_tokens * row;
+            if old_elems > 0 {
+                nk.narrow(0, 0, old_elems)?
+                    .slice_set(&mm.k.flatten_all()?, 0, 0)?;
+                nv.narrow(0, 0, old_elems)?
+                    .slice_set(&mm.v.flatten_all()?, 0, 0)?;
+            }
+            mm.k = nk;
+            mm.v = nv;
+            cap_tok = new_cap;
+        }
+        if kv_len > cap_tok {
+            self.kv_mirror[slot] = m;
+            return Ok(None);
+        }
+        // Top-up только недостающих строк.
+        while mm.valid_tokens < kv_len {
+            let cs = CHUNK.min(kv_len - mm.valid_tokens);
+            let cache = self.kv_cache_batched[slot]
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("mirror fill: no cache".into()))?;
+            let (kt, vt) = cache.prefix_chunk_f16(mm.valid_tokens, cs)?;
+            mm.k
+                .slice_set(&kt.flatten_all()?, 0, mm.valid_tokens * row)?;
+            mm.v
+                .slice_set(&vt.flatten_all()?, 0, mm.valid_tokens * row)?;
+            mm.valid_tokens += cs;
+        }
+        let k_view = mm
+            .k
+            .narrow(0, 0, kv_len * row)?
+            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
+        let v_view = mm
+            .v
+            .narrow(0, 0, kv_len * row)?
+            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
+        self.kv_mirror[slot] = m;
+        Ok(Some((k_view, v_view)))
+    }
+
+    /// Сброс валидности зеркала слота (bulk-перезапись q8: eviction/seed/restore).
+    fn invalidate_mirror(&mut self, slot: usize) {
+        if let Some(Some(mm)) = self.kv_mirror.get_mut(slot) {
+            mm.valid_tokens = 0;
+        }
+    }
+
     /// Partial RoPE: применяем RoPE только к первым rope_dim измерениям.
     ///
     /// x shape: (batch, n_head, seq_len, head_dim)
@@ -3564,6 +3688,7 @@ impl GatedAttentionLayer {
         rope_positions: &[usize],
         slots: &[u32],
         scratch: &mut Option<(Tensor, Tensor)>,
+        budget: &std::sync::atomic::AtomicI64,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if seq_len != 1
@@ -3706,6 +3831,7 @@ impl GatedAttentionLayer {
                     .as_ref()
                     .unwrap()
                     .shift_and_append(row, keep)?;
+                self.invalidate_mirror(slot);
                 self.kv_cache_len_batched[slot] = self.attn_window;
             } else if new_len > current_cap {
                 // Рост буфера. Копируем старое + пишем новое.
@@ -3733,12 +3859,33 @@ impl GatedAttentionLayer {
             }
 
             let kv_len = self.kv_cache_len_batched[slot];
-            // Стадия-1 фикс WDDM-коллапса (2026-08-22): заполняем persistent
-            // f16-scratch малыми чанками и отдаём FA2 zero-copy view вместо
-            // свежих крупных аллокаций каждый шаг. На высокой занятости карты
-            // те попадали в shared memory → PCIe-трафик → 12x деградация decode.
+            // Источники k/v в порядке приоритета (значения идентичны):
+            // P1 зеркало (инкрементальный top-up) → Stage-1 shared scratch
+            // (полный fill чанками) → прямая деквантация f16_prefix.
+            // До P1 при 97%+ занятости VRAM транзиенты попадали в WDDM
+            // shared memory → PCIe каждый шаг → коллапс ×12.
             #[cfg(feature = "cuda")]
-            let kv_from_scratch: Option<(Tensor, Tensor)> = if device.is_cuda() {
+            let mut k_opt: Option<Tensor> = None;
+            #[cfg(feature = "cuda")]
+            let mut v_opt: Option<Tensor> = None;
+            #[cfg(not(feature = "cuda"))]
+            let mut k_opt: Option<Tensor> = None;
+            #[cfg(not(feature = "cuda"))]
+            let mut v_opt: Option<Tensor> = None;
+            #[cfg(feature = "cuda")]
+            if device.is_cuda() && kv_len > 0 {
+                if let Some((mk, mv)) =
+                    self.mirror_prefix(slot, kv_len, &device, budget)?
+                {
+                    k_opt = Some(mk);
+                    v_opt = Some(mv);
+                }
+            }
+            #[cfg(feature = "cuda")]
+            if k_opt.is_none() && device.is_cuda() && kv_len > 0 {
+                // Стадия-1: общий scratch — полный fill чанками по 4096.
+                const CHUNK: usize = 4096;
+                let row_elems = self.n_kv_head * self.head_dim;
                 if scratch.is_none() {
                     let cap = std::env::var("QWEN36_KV_SCRATCH_TOKENS")
                         .ok()
@@ -3746,7 +3893,7 @@ impl GatedAttentionLayer {
                         .unwrap_or(32768)
                         .min(self.attn_window);
                     if cap > 0 {
-                        let n = cap * self.n_kv_head * self.head_dim;
+                        let n = cap * row_elems;
                         eprintln!(
                             "[kv] shared f16 scratch: {cap} tokens ({:.0} MiB x2)",
                             n as f32 * 2.0 / 1024.0 / 1024.0
@@ -3757,13 +3904,8 @@ impl GatedAttentionLayer {
                         ));
                     }
                 }
-                match scratch.as_ref() {
-                    Some((sk, sv))
-                        if kv_len > 0
-                            && kv_len <= sk.elem_count() / (self.n_kv_head * self.head_dim) =>
-                    {
-                        const CHUNK: usize = 4096;
-                        let row_elems = self.n_kv_head * self.head_dim;
+                if let Some((sk, sv)) = scratch.as_ref() {
+                    if kv_len <= sk.elem_count() / row_elems {
                         let cache = self.kv_cache_batched[slot].as_ref().unwrap();
                         let mut off = 0usize;
                         while off < kv_len {
@@ -3773,30 +3915,23 @@ impl GatedAttentionLayer {
                             sv.slice_set(&vt.flatten_all()?, 0, off * row_elems)?;
                             off += cs;
                         }
-                        let k_view = sk
-                            .narrow(0, 0, kv_len * row_elems)?
-                            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
-                        let v_view = sv
-                            .narrow(0, 0, kv_len * row_elems)?
-                            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
-                        Some((k_view, v_view))
+                        k_opt = Some(
+                            sk.narrow(0, 0, kv_len * row_elems)?
+                                .reshape((1, kv_len, self.n_kv_head, self.head_dim))?,
+                        );
+                        v_opt = Some(
+                            sv.narrow(0, 0, kv_len * row_elems)?
+                                .reshape((1, kv_len, self.n_kv_head, self.head_dim))?,
+                        );
                     }
-                    _ => None,
                 }
-            } else {
-                None
-            };
-            #[cfg(not(feature = "cuda"))]
-            let kv_from_scratch: Option<(Tensor, Tensor)> = None;
-
-            let (k, v) = match kv_from_scratch {
-                Some(kv) => kv,
-                None => {
-                    self.kv_cache_batched[slot]
-                        .as_ref()
-                        .unwrap()
-                        .f16_prefix(kv_len)?
-                }
+            }
+            let (k, v) = match (k_opt, v_opt) {
+                (Some(k), Some(v)) => (k, v),
+                _ => self.kv_cache_batched[slot]
+                    .as_ref()
+                    .unwrap()
+                    .f16_prefix(kv_len)?,
             };
 
             // SDPA (seq_len=1, decode path). k/v — head-last [1, kv, n_kv, hd].
@@ -4165,6 +4300,7 @@ impl HybridBlock {
         rope_positions: &[usize],
         slots: &[u32],
         scratch: &mut Option<(Tensor, Tensor)>,
+        budget: &std::sync::atomic::AtomicI64,
     ) -> Result<Tensor> {
         // Pre-norm → layer → residual (batched norm).
         let residual = x;
@@ -4178,6 +4314,7 @@ impl HybridBlock {
                 rope_positions,
                 slots,
                 scratch,
+                budget,
             )?,
         };
         let x = (layer_out + residual)?;
@@ -4246,6 +4383,9 @@ pub struct ModelWeights {
     /// первом batched decode, пока dedicated VRAM свободна. Плоский layout
     /// [cap*n_kv*hd] → view [1,len,n_kv,hd] без копии.
     f16_scratch: Option<(Tensor, Tensor)>,
+    /// Общий бюджет f16-зеркал (элементы, negative = перерасход). Arc — чтобы
+    /// отдавать &AtomicI64 внутрь блоков поверх &mut self.
+    kv_mirror_budget: std::sync::Arc<std::sync::atomic::AtomicI64>,
 
     norm: RmsNorm,
     output: QMatMul,
@@ -5582,6 +5722,7 @@ impl ModelWeights {
                     use_q8_f16_kv_cache,
                     kv_cache_len_batched: vec![0; decode_capacity() as usize],
                     kv_cache_cap_batched: 0,
+                    kv_mirror: (0..decode_capacity() as usize).map(|_| None).collect(),
                     #[cfg(feature = "cuda")]
                     paged_pool: None,
                 })
@@ -5639,6 +5780,15 @@ impl ModelWeights {
             tok_embeddings_cuda,
             blocks,
             f16_scratch: None,
+            kv_mirror_budget: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+                std::env::var("QWEN36_KV_MIRROR_MIB")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(640)
+                    * 1024
+                    * 1024
+                    / 2, // элементы f16
+            )),
             norm,
             output,
             context_length,
@@ -5964,7 +6114,62 @@ impl ModelWeights {
                 }
             }
         }
+        // Seed перезаливает q8-кэш слота целиком → f16-зеркало невалидно,
+        // первый decode сделает полный top-up.
+        self.invalidate_mirror(slot);
         Ok(())
+    }
+
+    /// Упреждающее выделение f16-зеркала слота 0 на всех attention-слоях.
+    /// Вызывается сразу после загрузки модели, пока dedicated VRAM свободна:
+    /// страницы закрепляются в дискретке до того, как префилл выест запас
+    /// (урок 2026-08-23: ленивое выделение после префилла попадало в shared).
+    pub fn prepare_kv_mirror(&mut self, cap_tokens: usize) {
+        let budget = std::sync::Arc::clone(&self.kv_mirror_budget);
+        #[cfg(feature = "cuda")]
+        let budget = budget;
+        #[cfg(feature = "cuda")]
+        for block in &mut self.blocks {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                let dev = a.cos.device();
+                if !dev.is_cuda() || a.kv_mirror.is_empty() || a.kv_mirror[0].is_some() {
+                    continue;
+                }
+                let cap = cap_tokens.min(a.attn_window);
+                if cap == 0 {
+                    continue;
+                }
+                let row = a.n_kv_head * a.head_dim;
+                for m in a.kv_mirror.iter_mut() {
+                    let cost = cap as i64 * row as i64;
+                    if budget.fetch_sub(cost, std::sync::atomic::Ordering::SeqCst) < cost {
+                        budget.fetch_add(cost, std::sync::atomic::Ordering::SeqCst);
+                        break; // бюджет исчерпан — остальные слоты на fallback
+                    }
+                    match (
+                        Tensor::zeros(cap * row, DType::F16, dev),
+                        Tensor::zeros(cap * row, DType::F16, dev),
+                    ) {
+                        (Ok(k), Ok(v)) => {
+                            *m = Some(KvMirror { k, v, valid_tokens: 0 });
+                        }
+                        _ => {
+                            budget.fetch_add(cost, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = cap_tokens; // non-cuda сборка
+    }
+
+    pub(crate) fn invalidate_mirror(&mut self, slot: usize) {
+        for block in &mut self.blocks {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                a.invalidate_mirror(slot);
+            }
+        }
     }
 
     /// Checkpoint one batched slot at committed boundary. DeltaNet CUDA/Metal
@@ -6659,8 +6864,9 @@ impl ModelWeights {
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
         // Shared f16 scratch вынимается на время прохода (borrow), потом
-        // возвращается в self.
+        // возвращается в self. Бюджет зеркал — Arc, живёт в self.
         let mut scratch = self.f16_scratch.take();
+        let mirror_budget = std::sync::Arc::clone(&self.kv_mirror_budget);
         let trace = crate::scheduler::trace_on();
         let mut t_delta = std::time::Duration::ZERO;
         let mut t_attn = std::time::Duration::ZERO;
@@ -6678,6 +6884,7 @@ impl ModelWeights {
                     rope_positions,
                     slots,
                     &mut scratch,
+                    &mirror_budget,
                 )?;
                 let el = t0.elapsed();
                 if is_delta {
@@ -6698,6 +6905,7 @@ impl ModelWeights {
                     rope_positions,
                     slots,
                     &mut scratch,
+                    &mirror_budget,
                 )?;
             }
         }

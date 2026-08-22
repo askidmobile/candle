@@ -257,7 +257,7 @@ impl Qwen35BatchAdapter {
             }
         };
 
-        Ok(Self {
+        let mut a = Self {
             model,
             device,
             profile,
@@ -279,7 +279,20 @@ impl Qwen35BatchAdapter {
             rope_deltas: vec![0; num_slots],
             eos,
             vocab,
-        })
+        };
+        let mut a = a; // keep mut for prepare below
+        // Упреждающее f16-зеркало слота 0 (фикс WDDM-коллапса 2026-08-23):
+        // выделяем сразу после загрузки весов, пока dedicated VRAM свободна,
+        // иначе страницы уходят в WDDM shared и декод падает на PCIe.
+        if let Some(tokens) = std::env::var("QWEN36_KV_MIRROR_PREPARE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if tokens > 0 {
+                a.model.prepare_kv_mirror(tokens.min(a.model.context_length));
+            }
+        }
+        Ok(a)
     }
 
     /// Загрузить с явным vocab (из GGUF metadata `tokenizer.ggml.tokens` len).
