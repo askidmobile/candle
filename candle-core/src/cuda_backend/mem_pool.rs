@@ -20,6 +20,19 @@ use cudarc::driver::sys;
 /// После этого пул не отдаёт страницы ОС на sync-точках → аллокации
 /// переиспользуют уже замапленную память без page-map стоимости.
 pub fn retain_default_mempool(dev: &CudaDevice) -> Result<()> {
+    set_release_threshold(dev, u64::MAX)
+}
+
+/// Ограниченный release threshold (байты): пул удерживает аллокации только до
+/// указанного суммарного объёма; транзиенты сверх порога освобождаются на
+/// sync-точках. Компромисс между «retain всё» (пул копит пиковые префилл
+/// транзиенты и добивает карту — измеренный 7x регресс при 98% занятости)
+/// и «threshold=0» (каждая decode-аллокация заново мапит страницы).
+pub fn set_release_threshold_mib(dev: &CudaDevice, mib: u64) -> Result<()> {
+    set_release_threshold(dev, mib.saturating_mul(1024 * 1024))
+}
+
+fn set_release_threshold(dev: &CudaDevice, bytes: u64) -> Result<()> {
     let cu_dev = dev.context.cu_device();
     unsafe {
         let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
@@ -27,7 +40,7 @@ pub fn retain_default_mempool(dev: &CudaDevice) -> Result<()> {
         if res != sys::CUresult::CUDA_SUCCESS {
             crate::bail!("cuDeviceGetDefaultMemPool failed: {res:?}");
         }
-        let mut threshold: u64 = u64::MAX;
+        let mut threshold: u64 = bytes;
         let res = sys::cuMemPoolSetAttribute(
             pool,
             sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,

@@ -1,4 +1,4 @@
-# Project Rules — candle-fork-qwen35-batch
+# Project Rules — candle-fork
 
 Auto-applied by Warp every conversation. Operational lessons + project conventions. Update when a mistake repeats or a new hard-won fact is learned.
 
@@ -8,13 +8,14 @@ Auto-applied by Warp every conversation. Operational lessons + project conventio
 - `candle-core/` — quantized CUDA/Metal/CPU dispatch. IQ quant work lives here (`src/quantized/`).
 - `candle-kernels/src/quantized.cu` — CUDA dequantize kernels + lookup tables.
 - `qwen35-batch/` — continuous batching prototype + real GGUF model (`src/real/model_weights.rs`).
-- `qwen36-server/` (on yttri-win only, `D:\Projects\yttri-build\qwen36-server`) — inference server binary.
+- `qwen36-server` lives in the separate project repo (`Qwen3.6 27B`, path-depends on this fork).
 - Remote (fork): `origin https://github.com/askidmobile/candle.git`. Upstream: `huggingface/candle`.
 - Push flow: local commit → `git push origin feat/qwen35-batching` → `git pull` on yttri-win.
 
 ## yttri-win (Windows build/test machine) — SSH + shell
 
 - SSH host alias: `yttri-win` (192.168.2.89, User Askid). See `~/.ssh/config`.
+- **Workspace ownership override.** Never read, write, build, launch, or store results under `D:\Projects\yttri-build`; another agent owns it. Use only `D:\Projects\yttri-inference`. This overrides historical paths below.
 - **Default shell is PowerShell.** `&&` is NOT valid in PowerShell — errors with «'&&' is not recognized». Always wrap commands in `cmd /c "..."`.
 - **Nested quotes break PowerShell parsing of `(x86)` paths.** `C:\Program Files (x86)\...` inside a PS `-Command` string triggers `ObjectNotFound: (x86:String)`. The `(x86)` parenthesised token gets parsed as a command. Workarounds:
   - For `Test-Path`/file checks: use `powershell -NoProfile -Command "Test-Path 'C:\Program Files (x86)\...\file.bat'"` (single quotes inside double-quoted `-Command`).

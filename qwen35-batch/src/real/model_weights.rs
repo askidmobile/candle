@@ -2852,6 +2852,27 @@ impl BatchedKvCache {
             )),
         }
     }
+
+    /// Малый contiguous f16-чанк [1, cs, n_kv, hd] префикса (для заполнения
+    /// persistent scratch без крупных транзиентов; см. forward_attn_decode_batch).
+    fn prefix_chunk_f16(&self, off: usize, cs: usize) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Q8(c) => Ok((
+                q8_dequantize_rows(
+                    &c.k_q.narrow(1, off, cs)?.contiguous()?,
+                    &c.k_s.narrow(1, off, cs)?.contiguous()?,
+                )?,
+                q8_dequantize_rows(
+                    &c.v_q.narrow(1, off, cs)?.contiguous()?,
+                    &c.v_s.narrow(1, off, cs)?.contiguous()?,
+                )?,
+            )),
+            Self::F16(c) => Ok((
+                c.k.narrow(1, off, cs)?.contiguous()?,
+                c.v.narrow(1, off, cs)?.contiguous()?,
+            )),
+        }
+    }
 }
 
 /// Квантование per-row (последняя ось = head_dim): scale = amax/127.
@@ -2931,6 +2952,7 @@ pub(crate) struct GatedAttentionLayer {
     /// Pre-allocated ёмкость KV-кэша для batched path (== attn_window cap).
     /// Одно значение для всех слотов.
     kv_cache_cap_batched: usize,
+
     /// Paged KV pool для CUDA-graph decode (опция, env QWEN36_CUDA_GRAPHS=1).
     #[cfg(feature = "cuda")]
     paged_pool: Option<crate::real::paged_kv_cuda::PagedKvPool>,
@@ -3541,6 +3563,7 @@ impl GatedAttentionLayer {
         cache_positions: &[usize],
         rope_positions: &[usize],
         slots: &[u32],
+        scratch: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         if seq_len != 1
@@ -3551,7 +3574,6 @@ impl GatedAttentionLayer {
             candle_core::bail!("invalid batched decode dimensions");
         }
         let device = x.device().clone();
-
         // 1. Batched projections (веса один раз на B слотов).
         #[cfg(target_os = "macos")]
         let qg = dispatch_q4k_matmul(&self.attention_wq, self.attention_wq_opt.as_ref(), x)?;
@@ -3711,10 +3733,71 @@ impl GatedAttentionLayer {
             }
 
             let kv_len = self.kv_cache_len_batched[slot];
-            let (k, v) = self.kv_cache_batched[slot]
-                .as_ref()
-                .unwrap()
-                .f16_prefix(kv_len)?;
+            // Стадия-1 фикс WDDM-коллапса (2026-08-22): заполняем persistent
+            // f16-scratch малыми чанками и отдаём FA2 zero-copy view вместо
+            // свежих крупных аллокаций каждый шаг. На высокой занятости карты
+            // те попадали в shared memory → PCIe-трафик → 12x деградация decode.
+            #[cfg(feature = "cuda")]
+            let kv_from_scratch: Option<(Tensor, Tensor)> = if device.is_cuda() {
+                if scratch.is_none() {
+                    let cap = std::env::var("QWEN36_KV_SCRATCH_TOKENS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(32768)
+                        .min(self.attn_window);
+                    if cap > 0 {
+                        let n = cap * self.n_kv_head * self.head_dim;
+                        eprintln!(
+                            "[kv] shared f16 scratch: {cap} tokens ({:.0} MiB x2)",
+                            n as f32 * 2.0 / 1024.0 / 1024.0
+                        );
+                        *scratch = Some((
+                            Tensor::zeros(n, DType::F16, &device)?,
+                            Tensor::zeros(n, DType::F16, &device)?,
+                        ));
+                    }
+                }
+                match scratch.as_ref() {
+                    Some((sk, sv))
+                        if kv_len > 0
+                            && kv_len <= sk.elem_count() / (self.n_kv_head * self.head_dim) =>
+                    {
+                        const CHUNK: usize = 4096;
+                        let row_elems = self.n_kv_head * self.head_dim;
+                        let cache = self.kv_cache_batched[slot].as_ref().unwrap();
+                        let mut off = 0usize;
+                        while off < kv_len {
+                            let cs = CHUNK.min(kv_len - off);
+                            let (kt, vt) = cache.prefix_chunk_f16(off, cs)?;
+                            sk.slice_set(&kt.flatten_all()?, 0, off * row_elems)?;
+                            sv.slice_set(&vt.flatten_all()?, 0, off * row_elems)?;
+                            off += cs;
+                        }
+                        let k_view = sk
+                            .narrow(0, 0, kv_len * row_elems)?
+                            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
+                        let v_view = sv
+                            .narrow(0, 0, kv_len * row_elems)?
+                            .reshape((1, kv_len, self.n_kv_head, self.head_dim))?;
+                        Some((k_view, v_view))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let kv_from_scratch: Option<(Tensor, Tensor)> = None;
+
+            let (k, v) = match kv_from_scratch {
+                Some(kv) => kv,
+                None => {
+                    self.kv_cache_batched[slot]
+                        .as_ref()
+                        .unwrap()
+                        .f16_prefix(kv_len)?
+                }
+            };
 
             // SDPA (seq_len=1, decode path). k/v — head-last [1, kv, n_kv, hd].
             let y = if q.device().is_metal() || q.device().is_cpu() {
@@ -4081,6 +4164,7 @@ impl HybridBlock {
         cache_positions: &[usize],
         rope_positions: &[usize],
         slots: &[u32],
+        scratch: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         // Pre-norm → layer → residual (batched norm).
         let residual = x;
@@ -4093,6 +4177,7 @@ impl HybridBlock {
                 cache_positions,
                 rope_positions,
                 slots,
+                scratch,
             )?,
         };
         let x = (layer_out + residual)?;
@@ -4156,6 +4241,12 @@ pub struct ModelWeights {
     #[cfg(feature = "cuda")]
     tok_embeddings_cuda: Option<QMatMul>,
     pub(crate) blocks: Vec<HybridBlock>,
+    /// Shared persistent flat f16 scratch для decode-префикса attention-слоёв
+    /// (фикс WDDM-коллапса 2026-08-22): один на модель, выделяется лениво при
+    /// первом batched decode, пока dedicated VRAM свободна. Плоский layout
+    /// [cap*n_kv*hd] → view [1,len,n_kv,hd] без копии.
+    f16_scratch: Option<(Tensor, Tensor)>,
+
     norm: RmsNorm,
     output: QMatMul,
     /// Максимальная длина контекста
@@ -5547,6 +5638,7 @@ impl ModelWeights {
             #[cfg(feature = "cuda")]
             tok_embeddings_cuda,
             blocks,
+            f16_scratch: None,
             norm,
             output,
             context_length,
@@ -6566,6 +6658,9 @@ impl ModelWeights {
         let mut layer_in = emb_ready.reshape((b_sz, 1usize, self.hidden_size()))?; // [b_sz, 1, n_embd]
 
         // Batched layers (DeltaNet decode_batch + Attention decode_batch).
+        // Shared f16 scratch вынимается на время прохода (borrow), потом
+        // возвращается в self.
+        let mut scratch = self.f16_scratch.take();
         let trace = crate::scheduler::trace_on();
         let mut t_delta = std::time::Duration::ZERO;
         let mut t_attn = std::time::Duration::ZERO;
@@ -6582,6 +6677,7 @@ impl ModelWeights {
                     cache_positions,
                     rope_positions,
                     slots,
+                    &mut scratch,
                 )?;
                 let el = t0.elapsed();
                 if is_delta {
@@ -6601,12 +6697,14 @@ impl ModelWeights {
                     cache_positions,
                     rope_positions,
                     slots,
+                    &mut scratch,
                 )?;
             }
         }
         if trace {
             eprintln!("[fdb] step blocks: delta={t_delta:?} attn={t_attn:?}");
         }
+        self.f16_scratch = scratch;
 
         // MTP consumes target hidden after output norm, matching h_nextn oracle.
         let hidden = self.norm.forward(&layer_in.i((.., 0, ..))?)?;
