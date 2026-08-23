@@ -935,7 +935,17 @@ fn indexed_moe_forward_dispatch(
         k_padded as i32,
         input_dim1 as i32
     );
+    let t0 = std::time::Instant::now();
     unsafe { builder.launch(cfg) }.w()?;
+    let trace_mmq = std::env::var_os("QWEN36_TRACE_MMQ").is_some();
+    if trace_mmq {
+        let _ = dev.cuda_stream().synchronize();
+        eprintln!(
+            "[moe] dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
+            w_dtype, n, batch, topk, n, k, batch, topk,
+            t0.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     let mut out_shape = in_shape.dims().to_vec();
     out_shape.pop();
@@ -1022,7 +1032,17 @@ impl QCudaStorage {
         barg!(b, topk as i32);
         barg!(b, k_padded as i32);
         barg!(b, input_dim1 as i32);
+        let t0 = std::time::Instant::now();
         unsafe { b.launch(cfg) }.w()?;
+        let trace_mmq = std::env::var_os("QWEN36_TRACE_MMQ").is_some();
+        if trace_mmq {
+            let _ = dev.cuda_stream().synchronize();
+            eprintln!(
+                "[moe2] dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
+                dtype, n, batch, topk, n, k, batch, topk,
+                t0.elapsed().as_secs_f64() * 1e3,
+            );
+        }
 
         let shape: crate::Shape = (batch, topk, n).into();
         Ok((
@@ -1534,9 +1554,23 @@ impl QCudaStorage {
             unsafe { mb.launch(cfg) }.w()?;
         }
 
+        if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+            eprintln!(
+                "[mmq] dtype={:?} m={} n={} k={} mmq_x={} nbs={} tiles={}x{}",
+                self.dtype, m_total, n, k, mmq_x, nbs, nty, ntx,
+            );
+        }
+        let t_mmq = std::time::Instant::now();
+        let trace_mmq = std::env::var_os("QWEN36_TRACE_MMQ").is_some();
+        if trace_mmq {
+            let _ = dev.cuda_stream().synchronize();
+        }
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(n);
+        if trace_mmq {
+            eprintln!("[mmq] gpu={:.1}ms", t_mmq.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(Some((
             CudaStorage::wrap_cuda_slice(dst, dev.clone()),
             out_shape.into(),
