@@ -235,6 +235,11 @@ impl<M: BatchModel> BatchScheduler<M> {
     /// ПОСЛЕ model+push_token для каждого эмитнутого токена; true → слот
     /// переводится в Finished (сгенерированный токен сохраняется в generated —
     /// caller решает, эмитить ли его текст). По умолчанию (`step`) — как раньше.
+    /// Снапшот статистики для внешней инструментации (P0.5b).
+    pub fn stats_snapshot(&self) -> SchedulerStats {
+        self.stats.clone()
+    }
+
     pub fn step_with(
         &mut self,
         should_stop: &mut dyn FnMut(usize, &[u32]) -> bool,

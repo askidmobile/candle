@@ -6164,6 +6164,21 @@ impl ModelWeights {
         let _ = cap_tokens; // non-cuda сборка
     }
 
+    /// Освободить single-slot F16 KV-кэш attention-слоёв (фикс обрыва
+    /// декода на длинном контексте 2026-08-23). Prefill пишет F16-кэш
+    /// [1, n_kv, cap, hd]; после seed_slot_batched decode идёт через
+    /// batched q8-кэш, а F16-оригинал (~480 MiB @24K на 35B-A3B) оставался
+    /// в VRAM навсегда → 97%+ занятости → WDDM shared → коллапс декода.
+    /// Откат: QWEN36_KEEP_SINGLE_KV=1.
+    pub fn clear_single_slot_kv(&mut self) {
+        for block in &mut self.blocks {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                a.kv_cache = None;
+                a.kv_cache_len = 0;
+            }
+        }
+    }
+
     pub(crate) fn invalidate_mirror(&mut self, slot: usize) {
         for block in &mut self.blocks {
             if let HybridLayerType::Attention(a) = &mut block.layer {

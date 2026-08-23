@@ -513,6 +513,8 @@ impl BatchModel for Qwen35BatchAdapter {
 
     fn prefill_chunk(&mut self, chunk: &PrefillChunk) -> Result<Vec<f32>> {
         let sidx = chunk.slot_idx;
+        let pf_t0 = std::time::Instant::now();
+        let mut pf_restore_ms = 0f64;
         if sidx >= self.slot_snaps.len() || chunk.tokens.is_empty() {
             return Err(anyhow!("prefill slot is out of range or chunk is empty"));
         }
@@ -539,11 +541,13 @@ impl BatchModel for Qwen35BatchAdapter {
             ));
         }
 
+        let pf_restore = pf_t0.elapsed();
         let ids = Tensor::from_vec(
             chunk.tokens.clone(),
             (1usize, chunk.tokens.len()),
             &self.device,
         )?;
+        let pf_fwd0 = std::time::Instant::now();
         let (logits, mtp_inputs) = if let Some(media) = self.multimodal[sidx].as_mut() {
             let end = chunk
                 .start_pos
@@ -628,14 +632,18 @@ impl BatchModel for Qwen35BatchAdapter {
             )
             .map_err(|error| anyhow!("MTP prefill catch-up: {error}"))?;
         }
+        let pf_fwd = pf_fwd0.elapsed();
+        let pf_l0 = std::time::Instant::now();
         let logits_f32 = logits
             .squeeze(0)?
             .to_dtype(DType::F32)?
             .to_vec1()
             .map_err(|e| anyhow!("prefill logits to_vec1: {e}"))?;
+        let pf_logits = pf_l0.elapsed();
 
         // Сохранить snapshot state слота на позиции start_pos + tokens.len().
         let new_pos = chunk.start_pos + chunk.tokens.len();
+        let pf_s0 = std::time::Instant::now();
         let snap = self
             .model
             .snapshot_state(&self.device, new_pos)
@@ -654,10 +662,28 @@ impl BatchModel for Qwen35BatchAdapter {
                 )
                 .map_err(|error| anyhow!("prefill seed slot {sidx}: {error}"))?;
             self.slot_seeded[sidx] = true;
+            // Single-slot F16 KV больше не нужен (decode через batched q8):
+            // освобождаем ~480 MiB @24K, иначе карта уходит в 97%+ и декод
+            // падает в WDDM shared (обрыв 6K→12K, 2026-08-23).
+            if std::env::var("QWEN36_KEEP_SINGLE_KV").as_deref() != Ok("1") {
+                self.model.clear_single_slot_kv();
+            }
         } else {
             self.slot_seeded[sidx] = false;
         }
 
+        if crate::scheduler::trace_on() {
+            eprintln!(
+                "[pfa] chunk tok={} restore={:.1}ms fwd={}ms logits_d2h={:.1}ms snap+seed={:.1}ms total={:.1}ms",
+                chunk.tokens.len(),
+                if chunk.reset_first { 0.0 } else { pf_restore.as_secs_f64() * 1e3 },
+                pf_fwd.as_secs_f64() * 1e3,
+                pf_logits.as_secs_f64() * 1e3,
+                pf_s0.elapsed().as_secs_f64() * 1e3,
+                pf_t0.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        let _ = pf_restore_ms;
         Ok(logits_f32)
     }
 
