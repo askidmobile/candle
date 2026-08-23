@@ -422,12 +422,18 @@ pub fn dispatch_delta_rule_prefill(
 
     // P3: рекуррентный delta rule, state в регистрах (warp-per-column).
     // grid = (n_v, hd/4), block = (32, 4).
+    // FR-002: tile-size sweep через QWEN36_DELTA_WARPS (1/2/4/8, default 4).
+    let delta_warps: u32 = std::env::var("QWEN36_DELTA_WARPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &u32| matches!(v, 1 | 2 | 4 | 8))
+        .unwrap_or(2); // FR-002 sweep: warps=2 optimal (1.8ms vs 2.8ms for warps=1)
     let t_p3_start = sync_t(dev);
     {
         let func = dev.get_or_load_func("delta_rule_prefill", &candle_kernels::DELTA_RULE)?;
         let cfg = LaunchConfig {
-            grid_dim: (n_v as u32, (hvd / 4) as u32, 1),
-            block_dim: (32, 4, 1),
+            grid_dim: (n_v as u32, (hvd / delta_warps as usize) as u32, 1),
+            block_dim: (32, delta_warps, 1),
             shared_mem_bytes: 0,
         };
         let mut b = func.builder();
