@@ -6741,6 +6741,128 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Grouped indexed MoE (q8_1): токены батчатся по экспертам через shared
+// memory, веса читаются ОДИН РАЗ на expert-row для всех токенов.
+// grid=(n, n_experts) вместо grid=(n, batch, topk) — в ~batch× раз
+// меньше блоков, выше occupancy.
+// FR-001: prefill optimization (2026-08-23 spec).
+// ═══════════════════════════════════════════════════════════════
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_grouped(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,   // q8_1
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    constexpr int route_tile = 256;
+    constexpr int task_group = 8;
+    const int row = blockIdx.x;
+    const int expert_id = blockIdx.y;
+    const int total_tasks = batch * topk;
+    if (row >= n) return;
+
+    const int blocks_per_row_x = k / qk;
+    const size_t weight_expert_stride = (size_t)(n * k) / qk * sizeof(block_q_t);
+    const size_t input_task_stride = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const size_t output_task_stride = n;
+
+    const block_q_t * w = (const block_q_t *)((const char *)all_weights
+        + expert_id * weight_expert_stride + row * blocks_per_row_x * sizeof(block_q_t));
+
+    __shared__ int tasks[route_tile];
+    __shared__ int task_count;
+    __shared__ float warp_sums[task_group][4];
+
+    constexpr int nwarps = 4;
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+    const int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+    for (int base = 0; base < total_tasks; base += route_tile) {
+        if (threadIdx.x == 0 && threadIdx.y == 0) task_count = 0;
+        __syncthreads();
+
+        for (int task = base + tid;
+             task < min(base + route_tile, total_tasks);
+             task += nwarps * WARP_SIZE) {
+            if (indices[task] == (unsigned int)expert_id) {
+                tasks[atomicAdd(&task_count, 1)] = task;
+            }
+        }
+        __syncthreads();
+
+        for (int group_start = 0; group_start < task_count; group_start += task_group) {
+            float sums[task_group] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+            for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+                const int kby = kbx * (qk / QK8_1);
+                const int kqs = vdr * (tid % (qi / vdr));
+#pragma unroll
+                for (int m = 0; m < task_group; ++m) {
+                    if (group_start + m < task_count) {
+                        const int task = tasks[group_start + m];
+                        const int input_idx = (input_dim1 == 1) ? task / topk : task;
+                        const block_q8_1 * x = (const block_q8_1 *)
+                            ((const char *)all_inputs + (size_t)input_idx * input_task_stride);
+                        sums[m] += vec_dot_q_cuda(&w[kbx], &x[kby], kqs);
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int m = 0; m < task_group; ++m) sums[m] = warp_reduce_sum(sums[m]);
+
+            if (threadIdx.x == 0) {
+#pragma unroll
+                for (int m = 0; m < task_group; ++m) {
+                    warp_sums[m][threadIdx.y] = sums[m];
+                }
+            }
+            __syncthreads();
+
+            if (threadIdx.y == 0 && threadIdx.x < WARP_SIZE) {
+#pragma unroll
+                for (int m = 0; m < task_group; ++m) {
+                    float sum = threadIdx.x < nwarps ? warp_sums[m][threadIdx.x] : 0.f;
+                    sum = warp_reduce_sum(sum);
+                    if (threadIdx.x == 0 && group_start + m < task_count) {
+                        const int task = tasks[group_start + m];
+                        all_outputs[(size_t)task * output_task_stride + row] = sum;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+#define IQ_MOE_Q8_1_GROUPED_EXTERN(name, qk_, qi_, BLOCK_, VDR_, VDOT_) \
+extern "C" __global__ void name##_grouped( \
+    const void * __restrict__ all_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    float * __restrict__ all_outputs, \
+    const int n, const int k, const int batch, const int topk, \
+    const int k_padded, const int input_dim1) { \
+    indexed_moe_forward_grouped<qk_, qi_, BLOCK_, VDR_, VDOT_> \
+        (all_weights, all_inputs, indices, all_outputs, \
+         n, k, batch, topk, k_padded, input_dim1); \
+}
+
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq2_xxs_q8_1, QK_K, QI2_XXS, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1)
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq2_xs_q8_1, QK_K, QI2_XS, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ, vec_dot_iq2_xs_q8_1)
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq2_s_q8_1, QK_K, QI2_S, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1)
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq3_xxs_q8_1, QK_K, QI3_XXS, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1)
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq3_s_q8_1, QK_K, QI3_S, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1)
+IQ_MOE_Q8_1_GROUPED_EXTERN(indexed_moe_forward_iq4_xs_q8_1, QK_K, QI4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
+
+// ═══════════════════════════════════════════════════════════════
 // Dual indexed MoE: ДВЕ проекции (gate+up) одним запуском на один вход.
 // Вход квантуется один раз, оба набора весов читаются в одном ядре —
 // экономия: 1 launch + 1 q8_1-quantize на MoE блок на шаг.

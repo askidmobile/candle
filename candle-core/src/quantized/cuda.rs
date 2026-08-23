@@ -897,27 +897,59 @@ fn indexed_moe_forward_dispatch(
     let outsize = batch * topk * n;
     let out = unsafe { dev.alloc::<f32>(outsize)? };
 
-    let kernel_name = match w_dtype {
-        GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_q8_1",
-        GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_q8_1",
-        GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_q8_1",
-        GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1",
-        GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_q8_1",
-        GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_q8_1",
-        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
-        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
-        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
-        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
-        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
-        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
-        _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
+    let use_grouped = batch > 1
+        && std::env::var_os("QWEN36_ENABLE_MOE_GROUPED").is_some()  // OFF by default — measured slower (2026-08-24)
+        && matches!(
+            w_dtype,
+            GgmlDType::IQ2XXS
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ4XS
+        );
+    let kernel_name = if use_grouped {
+        match w_dtype {
+            GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_q8_1_grouped",
+            GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_q8_1_grouped",
+            GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_q8_1_grouped",
+            GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1_grouped",
+            GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_q8_1_grouped",
+            GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_q8_1_grouped",
+            _ => unreachable!(),
+        }
+    } else {
+        match w_dtype {
+            GgmlDType::IQ2XXS => "indexed_moe_forward_iq2_xxs_q8_1",
+            GgmlDType::IQ2XS => "indexed_moe_forward_iq2_xs_q8_1",
+            GgmlDType::IQ2S => "indexed_moe_forward_iq2_s_q8_1",
+            GgmlDType::IQ3XXS => "indexed_moe_forward_iq3_xxs_q8_1",
+            GgmlDType::IQ3S => "indexed_moe_forward_iq3_s_q8_1",
+            GgmlDType::IQ4XS => "indexed_moe_forward_iq4_xs_q8_1",
+            GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
+            GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
+            GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
+            GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
+            GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
+            GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+            _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
+        }
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
-    let (nblocks, nwarps) = (n as u32, 4);
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (nblocks, batch as u32, topk as u32),
-        block_dim: (WARP_SIZE as u32, nwarps, 1),
-        shared_mem_bytes: 0,
+    // Grouped: grid=(n, n_experts). Non-grouped: grid=(n, batch, topk).
+    let cfg = if use_grouped {
+        let n_experts = w_shape.dims3()?.0;
+        cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, n_experts as u32, 1),
+            block_dim: (WARP_SIZE as u32, 4, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        cudarc::driver::LaunchConfig {
+            grid_dim: (n as u32, batch as u32, topk as u32),
+            block_dim: (WARP_SIZE as u32, 4, 1),
+            shared_mem_bytes: 0,
+        }
     };
 
     let mut builder = func.builder();
@@ -941,7 +973,8 @@ fn indexed_moe_forward_dispatch(
     if trace_mmq {
         let _ = dev.cuda_stream().synchronize();
         eprintln!(
-            "[moe] dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
+            "[moe] {} dtype={:?} grid=({},{},{}) n={} k={} batch={} topk={} gpu={:.1}ms",
+            if use_grouped { "GROUPED" } else { "BASIC" },
             w_dtype, n, batch, topk, n, k, batch, topk,
             t0.elapsed().as_secs_f64() * 1e3,
         );
