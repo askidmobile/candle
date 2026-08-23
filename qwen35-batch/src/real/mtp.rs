@@ -244,15 +244,19 @@ impl Qwen35Mtp {
         if self.transactions[slot].is_none() {
             candle_core::bail!("MTP draft requires active transaction");
         }
-        let mut token = first_token;
+        // P0.5b: черновой контур полностью на GPU — id предыдущего шага
+        // остаётся CUDA-тензором (H2D один раз в начале, D2H один раз в конце).
+        // Раньше каждый шаг делал D2H-sync (argmax→u32) + H2D (from_vec),
+        // дважды осушая pipeline на итерацию: ~3 мс × width на раунд.
+        let mut token_t =
+            Tensor::from_vec(vec![first_token], (1, 1), &self.device)?;
         let mut hidden = self.slots[slot]
             .pending_target_hidden
             .clone()
             .ok_or_else(|| candle_core::Error::Msg("MTP target hidden is not initialized".into()))?;
-        let mut out = Vec::with_capacity(width);
+        let mut tokens_gpu: Vec<Tensor> = Vec::with_capacity(width);
         for offset in 0..width {
-            let ids = Tensor::from_vec(vec![token], (1, 1), &self.device)?;
-            let embedding = target.embed_tokens(&ids, &self.device)?;
+            let embedding = target.embed_tokens(&token_t, &self.device)?;
             let mtp_hidden = self.forward_rows(
                 slot,
                 &embedding,
@@ -263,16 +267,26 @@ impl Qwen35Mtp {
             let pre_head = mtp_hidden.i((.., 0, ..))?;
             let normalized = self.head_norm.forward(&pre_head)?;
             let logits = self.shared_head.forward(&normalized)?;
-            // GPU argmax + D2H 4 байта вместо полных логитов (600КБ + host-scan
-            // на каждый драфт-шаг). Тай-брейк на равных максимумах может отличаться
-            // от host-argmax — на драфт это не влияет (target верифицирует).
-            token = if logits.device().is_cpu() {
-                argmax(&logits.to_dtype(DType::F32)?.to_vec2()?[0])
+            // Аргмакс на устройстве; тай-брейк на равных максимумах может
+            // отличаться от host-argmax — на драфт не влияет (верифицирует target).
+            if logits.device().is_cpu() {
+                let id = argmax(&logits.to_dtype(DType::F32)?.to_vec2()?[0]);
+                tokens_gpu.push(Tensor::from_vec(vec![id as u32], (1, 1), &self.device)?);
             } else {
-                logits.argmax(candle_core::D::Minus1)?.to_vec1::<u32>()?[0]
-            };
-            out.push(token);
+                tokens_gpu.push(
+                    logits
+                        .argmax(candle_core::D::Minus1)?
+                        .to_dtype(DType::U32)?
+                        .reshape((1, 1))?,
+                );
+            }
             hidden = pre_head;
+            token_t = tokens_gpu.last().unwrap().clone();
+        }
+        // Единственный D2H на весь draft.
+        let mut out = Vec::with_capacity(width);
+        for tg in &tokens_gpu {
+            out.push(tg.flatten_all()?.to_vec1::<u32>()?[0]);
         }
         Ok(out)
     }
