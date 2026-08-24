@@ -159,10 +159,17 @@ impl Qwen35BatchAdapter {
             let disabled = std::env::var("QWEN36_NO_MEMPOOL_RETAIN").as_deref() == Ok("1");
             if !disabled {
                 RETAIN_ONCE.call_once(|| {
-                    if let Err(e) =
-                        candle_core::cuda_backend::mem_pool::retain_default_mempool(cuda_dev)
-                    {
-                        log::warn!("[qwen35-batch] retain_default_mempool failed: {e}");
+                    // Ограниченный release threshold вместо u64::MAX:
+                    // retain=MAX держит пиковые префилл-транзиенты (до 1 GiB)
+                    // навсегда → VRAM 97%+ → WDDM spill → decode коллапс.
+                    // 512 MiBthreshold: decode-аллокации переиспользуют пул,
+                    // префилл-пики освобождаются на sync-точках.
+                    let thresh_mib = std::env::var("QWEN36_MEMPOOL_THRESHOLD_MIB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(256); // 256 MiB — баланс: decode reuse работает, префилл-пики >256 освобождаются
+                    if let Err(e) = candle_core::cuda_backend::mem_pool::set_release_threshold_mib(cuda_dev, thresh_mib) {
+                        log::warn!("[qwen35-batch] set_release_threshold_mib({thresh_mib}) failed: {e}");
                     }
                 });
             }
@@ -667,6 +674,13 @@ impl BatchModel for Qwen35BatchAdapter {
             // падает в WDDM shared (обрыв 6K→12K, 2026-08-23).
             if std::env::var("QWEN36_KEEP_SINGLE_KV").as_deref() != Ok("1") {
                 self.model.clear_single_slot_kv();
+            }
+            // Trim CUDA memory pool: prefill оставил пиковые F16/KV транзиенты
+            // в driver pool (release threshold=512 MiB). Trim возвращает ОС
+            // страницы сверх текущего usage → VRAM освобождается для decode.
+            #[cfg(feature = "cuda")]
+            if let Device::Cuda(c) = &self.device {
+                let _ = candle_core::cuda_backend::mem_pool::trim_default_mempool(c);
             }
         } else {
             self.slot_seeded[sidx] = false;
