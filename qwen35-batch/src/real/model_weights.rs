@@ -3809,7 +3809,7 @@ impl GatedAttentionLayer {
             let q = &q_slots[bidx];
             let row = &cache_rows[bidx];
             if self.kv_cache_batched[slot].is_none() {
-                let init_cap = self.attn_window; // Pre-alloc full ctx: eliminate reallocations + copy_prefix_to @24K (2026-08-24)
+                let init_cap = 512.min(self.attn_window); // Revert: pre-alloc 40960*5B*10attn*2slots = 8.4 GB — catastrophically too much for 12GB VRAM
                 self.kv_cache_batched[slot] = Some(row.empty_like(
                     init_cap,
                     self.n_kv_head,
