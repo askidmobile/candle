@@ -102,6 +102,19 @@ pub fn speculative_width() -> usize {
     })
 }
 
+/// P0.5c adaptive width (default ON, откат QWEN36_MTP_ADAPTIVE=0):
+/// ширина драфта следует за фактической принимаемостью — см. спекулятивный
+/// раунд. Убирает плату draft+rollback ~65 мс за раунды, где модель не
+/// угадывает (m<=1), сохраняя длинные всплески при полном принятии.
+fn mtp_adaptive_on() -> bool {
+    static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ADAPTIVE.get_or_init(|| {
+        std::env::var("QWEN36_MTP_ADAPTIVE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Диагностический trace шагов (QWEN36_TRACE=1) — для расследования зависаний
 /// dispatch loop в qwen36-server. Дёшево: одна проверка env на шаг.
 fn trace_value_on(value: &str) -> bool {
@@ -144,6 +157,12 @@ pub struct BatchScheduler<M: BatchModel> {
     queue: VecDeque<SlotRequest>,
     sampler: Box<dyn Sampler>,
     speculative: Vec<SpeculativeMetrics>,
+    /// P0.5c adaptive width: последний результат спекуляции per-slot
+    /// (m принятых, K драфтованных) + счётчик пропусков для периодического
+    /// probe-раунда после серии неудач.
+    slot_last_m: Vec<usize>,
+    slot_last_k: Vec<usize>,
+    skip_count: Vec<usize>,
     stats: SchedulerStats,
     eos: u32,
 }
@@ -167,6 +186,9 @@ impl<M: BatchModel> BatchScheduler<M> {
             queue: VecDeque::new(),
             sampler: Box::new(GreedySampler),
             speculative: vec![SpeculativeMetrics::default(); num_slots],
+            slot_last_m: vec![1; num_slots],
+            slot_last_k: vec![1; num_slots],
+            skip_count: vec![0; num_slots],
             stats: SchedulerStats::default(),
             eos,
         }
@@ -350,7 +372,30 @@ impl<M: BatchModel> BatchScheduler<M> {
         }
         let t_draft = Instant::now();
 
-        let width = self.slots[slot].remaining_new_tokens().min(speculative_width());
+        // P0.5c adaptive width (QWEN36_MTP_ADAPTIVE=0 для отката): ширина
+        // следующего раунда следует за фактической принимаемостью. Полный
+        // успех (m>=K) наращивает K; провал (m<=1) срезает к 1 → раунд
+        // пропускается (дешёвый baseline decode вместо draft+rollback ~65мс).
+        let mut width = self.slots[slot].remaining_new_tokens().min(speculative_width());
+        if mtp_adaptive_on() {
+            let (last_m, last_k) = (self.slot_last_m[slot], self.slot_last_k[slot]);
+            if last_m >= last_k {
+                self.slot_last_k[slot] = (last_k + 1).min(speculative_width());
+            } else if last_m <= 1 && last_k > 1 {
+                self.slot_last_k[slot] = last_k - 1;
+            }
+            let k_next = self.slot_last_k[slot];
+            if k_next <= 1 {
+                // Probe каждые 4 шага: не залипнуть в baseline навсегда.
+                self.skip_count[slot] += 1;
+                if self.skip_count[slot] % 4 != 3 {
+                    return Ok(Some(SpeculativeFallback::Draft));
+                }
+                self.slot_last_k[slot] = 2;
+            }
+            width = width.min(k_next);
+        }
+
         let draft = match self.model.speculative_draft(
             slot,
             self.slots[slot].current_token(),
@@ -413,6 +458,9 @@ impl<M: BatchModel> BatchScheduler<M> {
             self.sampler.restore(slot, sampler_checkpoint)?;
             return Ok(Some(SpeculativeFallback::Commit));
         }
+        // P0.5c: фиксируем результат раунда для adaptive width.
+        self.slot_last_m[slot] = verified.len();
+        self.slot_last_k[slot] = draft.len();
         if timing {
             eprintln!(
                 "[mtp] slot={slot} K={} m={} begin={:.1}ms draft={:.1}ms verify={:.1}ms sample={:.1}ms accept={:.1}ms commit={:.1}ms",
