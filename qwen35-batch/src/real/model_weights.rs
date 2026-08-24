@@ -3809,7 +3809,7 @@ impl GatedAttentionLayer {
             let q = &q_slots[bidx];
             let row = &cache_rows[bidx];
             if self.kv_cache_batched[slot].is_none() {
-                let init_cap = 512.min(self.attn_window);
+                let init_cap = self.attn_window; // Pre-alloc full ctx: eliminate reallocations + copy_prefix_to @24K (2026-08-24)
                 self.kv_cache_batched[slot] = Some(row.empty_like(
                     init_cap,
                     self.n_kv_head,
@@ -7056,8 +7056,8 @@ impl ModelWeights {
 
         // Размер 1 токена (K+V в F16) для всех слоёв внимания и всех B слотов
         let bytes_per_token_all_layers = num_attn_layers * capacity_b * (2 * n_kv * hd * 2);
-        // Резервируем 1.5 ГБ на рабочие буферы активаций и драйвера
-        let reserved_headroom = 1536 * 1024 * 1024;
+        // Резервируем 512 МиБ на рабочие буферы активаций и драйвера (было 1536)
+        let reserved_headroom = 512 * 1024 * 1024;
         let vram_for_paged_kv = free_vram.saturating_sub(reserved_headroom);
         let max_tokens_by_vram = if bytes_per_token_all_layers > 0 {
             vram_for_paged_kv / bytes_per_token_all_layers
@@ -7140,6 +7140,8 @@ impl ModelWeights {
 
     /// Миграция per-slot KV из batched cache (post-prefill/seed) в paged pool.
     /// Возвращает фактическую длину KV слота.
+    /// После миграции освобождает q8 batched кэш слота (~130 MiB @24K на 10 attn-слоёв),
+    /// иначе он живёт одновременно с paged pool → VRAM double-dip → WDDM spill.
     #[cfg(feature = "cuda")]
     pub fn migrate_kv_to_paged(&mut self, slot: usize) -> Result<usize> {
         let mb = self
@@ -7219,6 +7221,13 @@ impl ModelWeights {
                         }
                     }
                 }
+            }
+        }
+        // Освобождаем q8 batched кэш: данные скопированы в paged pool,
+        // оригинал больше не нужен. Экономия ~130 МиБ @24K на 10 attn-слоёв.
+        for block in self.blocks.iter_mut() {
+            if let HybridLayerType::Attention(a) = &mut block.layer {
+                a.kv_cache_batched[slot] = None;
             }
         }
         Ok(len)
