@@ -7242,6 +7242,7 @@ impl ModelWeights {
         let stem = gguf_path.with_extension("");
         let sidecar_path = stem.with_extension("ytf16");
         if !sidecar_path.exists() {
+            eprintln!("[ytf] no sidecar at {} — skipping", sidecar_path.display());
             return Ok(());
         }
         let t0 = std::time::Instant::now();
