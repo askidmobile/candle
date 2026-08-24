@@ -173,6 +173,28 @@ impl PagedModelCtx {
     }
 
     /// Узкие view под текущий batch B для FA2.
+pub fn launch_increment_t(&self, b: usize, t: usize) -> Result<()> {
+        let func = self.dev.get_or_load_func(
+            "kv_len_increment_t",
+            &candle_core::cuda_backend::kernels::QUANTIZED,
+        )?;
+        let t_i32 = t as i32;
+        let b_i32 = b as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&self.kv_len_dev);
+        builder.arg(&self.slots_dev);
+        builder.arg(&b_i32);
+        builder.arg(&t_i32);
+        unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
+    /// Узкие view под текущий batch B для FA2.
     pub fn seqlens_q(&self, b: usize) -> Result<Tensor> {
         self.seqlens_q_t.narrow(0, 0, b + 1)
     }
@@ -182,6 +204,28 @@ impl PagedModelCtx {
     pub fn block_table(&self, b: usize) -> Result<Tensor> {
         self.block_table_t.narrow(0, 0, b)
     }
+    /// Prefill varlen: seqlens_k[i] = kv_len[slot]+t. Graph-capturable.
+    pub fn seqlens_k_for_prefill(&self, b: usize, t: usize) -> Result<Tensor> {
+        let func = self.dev.get_or_load_func(
+            "cumsum_seqlens_from_kvlen_offset",
+            &candle_core::cuda_backend::kernels::QUANTIZED,
+        )?;
+        let out = self.seqlens_k_t.narrow(0, 0, b + 1)?;
+        let stream = self.dev.cuda_stream();
+        let (kv_len_ptr, _g1) = cudarc::driver::DevicePtr::device_ptr(&self.kv_len_dev, &stream);
+        let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&self.slots_dev, &stream);
+        let out_ptr = tensor_cuda_ptr(&out)?;
+        let cfg = LaunchConfig { grid_dim: (1,1,1), block_dim: (32,1,1), shared_mem_bytes: 0 };
+        let mut builder = func.builder();
+        builder.arg(&kv_len_ptr);
+        builder.arg(&slots_ptr);
+        builder.arg(&out_ptr);
+        builder.arg(&(b as i32));
+        builder.arg(&(t as i32));
+        unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        Ok(out)
+    }
+
     pub fn rope_pos(&self, b: usize) -> Result<Tensor> {
         self.rope_pos_t.narrow(0, 0, b)
     }
@@ -273,6 +317,55 @@ impl PagedKvPool {
         builder.arg(&page_i32);
         builder.arg(&max_blocks_i32);
         builder.arg(&window_i32);
+        unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
+    /// Prefill: append T строк на позиции [kv_len .. kv_len+T). Инкремент kv_len
+    /// отдельным kernel'ом (kv_len_increment_t).
+    pub fn launch_append_multi(
+        &self,
+        ctx: &PagedModelCtx,
+        k_rows: &Tensor,   // [B, T, n_kv, hd]
+        v_rows: &Tensor,
+        b: usize,
+        t: usize,
+        n_kv: usize,
+        hd: usize,
+        window: usize,
+    ) -> Result<()> {
+        let k_pool_ptr = tensor_cuda_ptr(&self.k_pool)?;
+        let v_pool_ptr = tensor_cuda_ptr(&self.v_pool)?;
+        let k_rows_ptr = tensor_cuda_ptr(k_rows)?;
+        let v_rows_ptr = tensor_cuda_ptr(v_rows)?;
+        let stream = ctx.dev.cuda_stream();
+        let (kv_len_ptr, _g1) = cudarc::driver::DevicePtr::device_ptr(&ctx.kv_len_dev, &stream);
+        let (slots_ptr, _g2) = cudarc::driver::DevicePtr::device_ptr(&ctx.slots_dev, &stream);
+        let block_table_ptr = tensor_cuda_ptr(&ctx.block_table_t)?;
+        let func = ctx.dev.get_or_load_func(
+            "kv_append_paged_f16_multi",
+            &candle_core::cuda_backend::kernels::QUANTIZED,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv as u32, b as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&k_pool_ptr);
+        builder.arg(&v_pool_ptr);
+        builder.arg(&k_rows_ptr);
+        builder.arg(&v_rows_ptr);
+        builder.arg(&block_table_ptr);
+        builder.arg(&slots_ptr);
+        builder.arg(&kv_len_ptr);
+        builder.arg(&(b as i32));
+        builder.arg(&(t as i32));
+        builder.arg(&(n_kv as i32));
+        builder.arg(&(hd as i32));
+        builder.arg(&(PAGE_SIZE as i32));
+        builder.arg(&(ctx.max_blocks as i32));
+        builder.arg(&(window as i32));
         unsafe { builder.launch(cfg) }.map_err(candle_core::Error::wrap)?;
         Ok(())
     }

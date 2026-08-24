@@ -7010,6 +7010,47 @@ extern "C" __global__ void kv_append_paged_f16(
     // должны видеть одну и ту же длину в пределах шага).
 }
 
+// Prefill variant: append T K/V rows per (batch, kv_head) at positions
+// [kv_len .. kv_len+T). CUDA-graph capturable (all state device-side).
+extern "C" __global__ void kv_append_paged_f16_multi(
+    half* __restrict__ k_pool,
+    half* __restrict__ v_pool,
+    const half* __restrict__ k_rows,  // [B, T, n_kv, hd]
+    const half* __restrict__ v_rows,  // [B, T, n_kv, hd]
+    const unsigned int* __restrict__ block_table,  // [B, max_blocks]
+    const unsigned int* __restrict__ slots,        // [B]
+    unsigned int* __restrict__ kv_len,             // [S] in/out
+    const int b,
+    const int t,
+    const int n_kv,
+    const int hd,
+    const int page_size,
+    const int max_blocks,
+    const int window)
+{
+    const int bidx = blockIdx.y;
+    const int head = blockIdx.x;
+    if (bidx >= b || head >= n_kv) return;
+    const unsigned int slot = slots[bidx];
+    unsigned int base_len = kv_len[slot];
+    for (int row = 0; row < t; ++row) {
+        unsigned int len = base_len + (unsigned int)row;
+        if (len >= (unsigned int)window) continue; // eviction guard: host falls back
+        const unsigned int page = block_table[bidx * max_blocks + len / page_size];
+        const unsigned int off = len % page_size;
+        const size_t dst_base = ((size_t)page * page_size + off) * n_kv * hd;
+        half* k_dst = k_pool + dst_base + (size_t)head * hd;
+        half* v_dst = v_pool + dst_base + (size_t)head * hd;
+        const size_t src_base = (((size_t)bidx * t) + row) * n_kv * hd + (size_t)head * hd;
+        const half* k_src = k_rows + src_base;
+        const half* v_src = v_rows + src_base;
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+            k_dst[i] = k_src[i];
+            v_dst[i] = v_src[i];
+        }
+    }
+}
+
 // Cumulative seqlens_k for varlen FA2 from device kv_len. kv_len is the
 // pre-step length; FA2 must see len+1 (the row appended this step).
 extern "C" __global__ void cumsum_seqlens_from_kvlen(
@@ -7027,6 +7068,24 @@ extern "C" __global__ void cumsum_seqlens_from_kvlen(
     }
 }
 
+// Prefill varlen FA2: seqlens_k[i] = kv_len[slot_i] + t (append уже записал
+// T строк; kv_len ещё не инкрементирован).
+extern "C" __global__ void cumsum_seqlens_from_kvlen_offset(
+    const unsigned int* __restrict__ kv_len,
+    const unsigned int* __restrict__ slots,
+    int* __restrict__ out,                    // [B+1]
+    const int b,
+    const int t)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int acc = 0;
+    out[0] = 0;
+    for (int i = 0; i < b; ++i) {
+        acc += (int)kv_len[slots[i]] + t;
+        out[i + 1] = acc;
+    }
+}
+
 // Increment per-slot kv_len once at the end of the decode step.
 extern "C" __global__ void kv_len_increment(
     unsigned int* __restrict__ kv_len,
@@ -7036,5 +7095,18 @@ extern "C" __global__ void kv_len_increment(
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     for (int i = 0; i < b; ++i) {
         kv_len[slots[i]] += 1u;
+    }
+}
+
+// Prefill: increment per-slot kv_len by t rows at the end of the prefill step.
+extern "C" __global__ void kv_len_increment_t(
+    unsigned int* __restrict__ kv_len,
+    const unsigned int* __restrict__ slots,  // [B]
+    const int b,
+    const int t)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (int i = 0; i < b; ++i) {
+        kv_len[slots[i]] += (unsigned int)t;
     }
 }

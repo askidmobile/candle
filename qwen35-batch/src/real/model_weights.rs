@@ -3771,6 +3771,109 @@ impl GatedAttentionLayer {
         res
     }
 
+    /// yttri-forge: paged prefill attention (CUDA-graph friendly).
+    /// x: [1, T, n_embd]; пишет T строк в paged pool; FA2 varlen q_len=T.
+    /// RoPE по device-позициям (rope_pos_dev = [start_pos..start_pos+T)).
+    fn forward_attn_prefill_paged(
+        &mut self,
+        x: &Tensor,
+        ctx: &crate::real::paged_kv_cuda::PagedModelCtx,
+        rope_pos_dev: &Tensor,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        if b_sz != 1 {
+            candle_core::bail!("paged prefill: b_sz must be 1");
+        }
+        // 1. Проекции (F16-сайдкар если подключён — dual-read prefill)
+        let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
+            (Some(fq), Some(fk), Some(fv)) => (fq.forward(x)?, fk.forward(x)?, fv.forward(x)?),
+            _ => (
+                self.attention_wq.forward(x)?,
+                self.attention_wk.forward(x)?,
+                self.attention_wv.forward(x)?,
+            ),
+        };
+
+        // 2. Reshape + norms
+        let qg = qg.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+        let q_all = qg.narrow(3, 0, self.head_dim)?.contiguous()?.transpose(1, 2)?;
+        let gate_all = qg.narrow(3, self.head_dim, self.head_dim)?.contiguous()?.transpose(1, 2)?;
+        let k_all = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let v_all = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q_all = self.q_norm.forward(&q_all.flatten(0, 2)?)?.reshape((
+            b_sz, self.n_head, seq_len, self.head_dim,
+        ))?;
+        let k_all = self.k_norm.forward(&k_all.flatten(0, 2)?)?.reshape((
+            b_sz, self.n_kv_head, seq_len, self.head_dim,
+        ))?;
+
+        // 3. RoPE по device-позициям [T]
+        let q_rope = self.apply_partial_rotary_emb_devpos(&q_all, rope_pos_dev)?;
+        let k_rope = self.apply_partial_rotary_emb_devpos(&k_all, rope_pos_dev)?;
+
+        // 4. head-last + q8 round-trip (паритет с eager)
+        let k_hl = k_rope.transpose(1, 2)?.contiguous()?; // [B, T, n_kv, hd]
+        let v_hl = v_all.transpose(1, 2)?.contiguous()?;
+        let (kq, ks) = q8_quantize_rows(&k_hl)?;
+        let (vq, vs) = q8_quantize_rows(&v_hl)?;
+        let k_rows = q8_dequantize_rows(&kq, &ks)?
+            .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
+            .contiguous()?;
+        let v_rows = q8_dequantize_rows(&vq, &vs)?
+            .reshape((b_sz * seq_len, self.n_kv_head, self.head_dim))?
+            .contiguous()?;
+
+        // 5. Append T строк в paged pool
+        let pool = self.paged_pool.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("paged pool not initialized".into())
+        })?;
+        pool.launch_append_multi(ctx, &k_rows, &v_rows, b_sz, seq_len, self.n_kv_head, self.head_dim, self.attn_window)?;
+
+        // 6. FA2 varlen: seqlens_q=[T], seqlens_k=[kv0+T]
+        let q_f16 = q_rope.to_dtype(DType::F16)?.squeeze(2)?.contiguous()?; // [B, n_head, T, hd]→varlen ждёт [total_q, n_head, hd]? см. decode: squeeze(2) из [B,nh,1,hd]
+        // Для varlen q формат: [total_q_tokens, n_head, hd] → из [B, nh, T, hd]: transpose→[B,T,nh,hd]→flatten
+        let q_f16 = q_rope.to_dtype(DType::F16)?
+            .transpose(1, 2)?.contiguous()?
+            .reshape((b_sz * seq_len, self.n_head, self.head_dim))?;
+        let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let window = ctx.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE;
+        // seqlens_k нужно kv0+T (append уже прошёл? НЕТ: FA2 должен видеть len+T строк).
+        // append записал строки, но kv_len ещё не инкрементирован → seqlens_k считаем сами:
+        // используем cumsum от kv_len+T через отдельный staging... MVP: seqlens_k_t патчим host-side вне графа.
+        let seqlens_q = ctx.seqlens_q(b_sz)?;
+        let seqlens_k = ctx.seqlens_k_for_prefill(seq_len)?;
+        let block_table = ctx.block_table(b_sz)?;
+        let out = candle_flash_attn::flash_attn_varlen_paged_windowed(
+            &q_f16,
+            &pool.k_pool,
+            &pool.v_pool,
+            &seqlens_q,
+            &seqlens_k,
+            &block_table,
+            None,
+            seq_len as u32,
+            window,
+            scale,
+            None,
+            None,
+            crate::real::paged_kv_cuda::PAGE_SIZE,
+            None,
+        )?;
+
+        // 7. Gate + Wo
+        let y_all = out.to_dtype(DType::F32)?.unsqueeze(2)?; // [B, T, nh, 1?] — проверка формы
+        let y_all = y_all.reshape((b_sz, seq_len, self.n_head, self.head_dim))?;
+        let gate_sigmoid = candle_nn::ops::sigmoid(&gate_all)?;
+        let y_all = (y_all.transpose(1, 2) * gate_sigmoid)?;
+        let y_all = y_all
+            .transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        match &self.f16_o {
+            Some(fo) => fo.forward(&y_all),
+            None => self.attention_wo.forward(&y_all),
+        }
+    }
+
     fn forward_attn_decode_batch(
         &mut self,
         x: &Tensor,
