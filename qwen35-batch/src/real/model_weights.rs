@@ -2271,14 +2271,28 @@ impl DeltaNetLayer {
         let dn_gpf3 = std::env::var("QWEN36_GPROF").as_deref() == Ok("3");
         #[cfg(not(target_os = "macos"))]
         let dn_tp = std::time::Instant::now();
+        // yttri-forge stage1 (dual-read): prefill-проекции через F16-сайдкар.
         #[cfg(not(target_os = "macos"))]
-        let qkv_t = { if std::env::var_os("QWEN36_TRACE_MMQ").is_some() { eprintln!("[dn-pf] wqkv x={:?}", x.shape()); } self.wqkv.forward(x)? };
-        #[cfg(not(target_os = "macos"))]
-        let z_t = self.wgate.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let beta_t = self.w_beta.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let alpha_t = self.w_alpha.forward(x)?;
+        let (qkv_t, z_t, beta_t, alpha_t) = match (
+            &self.f16_wqkv,
+            &self.f16_wgate,
+            &self.f16_w_beta,
+            &self.f16_w_alpha,
+        ) {
+            (Some(fq), Some(fg), Some(fb), Some(fa)) => {
+                let qkv = fq.forward(x)?;
+                let z = fg.forward(x)?;
+                let b = fb.forward(x)?;
+                let a = fa.forward(x)?;
+                (qkv, z, b, a)
+            }
+            _ => (
+                self.wqkv.forward(x)?,
+                self.wgate.forward(x)?,
+                self.w_beta.forward(x)?,
+                self.w_alpha.forward(x)?,
+            ),
+        };
         #[cfg(not(target_os = "macos"))]
         let dn_proj_ms = {
             if dn_gpf3 {
@@ -2370,7 +2384,10 @@ impl DeltaNetLayer {
                     eprintln!("[pfstep] delta seq={:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
                 }
                 let dn_th = std::time::Instant::now();
-                let r = self.ssm_out.forward(&gated_all);
+                let r = match &self.f16_ssm_out {
+                    Some(fo) => fo.forward(&gated_all),
+                    None => self.ssm_out.forward(&gated_all),
+                };
                 if dn_gpf3 {
                     if let Device::Cuda(c) = &device { let _ = c.cuda_stream().synchronize(); }
                     eprintln!(
@@ -3206,12 +3223,21 @@ impl GatedAttentionLayer {
         let k = dispatch_q4k_matmul(&self.attention_wk, self.attention_wk_opt.as_ref(), x)?;
         #[cfg(target_os = "macos")]
         let v = dispatch_q4k_matmul(&self.attention_wv, self.attention_wv_opt.as_ref(), x)?;
+        // yttri-forge stage1 (dual-read): prefill-проекции через F16-сайдкар,
+        // если подключён. Decode-пути продолжают использовать GGUF-квант.
         #[cfg(not(target_os = "macos"))]
-        let qg = self.attention_wq.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let k = self.attention_wk.forward(x)?;
-        #[cfg(not(target_os = "macos"))]
-        let v = self.attention_wv.forward(x)?;
+        let (qg, k, v) = match (&self.f16_q, &self.f16_k, &self.f16_v) {
+            (Some(fq), Some(fk), Some(fv)) => (
+                fq.forward(x)?,
+                fk.forward(x)?,
+                fv.forward(x)?,
+            ),
+            _ => (
+                self.attention_wq.forward(x)?,
+                self.attention_wk.forward(x)?,
+                self.attention_wv.forward(x)?,
+            ),
+        };
         let t_proj = t0.elapsed();
 
         // 2-5. Reshape + norm + RoPE
@@ -3424,10 +3450,13 @@ impl GatedAttentionLayer {
                 unreachable!();
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let r = self.attention_wo.forward(&y);
+                    let r = match &self.f16_o {
+                        Some(fo) => fo.forward(&y),
+                        None => self.attention_wo.forward(&y),
+                    };
                     if at_gpf3 {
                         eprintln!(
-                            "[pfp-attn] proj={:.1} kv={:.1} fa2={:.1} wo={:.1}",
+                            "[pfp-attn] f16=1 proj={:.1} kv={:.1} fa2={:.1} wo={:.1}",
                             t_proj.as_secs_f64() * 1e3,
                             t_kv_cache.as_secs_f64() * 1e3,
                             fa_ms,
