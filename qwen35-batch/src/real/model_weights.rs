@@ -7239,8 +7239,17 @@ impl ModelWeights {
         if std::env::var("QWEN36_DISABLE_YTF16").as_deref() == Ok("1") {
             return Ok(());
         }
-        let stem = gguf_path.with_extension("");
-        let sidecar_path = stem.with_extension("ytf16");
+        // ВАЖНО: with_extension ломает имена с точками (Qwen3.5-...→Qwen3.ytf16)
+        let sidecar_path = gguf_path.with_file_name({
+            let fname = gguf_path
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match fname.rfind('.') {
+                Some(i) => format!("{}.ytf16", &fname[..i]),
+                None => format!("{fname}.ytf16"),
+            }
+        });
         if !sidecar_path.exists() {
             eprintln!("[ytf] no sidecar at {} — skipping", sidecar_path.display());
             return Ok(());
