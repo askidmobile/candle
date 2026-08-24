@@ -7201,14 +7201,6 @@ impl ModelWeights {
     }
 
     /// Текущее graph window (для fallback-решений адаптера).
-    #[cfg(feature = "cuda")]
-    pub fn paged_window(&self) -> usize {
-        self.paged_ctx
-            .as_ref()
-            .map(|c| c.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE)
-            .unwrap_or(0)
-    }
-
     /// yttri-forge stage1: подключить F16-сайдкар тяжёлых проекций.
     ///
     /// `gguf_path` — путь GGUF (для sha256 против манифеста сайдкара); sidecar
