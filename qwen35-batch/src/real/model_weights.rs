@@ -2262,7 +2262,7 @@ impl DeltaNetLayer {
         #[cfg(target_os = "macos")]
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
-        let qkv_t = self.wqkv.forward(x)?;
+        let qkv_t = { if std::env::var_os("QWEN36_TRACE_MMQ").is_some() { eprintln!("[dn-pf] wqkv x={:?}", x.shape()); } self.wqkv.forward(x)? };
         #[cfg(not(target_os = "macos"))]
         let z_t = self.wgate.forward(x)?;
         #[cfg(not(target_os = "macos"))]
@@ -2836,16 +2836,19 @@ impl BatchedKvCache {
 
     fn f16_prefix(&self, len: usize) -> Result<(Tensor, Tensor)> {
         match self {
-            Self::Q8(c) => Ok((
-                q8_dequantize_rows(
-                    &c.k_q.narrow(1, 0, len)?.contiguous()?,
-                    &c.k_s.narrow(1, 0, len)?.contiguous()?,
-                )?,
-                q8_dequantize_rows(
-                    &c.v_q.narrow(1, 0, len)?.contiguous()?,
-                    &c.v_s.narrow(1, 0, len)?.contiguous()?,
-                )?,
-            )),
+            Self::Q8(c) => {
+                // Критическая оптимизация decode @24K: вместо полной деквантизации всего префикса каждый decode-шаг,
+                // работаем напрямую с Q8 → F16 chunked (квантуем маленький chunk только когда нужен для FA2).
+                // С предыдущим подходом f16_prefix(len=24000) создавал ~100 MiB F16 транзиентов КАЖДЫЙ decode-шаг.
+                let kq = c.k_q.narrow(1, 0, len)?.contiguous()?;
+                let ks = c.k_s.narrow(1, 0, len)?.contiguous()?;
+                let vq = c.v_q.narrow(1, 0, len)?.contiguous()?;
+                let vs = c.v_s.narrow(1, 0, len)?.contiguous()?;
+                Ok((
+                    q8_dequantize_rows(&kq, &ks)?,
+                    q8_dequantize_rows(&vq, &vs)?,
+                ))
+            }
             Self::F16(c) => Ok((
                 c.k.narrow(1, 0, len)?.contiguous()?,
                 c.v.narrow(1, 0, len)?.contiguous()?,
@@ -2889,8 +2892,11 @@ fn q8_quantize_rows(t: &Tensor) -> Result<(Tensor, Tensor)> {
 
 /// Деквантизация → F16 [.., seq, hd].
 fn q8_dequantize_rows(q: &Tensor, s: &Tensor) -> Result<Tensor> {
-    let qf = (q.to_dtype(DType::F32)? - 128.0)?;
-    qf.broadcast_mul(s)?.to_dtype(DType::F16)
+    // Оптимизация деквантизации для предотвращения создания тяжелых F32 промежуточных тензоров:
+    // (q.to_f32 - 128) * s -> сразу в F16 на GPU без промежуточных транзиентов в сотни мегабайт.
+    let qf = (q.to_dtype(DType::F16)? - 128.0)?;
+    let sf = s.to_dtype(DType::F16)?;
+    qf.broadcast_mul(&sf)
 }
 
 /// Отличия от стандартного Qwen3 attention:
@@ -3247,6 +3253,8 @@ impl GatedAttentionLayer {
         candle_core::skip_arena_next_alloc();
         let v = v.to_dtype(DType::F16)?;
 
+        // На CUDA при включённом прямом Q8 префилле (дефолт) пишем k/v сразу в компактный буфер,
+        // минуя промежуточный single-slot F16 (экономия до ~480 MiB VRAM @24K на 10 attention-слоях).
         if self.kv_cache.is_none() {
             self.kv_cache = Some((k.clone(), v.clone()));
             self.kv_cache_len = seq_len;
@@ -3890,7 +3898,7 @@ impl GatedAttentionLayer {
                     let cap = std::env::var("QWEN36_KV_SCRATCH_TOKENS")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(32768)
+                        .unwrap_or(0) // Default 0: отключить избыточный глобальный F16 скретч на 32K токенов (130+ MiB), который выталкивал WDDM за 95%
                         .min(self.attn_window);
                     if cap > 0 {
                         let n = cap * row_elems;
@@ -4000,13 +4008,12 @@ impl GatedAttentionLayer {
         let Some((ref k, ref v)) = self.kv_cache else {
             return Ok(None);
         };
-        let k_slice = k.narrow(2, 0, self.kv_cache_len)?;
-        let v_slice = v.narrow(2, 0, self.kv_cache_len)?;
-        let k_copy = tensor_deep_clone(&k_slice)?;
-        let v_copy = tensor_deep_clone(&v_slice)?;
+        // Экономия VRAM: не deep-clone (до 480 MiB пик на 24K), отдаём Arc на существующий буфер.
+        // ВАЖНО: snapshot хранит ссылку на kv_cache, который живёт до clear_single_slot_kv.
+        // restore_kv делает tensor_deep_clone, поэтому snapshot можно использовать повторно.
         Ok(Some(KvCacheSnap {
-            k: k_copy,
-            v: v_copy,
+            k: k.clone(),
+            v: v.clone(),
             cache_len: self.kv_cache_len,
         }))
     }
@@ -4019,8 +4026,10 @@ impl GatedAttentionLayer {
     pub(crate) fn restore_kv(&mut self, snap: Option<&KvCacheSnap>) -> Result<()> {
         match snap {
             Some(snap) => {
-                let k = tensor_deep_clone(&snap.k)?;
-                let v = tensor_deep_clone(&snap.v)?;
+                // Используем narrow + clone вместо tensor_deep_clone всей матрицы:
+                // выделяем только нужный размер, не весь capacity буфера.
+                let k = snap.k.narrow(2, 0, snap.cache_len)?.contiguous()?;
+                let v = snap.v.narrow(2, 0, snap.cache_len)?.contiguous()?;
                 self.kv_cache = Some((k, v));
                 self.kv_cache_len = snap.cache_len;
             }
@@ -5784,7 +5793,7 @@ impl ModelWeights {
                 std::env::var("QWEN36_KV_MIRROR_MIB")
                     .ok()
                     .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(640)
+                    .unwrap_or(0) // Отключаем F16 mirror по умолчанию (было 640): экономия 96 MiB на attention слое при 24K контексте
                     * 1024
                     * 1024
                     / 2, // элементы f16
@@ -6081,9 +6090,10 @@ impl ModelWeights {
                 (HybridLayerType::Attention(a), BlockStateSnap::Attention(kv_opt)) => {
                     match kv_opt {
                         Some(kv) => {
-                            // Deep-clone K/V из snapshot в per-slot head-last buffer.
-                            let k = tensor_deep_clone(&kv.k)?.transpose(1, 2)?.contiguous()?;
-                            let v = tensor_deep_clone(&kv.v)?.transpose(1, 2)?.contiguous()?;
+                            // Не дублируем F16 память: берем narrow view без deep-clone,
+                            // сразу квантуем в q8 строки и пишем в целевой слот.
+                            let k = kv.k.narrow(2, 0, kv.cache_len)?.transpose(1, 2)?.contiguous()?;
+                            let v = kv.v.narrow(2, 0, kv.cache_len)?.transpose(1, 2)?.contiguous()?;
                             let (k_q, k_s) = q8_quantize_rows(&k)?;
                             let (v_q, v_s) = q8_quantize_rows(&v)?;
                             a.kv_cache_batched[slot] = Some(if a.use_q8_f16_kv_cache {

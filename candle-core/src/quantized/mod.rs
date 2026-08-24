@@ -1505,6 +1505,14 @@ impl crate::Module for QMatMul {
         } else {
             xs.clone()
         };
+        if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+            let variant = match self {
+                Self::QTensor(_) => "QTensor",
+                Self::Tensor(_) => "Tensor",
+                Self::TensorF16(_) => "TensorF16",
+            };
+            eprintln!("[qmatmul-fwd] variant={} xs={:?}", variant, xs.shape());
+        }
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {

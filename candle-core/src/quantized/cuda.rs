@@ -1426,8 +1426,29 @@ impl QCudaStorage {
             if let Some(result) = super::fast_mmvq::try_fwd(self, self_shape, storage, layout)? {
                 return Ok(result);
             }
+            if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+                let m = match layout.shape().dims() {
+                    [b, m, _] => b * m,
+                    [m, _] => *m,
+                    _ => 0,
+                };
+                let (n, k) = self_shape.dims2()?;
+                eprintln!("[mmq-entry] dtype={:?} m={} n={} k={}", self.dtype, m, n, k);
+            }
             if let Some(result) = super::fast_mmq::try_fwd(self, self_shape, storage, layout)? {
                 return Ok(result);
+            }
+            if std::env::var_os("QWEN36_TRACE_MMQ").is_some() {
+                let (n, k) = self_shape.dims2()?;
+                let m = match layout.shape().dims() {
+                    [b, m, _] => b * m,
+                    [m, _] => *m,
+                    _ => 0,
+                };
+                eprintln!(
+                    "[mmq-fallback] dtype={:?} m={} n={} k={} — MMQ returned None, using dequantize_matmul",
+                    self.dtype, m, n, k,
+                );
             }
         }
         let max_bm = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
