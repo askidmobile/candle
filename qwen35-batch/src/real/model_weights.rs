@@ -2262,6 +2262,10 @@ impl DeltaNetLayer {
         #[cfg(target_os = "macos")]
         let alpha_t = dispatch_q4k_matmul(&self.w_alpha, self.w_alpha_opt.as_ref(), x)?;
         #[cfg(not(target_os = "macos"))]
+        let dn_gpf3 = std::env::var("QWEN36_GPROF").as_deref() == Ok("3");
+        #[cfg(not(target_os = "macos"))]
+        let dn_tp = std::time::Instant::now();
+        #[cfg(not(target_os = "macos"))]
         let qkv_t = { if std::env::var_os("QWEN36_TRACE_MMQ").is_some() { eprintln!("[dn-pf] wqkv x={:?}", x.shape()); } self.wqkv.forward(x)? };
         #[cfg(not(target_os = "macos"))]
         let z_t = self.wgate.forward(x)?;
@@ -2269,6 +2273,13 @@ impl DeltaNetLayer {
         let beta_t = self.w_beta.forward(x)?;
         #[cfg(not(target_os = "macos"))]
         let alpha_t = self.w_alpha.forward(x)?;
+        #[cfg(not(target_os = "macos"))]
+        let dn_proj_ms = {
+            if dn_gpf3 {
+                if let Device::Cuda(c) = &device { let _ = c.cuda_stream().synchronize(); }
+            }
+            dn_tp.elapsed().as_secs_f64() * 1e3
+        };
 
         // ═══════════════════════════════════════════════════════════════════
         // Metal Fused GDN путь — основной (T-265, Phase 3).
@@ -2352,7 +2363,18 @@ impl DeltaNetLayer {
                     let _ = ctx.dev.cuda_stream().synchronize();
                     eprintln!("[pfstep] delta seq={:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
                 }
-                return self.ssm_out.forward(&gated_all);
+                let dn_th = std::time::Instant::now();
+                let r = self.ssm_out.forward(&gated_all);
+                if dn_gpf3 {
+                    if let Device::Cuda(c) = &device { let _ = c.cuda_stream().synchronize(); }
+                    eprintln!(
+                        "[pfp-delta] proj={:.1} fused={:.1} head={:.1}",
+                        dn_proj_ms,
+                        t0.elapsed().as_secs_f64() * 1e3,
+                        dn_th.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return r;
             }
             let mut outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
             for t in 0..seq_len {
@@ -3368,12 +3390,19 @@ impl GatedAttentionLayer {
             if q.device().is_cuda()
                 && std::env::var("QWEN36_DISABLE_FLASH_PREFILL").is_err()
             {
+                let at_gpf3 = std::env::var("QWEN36_GPROF").as_deref() == Ok("3");
+                let t_fa = std::time::Instant::now();
                 let q_f = q.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
                 let k_f = k.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
                 let v_f = v.to_dtype(DType::F16)?.transpose(1, 2)?.contiguous()?;
                 let out = candle_flash_attn::flash_attn(&q_f, &k_f, &v_f, scale as f32, true)?;
                 let y = out.transpose(1, 2)?.to_dtype(DType::F32)?;
+                if at_gpf3 {
+                    if let Ok(cd) = q.device().as_cuda_device() { let _ = cd.cuda_stream().synchronize(); }
+                }
+                let fa_ms = t_fa.elapsed().as_secs_f64() * 1e3;
                 // дальше gate+output projection — как в основном пути
+                let t_wo = std::time::Instant::now();
                 let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
                 let y = (y * gate_sigmoid)?;
                 let y = y
@@ -3382,7 +3411,19 @@ impl GatedAttentionLayer {
                 #[cfg(target_os = "macos")]
                 unreachable!();
                 #[cfg(not(target_os = "macos"))]
-                return self.attention_wo.forward(&y);
+                {
+                    let r = self.attention_wo.forward(&y);
+                    if at_gpf3 {
+                        eprintln!(
+                            "[pfp-attn] proj={:.1} kv={:.1} fa2={:.1} wo={:.1}",
+                            t_proj.as_secs_f64() * 1e3,
+                            t_kv_cache.as_secs_f64() * 1e3,
+                            fa_ms,
+                            t_wo.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
+                    return r;
+                }
             }
             // Prefill: CHUNKED manual matmul attention в F16.
             //
