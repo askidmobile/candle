@@ -1114,8 +1114,25 @@ impl Qwen35BatchAdapter {
         let _ = max_blocks;
 
         let need_capture = match &self.decode_graph {
-            Some(g) => g.b != b || g.slots != slots,
-            None => true,
+            Some(g) => {
+                let why = if g.b != b {
+                    format!("b {}!={}", g.b, b)
+                } else if g.slots != slots {
+                    format!("slots {:?}!={:?}", g.slots, slots)
+                } else {
+                    String::new()
+                };
+                if crate::scheduler::trace_on() && !why.is_empty() {
+                    eprintln!("[graphs] recapture reason: {why}");
+                }
+                !why.is_empty()
+            }
+            None => {
+                if crate::scheduler::trace_on() {
+                    eprintln!("[graphs] recapture reason: no graph");
+                }
+                true
+            }
         };
         if crate::scheduler::trace_on() {
             eprintln!("[graphs] step b={b} need_capture={need_capture}");
@@ -1136,7 +1153,13 @@ impl Qwen35BatchAdapter {
                 .model
                 .forward_decode_batch_graphed(&ids_eager, slots)
                 .map_err(|e| anyhow!("graphed forward (eager prime): {e}"))?;
-            // Второй eager прогон: теплый (без PTX JIT первого запуска) — для измерений.
+            // Второй eager прогон (замер тёплого пути): ТОЛЬКО диагностика.
+            // ВАЖНО: двигает device KV на +1 — рассинхронизирует scheduler
+            // позиции после capture. Поэтому gprof+graphs даёт корректные
+            // замеры только первого шага; последующие уходят в eager.
+            // Не инкрементируем kv_len_host за этот прогон намеренно? Нет —
+            // инкремент ниже (1206) покрывает оба прогона; расхождение
+            // остаётся и это известное ограничение диагностики.
             if self.model.gprof_events.is_some() {
                 {
                     let ctx = self.model.paged_ctx.as_mut().unwrap();
@@ -1148,6 +1171,15 @@ impl Qwen35BatchAdapter {
                     .model
                     .forward_decode_batch_graphed(&ids_eager, slots)
                     .map_err(|e| anyhow!("graphed forward (eager prime 2): {e}"))?;
+                // Компенсация: вернуть host mirror к состоянию ПОСЛЕ одного
+                // реального шага, чтобы scheduler-позиции совпали с device
+                // только на реальный инкремент (строка ниже).
+                {
+                    let ctx = self.model.paged_ctx.as_mut().unwrap();
+                    for &s in slots {
+                        ctx.kv_len_host[s as usize] -= 1;
+                    }
+                }
             }
             // GPU-сегменты eager-prime: та же последовательность ядер, что в графе.
             if let Some(ev) = self.model.gprof_events.as_ref() {

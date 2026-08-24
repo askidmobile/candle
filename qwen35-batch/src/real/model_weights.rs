@@ -7223,13 +7223,10 @@ impl ModelWeights {
                 }
             }
         }
-        // Освобождаем q8 batched кэш: данные скопированы в paged pool,
-        // оригинал больше не нужен. Экономия ~130 МиБ @24K на 10 attn-слоёв.
-        for block in self.blocks.iter_mut() {
-            if let HybridLayerType::Attention(a) = &mut block.layer {
-                a.kv_cache_batched[slot] = None;
-            }
-        }
+        // ВАЖНО: НЕ освобождаем kv_cache_batched после миграции (ранняя правка
+        // 2026-08-24 делала None): любой eager-fallback после миграции требует
+        // batched кэш — без него запрос умирает ("cache length 0"). Double-VRAM
+        // актуален только на 27B@12GB, где graphs всё равно OFF.
         Ok(len)
     }
 
