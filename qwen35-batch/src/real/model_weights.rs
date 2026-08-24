@@ -1613,7 +1613,13 @@ struct DeltaNetCudaContextBatched {
 /// - Gated output через SiLU
 struct DeltaNetLayer {
     /// Joint QKV проекция: [n_embd] → [key_dim*2 + value_dim]
-    wqkv: QMatMul,
+/// yttri-forge stage1: F16-проекции prefill (dual-read).
+    pub(crate) f16_wqkv: Option<QMatMul>,
+    pub(crate) f16_wgate: Option<QMatMul>,
+    pub(crate) f16_w_beta: Option<QMatMul>,
+    pub(crate) f16_w_alpha: Option<QMatMul>,
+    pub(crate) f16_ssm_out: Option<QMatMul>,
+        wqkv: QMatMul,
     /// Gate (z) проекция: [n_embd] → [value_dim]
     wgate: QMatMul,
     /// Beta проекция: [n_embd] → [n_v_heads]
@@ -2967,6 +2973,12 @@ pub(crate) struct GatedAttentionLayer {
     /// DeltaNet слои (24/32) уже хранят полную историю в SSM state,
     /// поэтому attention окно не теряет долгосрочный контекст.
     attn_window: usize,
+    /// yttri-forge stage1: F16-проекции для PREFILL-пути (dual-read, R-DUAL).
+    /// Decode всегда читает GGUF-квант выше. None = сайдкар отсутствует/выключен.
+    pub(crate) f16_q: Option<QMatMul>,
+    pub(crate) f16_k: Option<QMatMul>,
+    pub(crate) f16_v: Option<QMatMul>,
+    pub(crate) f16_o: Option<QMatMul>,
     /// Per-slot KV-cache для true batched decode (Phase 5). Каждый слот имеет
     /// свой Q8-квантованный буфер (u8+scale) + длину. Размер = capacity B
     /// (DECODE_BATCH_CAPACITY). Используется ТОЛЬКО в forward_attn_decode_batch;
@@ -5655,6 +5667,11 @@ impl ModelWeights {
                     wgate: qm_wgate,
                     w_beta: qm_w_beta,
                     w_alpha: qm_w_alpha,
+                    f16_wqkv: None,
+                    f16_wgate: None,
+                    f16_w_beta: None,
+                    f16_w_alpha: None,
+                    f16_ssm_out: None,
                     dt_bias,
                     ssm_a,
                     conv_kernel_weights,
@@ -5748,6 +5765,10 @@ impl ModelWeights {
                     attention_wk: qm_attention_wk,
                     attention_wv: qm_attention_wv,
                     attention_wo: qm_attention_wo,
+                    f16_q: None,
+                    f16_k: None,
+                    f16_v: None,
+                    f16_o: None,
                     #[cfg(target_os = "macos")]
                     attention_wq_opt,
                     #[cfg(target_os = "macos")]
@@ -7178,6 +7199,123 @@ impl ModelWeights {
             .map(|c| c.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE)
             .unwrap_or(0)
     }
+
+    /// Текущее graph window (для fallback-решений адаптера).
+    #[cfg(feature = "cuda")]
+    pub fn paged_window(&self) -> usize {
+        self.paged_ctx
+            .as_ref()
+            .map(|c| c.max_blocks * crate::real::paged_kv_cuda::PAGE_SIZE)
+            .unwrap_or(0)
+    }
+
+    /// yttri-forge stage1: подключить F16-сайдкар тяжёлых проекций.
+    ///
+    /// `gguf_path` — путь GGUF (для sha256 против манифеста сайдкара); sidecar
+    /// ожидается в `<stem>.ytf16`. Откат: QWEN36_DISABLE_YTF16=1.
+    /// Dual-read (R-DUAL): F16 ТОЛЬКО в forward_prefill; decode читает GGUF-квант.
+    pub fn attach_ytf16(&mut self, gguf_path: &std::path::Path, device: &candle_core::Device) -> Result<()> {
+        if std::env::var("QWEN36_DISABLE_YTF16").as_deref() == Ok("1") {
+            return Ok(());
+        }
+        let stem = gguf_path.with_extension("");
+        let sidecar_path = stem.with_extension("ytf16");
+        if !sidecar_path.exists() {
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        use sha2::Digest;
+        let mut f = std::fs::File::open(gguf_path)
+            .map_err(|e| candle_core::Error::Msg(format!("ytf16: open gguf: {e}")))?;
+        let mut hasher = sha2::Sha256::new();
+        std::io::copy(&mut f, &mut hasher)
+            .map_err(|e| candle_core::Error::Msg(format!("ytf16: hash gguf: {e}")))?;
+        let gguf_sha = format!("{:x}", hasher.finalize());
+
+        let reader = crate::real::ytf16::Ytf16Sidecar::open(&sidecar_path)?;
+        if reader.gguf_sha256() != gguf_sha {
+            eprintln!(
+                "[ytf] WARN sha256 mismatch (sidecar={} vs gguf={}) — ignoring sidecar",
+                &reader.gguf_sha256()[..12.min(reader.gguf_sha256().len())],
+                &gguf_sha[..12]
+            );
+            return Ok(());
+        }
+
+        fn build_f16(
+            reader: &crate::real::ytf16::Ytf16Sidecar,
+            name: &str,
+            device: &candle_core::Device,
+        ) -> Option<QMatMul> {
+            let (bytes, shape) = reader.tensor_bytes(name)?;
+            let n_elem: usize = shape.iter().product();
+            assert_eq!(bytes.len(), n_elem * 2, "ytf16 {name}: size mismatch");
+            // SAFETY: F16 LE буфер выровнен 64B, lifetime покрыт mmap'ом Reader
+            let ptr = bytes.as_ptr() as *const half::f16;
+            let slice = unsafe { std::slice::from_raw_parts(ptr, n_elem) };
+            match candle_core::Tensor::from_vec(slice.to_vec(), shape.to_vec(), device) {
+                Ok(t) => Some(QMatMul::TensorF16(t)),
+                Err(e) => {
+                    eprintln!("[ytf] WARN tensor {name}: {e}");
+                    None
+                }
+            }
+        }
+
+        let mut mapped = 0usize;
+        let mut total_bytes = 0u64;
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            match &mut block.layer {
+                HybridLayerType::Attention(a) => {
+                    for (field, suffix) in [
+                        (&mut a.f16_q, "q.weight"),
+                        (&mut a.f16_k, "k.weight"),
+                        (&mut a.f16_v, "v.weight"),
+                        (&mut a.f16_o, "o.weight"),
+                    ] {
+                        let name = format!("blk.{i}.attn_{suffix}");
+                        *field = build_f16(&reader, &name, device);
+                        if field.is_some() {
+                            mapped += 1;
+                            total_bytes += reader
+                                .tensor_bytes(&name)
+                                .map(|(b, _)| b.len())
+                                .unwrap_or(0) as u64;
+                        }
+                    }
+                }
+                HybridLayerType::DeltaNet(d) => {
+                    let dev = device.clone();
+                    for (field, suffix) in [
+                        (&mut d.f16_wqkv, "qkv.weight"),
+                        (&mut d.f16_wgate, "z.weight"),
+                        (&mut d.f16_w_beta, "b.weight"),
+                        (&mut d.f16_w_alpha, "a.weight"),
+                        (&mut d.f16_ssm_out, "out.weight"),
+                    ] {
+                        let name = format!("blk.{i}.attn_{suffix}");
+                        *field = build_f16(&reader, &name, &dev);
+                        if field.is_some() {
+                            mapped += 1;
+                            total_bytes += reader
+                                .tensor_bytes(&name)
+                                .map(|(b, _)| b.len())
+                                .unwrap_or(0) as u64;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[ytf] mapped {mapped} tensors ({:.0} MiB F16) in {:.1}s from {}",
+            total_bytes as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64(),
+            sidecar_path.display()
+        );
+        Ok(())
+    }
+
+
 
     /// Миграция per-slot KV из batched cache (post-prefill/seed) в paged pool.
     /// Возвращает фактическую длину KV слота.

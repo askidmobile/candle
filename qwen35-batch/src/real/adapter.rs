@@ -291,6 +291,11 @@ impl Qwen35BatchAdapter {
         // Упреждающее f16-зеркало слота 0 (фикс WDDM-коллапса 2026-08-23):
         // выделяем сразу после загрузки весов, пока dedicated VRAM свободна,
         // иначе страницы уходят в WDDM shared и декод падает на PCIe.
+        // yttri-forge stage1: F16-сайдкар тяжёлых проекций (dual-read prefill)
+        a.model
+            .attach_ytf16(gguf_path, &a.device)
+            .map_err(|e| anyhow!("attach_ytf16: {e}"))?;
+
         if let Some(tokens) = std::env::var("QWEN36_KV_MIRROR_PREPARE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())

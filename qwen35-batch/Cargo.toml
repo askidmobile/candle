@@ -10,6 +10,7 @@ candle-nn = { path = "../candle-nn" }
 anyhow = "1"
 log = "0.4"
 half = "2.5.0"
+sha2 = { version = "0.10", optional = true }
 image = { workspace = true, optional = true }
 rand = "0.9.0"
 rayon = "1.7.0"
@@ -34,7 +35,7 @@ candle-flash-attn = { path = "../candle-flash-attn", optional = true }
 [features]
 # Активировать адаптер реальной Qwen3.5 модели (GGUF loader + port quantized_qwen35).
 # Backend выбирается отдельно: `metal` на macOS или `cuda` на Windows/Linux.
-real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger", "dep:serde_json", "dep:image"]
+real-model = ["dep:memmap2", "dep:tokenizers", "dep:env_logger", "dep:serde_json", "dep:sha2", "dep:image"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = [
     "candle-core/cuda",
